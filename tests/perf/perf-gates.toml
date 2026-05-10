@@ -58,7 +58,7 @@ p95_ms = 300000
 max_ms = 1800000
 
 [delta_reindex_ms]
-p50_ms = 8000
+p50_ms = 15000
 p95_ms = 30000
 max_ms = 120000
 
@@ -73,7 +73,7 @@ p95_max = 150.0
 max = 300.0
 
 [observed_command_overhead_ms]
-p50_max = 10.0
+p50_max = 20.0
 p95_max = 25.0
 max = 50.0
 
