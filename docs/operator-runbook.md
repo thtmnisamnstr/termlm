@@ -119,15 +119,44 @@ Actions:
 
 ## 6) Release / CI Gate Commands
 
+Full local workflow-equivalent runner:
+
 ```bash
+bash scripts/ci/run_local_ci.sh
+```
+
+Fast local iteration:
+
+```bash
+bash scripts/ci/run_local_ci.sh --quick
+```
+
+Fast GitHub push/PR gate equivalent (`.github/workflows/ci.yml`):
+
+```bash
+python3 scripts/ci/check_docs_links.py
+bash scripts/ci/lint_shell.sh
 cargo fmt --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --locked -- -D warnings
+cargo test --workspace --locked
+bash tests/compatibility/macos_profile.sh
+```
+
+Extended manual validation (`.github/workflows/extended-validation.yml`):
+
+```bash
 cargo test --workspace --all-targets --release --locked
 bash tests/adapter-contract/zsh_adapter_contract.sh
-bash tests/compatibility/macos_profile.sh
 bash tests/compatibility/terminal_matrix.sh
 bash tests/compatibility/ssh_env_smoke.sh
 bash tests/compatibility/plugin_manager_matrix.sh
+cargo run -p termlm-test --release --locked -- --suite tests/fixtures/termlm-test-suite.toml --mode all --provider local --perf-gates tests/perf/perf-gates.toml
+```
+
+If index reindex waits time out on a large PATH host, raise harness limits:
+
+```bash
+TERMLM_TEST_REINDEX_TIMEOUT_SECS=300 \
 cargo run -p termlm-test --release --locked -- --suite tests/fixtures/termlm-test-suite.toml --mode all --provider local --perf-gates tests/perf/perf-gates.toml
 ```
 
@@ -151,4 +180,43 @@ Reliability drill:
 
 ```bash
 TERMLM_SOAK_ITERS=40 bash tests/reliability/reliability_drills.sh
+```
+
+Duration-based soak target:
+
+```bash
+TERMLM_SOAK_DURATION_SECS=86400 bash tests/reliability/reliability_drills.sh
+```
+
+24-hour soak evidence (duration-based, concurrent client pressure, metrics artifact):
+
+```bash
+bash tests/reliability/soak_24h.sh /tmp/termlm-soak-24h
+```
+
+Short soak smoke validation before a full-day run:
+
+```bash
+TERMLM_SOAK_DURATION_SECS=120 \
+TERMLM_SOAK_PARALLEL_CLIENTS=3 \
+bash tests/reliability/soak_24h.sh /tmp/termlm-soak-smoke
+```
+
+or with explicit controls:
+
+```bash
+TERMLM_SOAK_DURATION_SECS=86400 \
+TERMLM_SOAK_PARALLEL_CLIENTS=3 \
+TERMLM_SOAK_PATH_CHURN_WINDOW=8 \
+TERMLM_RELIABILITY_RETRIES=3 \
+TERMLM_RELIABILITY_RETRY_DELAY_SECS=0.05 \
+TERMLM_SOAK_LOOP_SLEEP_SECS=0.02 \
+TERMLM_SOAK_METRICS_PATH=/tmp/termlm-soak-24h/soak-metrics.json \
+bash tests/reliability/reliability_drills.sh
+```
+
+Local release-upgrade rehearsal:
+
+```bash
+bash tests/release/upgrade_rehearsal.sh
 ```

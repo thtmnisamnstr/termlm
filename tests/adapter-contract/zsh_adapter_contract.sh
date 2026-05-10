@@ -96,6 +96,8 @@ require_pattern "$LIB_OBSERVER" 'started_at_ms' "adapter must forward absolute c
 # shellcheck disable=SC2016
 require_pattern "$LIB_OBSERVER" '_TERMLM_LAST_PREEXEC_EXPANDED:-\$_TERMLM_LAST_PREEXEC_CMD' "observer payload must preserve expanded-command field"
 require_pattern "$LIB_OBSERVER" 'termlm-epoch-to-ms' "observer must convert preexec timestamps for IPC"
+require_pattern "$LIB_IPC" 'no configured LLM provider is available; agentic features are disabled' "adapter must surface startup warning when no ollama LLM provider is reachable"
+require_literal "$LIB_IPC" "https://github.com/thtmnisamnstr/termlm/blob/main/docs/configuration.md#use-ollama-for-generation-local-embeddings-still-default" "startup warning must include full ollama configuration docs URL"
 # shellcheck disable=SC2016
 require_pattern "$LIB_IPC" 'bridge <"\$fifo_in" >"\$fifo_out"' "adapter must run persistent helper bridge over stdio"
 if rg -q --pcre2 '\$client_bin[[:space:]]+(run-task|respond-task|ack-task|send-shell-context|observe-command)\b' "$LIB_IPC" "$LIB_OBSERVER"; then

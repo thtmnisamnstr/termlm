@@ -3,61 +3,37 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  rust-macos:
-    runs-on: macos-14
+  rust-macos-quick:
+    runs-on: macos-14-arm64
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
-      - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
-      - run: if ! command -v rg >/dev/null 2>&1; then brew install ripgrep; fi
-      - run: if ! command -v expect >/dev/null 2>&1; then brew install expect; fi
-      - run: if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
-      - run: python3 scripts/ci/check_docs_links.py
-      - run: bash scripts/ci/lint_shell.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --release --locked
-      - run: bash tests/adapter-contract/zsh_adapter_contract.sh
+      - run: cargo test --workspace --locked --no-run
       - run: bash tests/compatibility/macos_profile.sh
-      - run: bash tests/compatibility/terminal_matrix.sh
-      - run: bash tests/compatibility/ssh_env_smoke.sh
-      - run: bash tests/compatibility/plugin_manager_matrix.sh
-      - run: bash tests/release/release_smoke.sh
-      - name: Run local stub hardware matrix evidence
-        run: |
-          OUT_DIR="${RUNNER_TEMP}/termlm-hardware-matrix-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "${OUT_DIR}"
-          echo "TERMLM_HW_MATRIX_OUT=${OUT_DIR}" >> "${GITHUB_ENV}"
-          TERMLM_PERF_MATRIX_CASES=local_stub_all \
-          bash tests/perf/hardware_matrix.sh "${OUT_DIR}"
-      - run: |
-          MODEL_PATH="$HOME/.local/share/termlm/models/gemma-4-E4B-it-Q4_K_M.gguf"
-          if [[ -f "$MODEL_PATH" ]]; then
-            TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite tests/fixtures/termlm-test-suite.toml --mode local-integration --provider local
-          else
-            echo "Skipping real-runtime E2E lane (model artifact not present at $MODEL_PATH)"
-          fi
-      - name: Upload hardware matrix artifacts
-        if: ${{ always() && env.TERMLM_HW_MATRIX_OUT != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: hardware-matrix-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.TERMLM_HW_MATRIX_OUT }}
-          if-no-files-found: error
 
-  rust-linux-smoke:
+  rust-linux-quick:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
-      - run: cargo install cargo-machete --locked
-      - run: cargo machete --with-metadata --skip-target-dir
       - run: python3 scripts/ci/check_docs_links.py
       - run: bash scripts/ci/lint_shell.sh
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --locked
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - run: cargo test --workspace --locked

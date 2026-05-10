@@ -2,8 +2,6 @@ name: security
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 8 * * 1"
 
 permissions:
   contents: read
@@ -11,16 +9,19 @@ permissions:
 jobs:
   audit-and-sbom:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo audit --deny warnings
       - run: cargo cyclonedx --format json --override-filename termlm-sbom
+      - run: find crates -maxdepth 2 -type f -name 'termlm-sbom.json' | grep .
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: termlm-sbom-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ./*.cdx.json
+          path: crates/*/termlm-sbom.json
           if-no-files-found: error

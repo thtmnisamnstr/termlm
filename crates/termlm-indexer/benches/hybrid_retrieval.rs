@@ -32,9 +32,9 @@ fn build_chunks(count: usize) -> Vec<Chunk> {
 
 fn bench_hybrid_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("hybrid_retrieval");
-    group.sample_size(20);
+    group.sample_size(15);
 
-    for &size in &[5_000usize, 20_000usize] {
+    for &size in &[5_000usize, 20_000usize, 50_000usize] {
         let retriever = HybridRetriever::with_dim(build_chunks(size), 384);
         group.throughput(Throughput::Elements(size as u64));
 

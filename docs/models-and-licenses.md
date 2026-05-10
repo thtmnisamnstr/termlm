@@ -20,6 +20,7 @@ Optional release-time inclusion:
 
 ## Notes
 
-- `termlm upgrade` uses `no-models` artifacts and preserves existing models.
+- `termlm upgrade` uses `no-models` artifacts, preserves existing inference models, and bootstraps
+  embeddings/index assets if missing.
 - Verify model provenance/checksums in your deployment process.
 - Some models have usage restrictions beyond OSS licensing; review upstream terms before distribution.

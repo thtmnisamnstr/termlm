@@ -78,14 +78,14 @@ plugins=(... termlm zsh-autosuggestions zsh-syntax-highlighting)
 
 ```zsh
 # zinit
-zi light user/termlm
+zi light thtmnisamnstr/termlm
 zi light zsh-users/zsh-autosuggestions
 zi light zsh-users/zsh-syntax-highlighting
 ```
 
 ```zsh
 # antidote
-antidote bundle user/termlm
+antidote bundle thtmnisamnstr/termlm
 antidote bundle zsh-users/zsh-autosuggestions
 antidote bundle zsh-users/zsh-syntax-highlighting
 ```

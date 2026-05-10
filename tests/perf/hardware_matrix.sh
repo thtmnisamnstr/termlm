@@ -4,13 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OUT_DIR="${1:-/tmp/termlm-perf-matrix-$(date +%Y%m%d-%H%M%S)}"
-SUITE="${REPO_ROOT}/tests/fixtures/termlm-test-suite.toml"
-GATES="${REPO_ROOT}/tests/perf/perf-gates.toml"
+SUITE="${TERMLM_PERF_MATRIX_SUITE:-${REPO_ROOT}/tests/fixtures/termlm-test-suite.toml}"
+GATES="${TERMLM_PERF_MATRIX_GATES:-${REPO_ROOT}/tests/perf/perf-gates.toml}"
+REAL_GATES="${TERMLM_PERF_MATRIX_REAL_GATES:-${REPO_ROOT}/tests/perf/real-runtime-gates.toml}"
 MODEL_PATH="${TERMLM_PERF_MATRIX_LOCAL_MODEL_PATH:-${HOME}/.local/share/termlm/models/gemma-4-E4B-it-Q4_K_M.gguf}"
 OLLAMA_MODEL="${TERMLM_TEST_OLLAMA_MODEL:-gemma3:1b}"
 CASES_RAW="${TERMLM_PERF_MATRIX_CASES:-local_stub_all,local_real_e2e,ollama_integration}"
 REQUIRE_REAL_LOCAL="${TERMLM_PERF_MATRIX_REQUIRE_REAL_LOCAL:-0}"
 REQUIRE_OLLAMA="${TERMLM_PERF_MATRIX_REQUIRE_OLLAMA:-0}"
+REINDEX_TIMEOUT_SECS="${TERMLM_PERF_MATRIX_REINDEX_TIMEOUT_SECS:-300}"
 RECORDS_FILE=""
 RUN_FAILED=0
 
@@ -20,6 +22,15 @@ RECORDS_FILE="${OUT_DIR}/case-records.tsv"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "hardware matrix requires jq in PATH" >&2
+  exit 2
+fi
+
+if [[ ! -f "${GATES}" ]]; then
+  echo "hardware matrix perf gates file not found: ${GATES}" >&2
+  exit 2
+fi
+if [[ ! -f "${REAL_GATES}" ]]; then
+  echo "hardware matrix real-runtime perf gates file not found: ${REAL_GATES}" >&2
   exit 2
 fi
 
@@ -99,7 +110,8 @@ run_case() {
 
 if has_case "local_stub_all"; then
   run_case "local_stub_all" \
-  "cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode all --provider local --perf-gates ${GATES}" \
+  "TERMLM_TEST_REINDEX_TIMEOUT_SECS=${REINDEX_TIMEOUT_SECS} cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode all --provider local --perf-gates ${GATES}" \
+  env TERMLM_TEST_REINDEX_TIMEOUT_SECS="${REINDEX_TIMEOUT_SECS}" \
   cargo run -p termlm-test --release --locked -- \
   --suite "${SUITE}" --mode all --provider local --perf-gates "${GATES}"
 fi
@@ -107,18 +119,18 @@ fi
 if has_case "local_real_e2e"; then
   if [[ -f "${MODEL_PATH}" ]]; then
     run_case "local_real_e2e" \
-      "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local" \
+      "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local --perf-gates ${REAL_GATES}" \
       env TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- \
-      --suite "${SUITE}" --mode local-integration --provider local
+      --suite "${SUITE}" --mode local-integration --provider local --perf-gates "${REAL_GATES}"
   else
     local_reason="missing-model-${MODEL_PATH}"
     if [[ "${REQUIRE_REAL_LOCAL}" == "1" ]]; then
       echo "==> required case local_real_e2e missing prerequisite (${MODEL_PATH})" >&2
-      record_case "local_real_e2e" "failed" "" "${local_reason}" "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local"
+      record_case "local_real_e2e" "failed" "" "${local_reason}" "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local --perf-gates ${REAL_GATES}"
       RUN_FAILED=1
     else
       echo "==> skipping local_real_e2e (missing model: ${MODEL_PATH})"
-      record_case "local_real_e2e" "skipped" "" "${local_reason}" "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local"
+      record_case "local_real_e2e" "skipped" "" "${local_reason}" "TERMLM_E2E_REAL=1 cargo run -p termlm-test --release --locked -- --suite ${SUITE} --mode local-integration --provider local --perf-gates ${REAL_GATES}"
     fi
   fi
 fi
@@ -152,8 +164,10 @@ jq -Rn \
   --arg host_name "$(hostname -s 2>/dev/null || hostname)" \
   --arg suite "${SUITE}" \
   --arg gates "${GATES}" \
+  --arg real_gates "${REAL_GATES}" \
   --arg model_path "${MODEL_PATH}" \
   --arg ollama_model "${OLLAMA_MODEL}" \
+  --arg reindex_timeout_secs "${REINDEX_TIMEOUT_SECS}" \
   --arg selected_cases "${CASES_RAW}" \
   '
   [inputs | select(length > 0) | split("\t")] as $rows
@@ -168,9 +182,11 @@ jq -Rn \
       },
       suite: $suite,
       perf_gates: $gates,
+      real_runtime_perf_gates: $real_gates,
       selected_cases: $selected_cases,
       local_model_path: $model_path,
       ollama_model: $ollama_model,
+      reindex_timeout_secs: ($reindex_timeout_secs | tonumber?),
       cases: [
         $rows[] | {
           name: .[0],

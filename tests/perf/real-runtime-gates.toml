@@ -1,0 +1,48 @@
+# Dedicated real-runtime perf gates for local-model evidence lanes.
+# These focus on NFR-1..NFR-3 metrics so they can run on the small
+# `local-integration` harness mode without requiring full-suite metrics.
+
+[model_load_ms]
+p50_ms = 30000
+p95_ms = 30000
+max_ms = 30000
+
+[ttft_ms]
+p50_ms = 15000
+p95_ms = 15000
+max_ms = 15000
+
+[throughput_toks_per_sec]
+p50_min = 1.0
+p95_min = 1.0
+min = 1.0
+
+[hardware_profiles.apple_m2_pro_max_local.model_load_ms]
+p50_ms = 8000
+p95_ms = 8000
+max_ms = 30000
+
+[hardware_profiles.apple_m2_pro_max_local.throughput_toks_per_sec]
+p50_min = 25.0
+p95_min = 25.0
+min = 25.0
+
+[hardware_profiles.apple_m3_pro_local.model_load_ms]
+p50_ms = 8000
+p95_ms = 8000
+max_ms = 30000
+
+[hardware_profiles.apple_m3_max_local.model_load_ms]
+p50_ms = 8000
+p95_ms = 8000
+max_ms = 30000
+
+[hardware_profiles.apple_m3_max_local.ttft_ms]
+p50_ms = 400
+p95_ms = 1500
+max_ms = 1500
+
+[hardware_profiles.apple_m3_max_local.throughput_toks_per_sec]
+p50_min = 60.0
+p95_min = 40.0
+min = 25.0

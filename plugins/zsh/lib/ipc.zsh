@@ -47,6 +47,146 @@ termlm-helper-is-alive() {
   [[ -n "$pid" ]] && [[ -n "${_TERMLM_HELPER_IN_FD:-}" ]] && [[ -n "${_TERMLM_HELPER_OUT_FD:-}" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+termlm-config-path() {
+  if [[ -n "${TERMLM_CONFIG_PATH:-}" ]]; then
+    print -r -- "${TERMLM_CONFIG_PATH}"
+    return
+  fi
+  print -r -- "${XDG_CONFIG_HOME:-$HOME/.config}/termlm/config.toml"
+}
+
+termlm-config-section-value() {
+  local section="$1"
+  local key="$2"
+  local fallback="$3"
+  local cfg
+  cfg="$(termlm-config-path)"
+  [[ -f "$cfg" ]] || {
+    print -r -- "$fallback"
+    return
+  }
+
+  local in_section=0
+  local value="$fallback"
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ '^[[:space:]]*\[([^]]+)\][[:space:]]*$' ]]; then
+      if [[ "${match[1]}" == "$section" ]]; then
+        in_section=1
+      else
+        in_section=0
+      fi
+      continue
+    fi
+    (( in_section )) || continue
+
+    if [[ "$line" =~ "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\\\"([^\\\"]+)\\\"" ]]; then
+      value="${match[1]}"
+      break
+    elif [[ "$line" =~ "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*([^#[:space:]]+)" ]]; then
+      value="${match[1]}"
+      break
+    fi
+  done < "$cfg"
+
+  print -r -- "$value"
+}
+
+termlm-expand-home-path() {
+  local path="$1"
+  if [[ "$path" == "~/"* ]]; then
+    print -r -- "$HOME/${path#~/}"
+  else
+    print -r -- "$path"
+  fi
+}
+
+termlm-config-inference-provider() {
+  termlm-config-section-value "inference" "provider" "local"
+}
+
+termlm-config-ollama-endpoint() {
+  termlm-config-section-value "ollama" "endpoint" "http://127.0.0.1:11434"
+}
+
+termlm-selected-local-model-path() {
+  local models_dir variant filename
+  models_dir="$(termlm-config-section-value "model" "models_dir" "~/.local/share/termlm/models")"
+  models_dir="$(termlm-expand-home-path "$models_dir")"
+  variant="$(termlm-config-section-value "model" "variant" "E4B" | tr '[:lower:]' '[:upper:]')"
+
+  if [[ "$variant" == "E2B" ]]; then
+    filename="$(termlm-config-section-value "model" "e2b_filename" "gemma-4-E2B-it-Q4_K_M.gguf")"
+  else
+    filename="$(termlm-config-section-value "model" "e4b_filename" "gemma-4-E4B-it-Q4_K_M.gguf")"
+  fi
+
+  print -r -- "${models_dir}/${filename}"
+}
+
+termlm-warn-no-llm-provider() {
+  local detail="$1"
+  local docs_url="https://github.com/thtmnisamnstr/termlm/blob/main/docs/configuration.md#use-ollama-for-generation-local-embeddings-still-default"
+  print -r -- "termlm: no configured LLM provider is available; agentic features are disabled until an LLM is configured."
+  if [[ -n "$detail" ]]; then
+    print -r -- "termlm: $detail"
+  fi
+  print -r -- "termlm: configure Ollama in: ${docs_url}"
+}
+
+termlm-maybe-warn-no-llm-provider() {
+  if [[ "${_TERMLM_NO_LLM_WARNING_SHOWN:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local configured_provider
+  configured_provider="$(termlm-config-inference-provider)"
+
+  if [[ "$configured_provider" == "local" ]]; then
+    local local_model_path
+    local_model_path="$(termlm-selected-local-model-path)"
+    if [[ ! -f "$local_model_path" ]]; then
+      termlm-warn-no-llm-provider "bundled local model is missing at ${local_model_path}."
+      _TERMLM_NO_LLM_WARNING_SHOWN=1
+      return 0
+    fi
+  fi
+
+  if [[ "$configured_provider" != "local" && "$configured_provider" != "ollama" ]]; then
+    termlm-warn-no-llm-provider "configured inference provider '${configured_provider}' is unsupported."
+    _TERMLM_NO_LLM_WARNING_SHOWN=1
+    return 0
+  fi
+
+  local client_bin
+  client_bin="$(termlm-client-bin)"
+  local status_out=""
+  if status_out="$("$client_bin" status 2>/dev/null)"; then
+    local runtime_provider provider_healthy
+    runtime_provider="$(printf '%s\n' "$status_out" | awk -F': ' '/^provider:/ {print $2; exit}')"
+    provider_healthy="$(printf '%s\n' "$status_out" | awk -F': ' '/^provider_healthy:/ {print $2; exit}')"
+    if [[ "$provider_healthy" == "true" ]]; then
+      return 0
+    fi
+    if [[ "$runtime_provider" == "ollama" || "$configured_provider" == "ollama" ]]; then
+      local endpoint
+      endpoint="$(termlm-config-ollama-endpoint)"
+      termlm-warn-no-llm-provider "configured provider=ollama is unavailable (endpoint: ${endpoint})."
+    else
+      termlm-warn-no-llm-provider "configured local provider is unavailable."
+    fi
+    _TERMLM_NO_LLM_WARNING_SHOWN=1
+    return 0
+  fi
+
+  if [[ "$configured_provider" == "ollama" ]]; then
+    local endpoint
+    endpoint="$(termlm-config-ollama-endpoint)"
+    termlm-warn-no-llm-provider "configured provider=ollama could not be reached (endpoint: ${endpoint})."
+    _TERMLM_NO_LLM_WARNING_SHOWN=1
+  fi
+}
+
 termlm-helper-send() {
   local payload="$1"
   local attempt=1
@@ -186,13 +326,16 @@ termlm-start-helper() {
 
 termlm-register-shell() {
   if [[ -n "${_TERMLM_SHELL_ID:-}" ]] && termlm-helper-is-alive; then
+    termlm-maybe-warn-no-llm-provider
     return 0
   fi
 
   if termlm-start-helper; then
+    termlm-maybe-warn-no-llm-provider
     return 0
   fi
 
+  termlm-maybe-warn-no-llm-provider
   return 1
 }
 

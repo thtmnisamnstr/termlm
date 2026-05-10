@@ -11,9 +11,9 @@ Usage:
 Environment overrides:
   TERMLM_RELEASE_MODEL_DIR              Source directory for pre-downloaded model files
   TERMLM_RELEASE_MODEL_E4B_URL          Override E4B download URL
-  TERMLM_RELEASE_MODEL_E4B_SHA256       Optional E4B checksum validation
+  TERMLM_RELEASE_MODEL_E4B_SHA256       Override E4B checksum validation (defaults to pinned value)
   TERMLM_RELEASE_EMBED_URL              Override embedding-model download URL
-  TERMLM_RELEASE_EMBED_SHA256           Optional embedding-model checksum override
+  TERMLM_RELEASE_EMBED_SHA256           Override embedding-model checksum validation
   TERMLM_RELEASE_INCLUDE_E2B=1          Include E2B variant in with-models bundle
   TERMLM_RELEASE_MODEL_E2B_URL          Optional E2B download URL
   TERMLM_RELEASE_MODEL_E2B_SHA256       Optional E2B checksum validation
@@ -85,6 +85,7 @@ EMBED_FILE="bge-small-en-v1.5.Q4_K_M.gguf"
 E4B_URL="${TERMLM_RELEASE_MODEL_E4B_URL:-https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/${E4B_FILE}}"
 E2B_URL="${TERMLM_RELEASE_MODEL_E2B_URL:-https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/${E2B_FILE}}"
 EMBED_URL="${TERMLM_RELEASE_EMBED_URL:-https://huggingface.co/ChristianAzinn/bge-small-en-v1.5-gguf/resolve/main/${EMBED_FILE}}"
+E4B_SHA256_DEFAULT="90ce98129eb3e8cc57e62433d500c97c624b1e3af1fcc85dd3b55ad7e0313e9f"
 EMBED_SHA256_DEFAULT="d8c2e0e38bce043562bbc6f437c638c2538bfe02cadfe6476a01f906bfde6d40"
 
 MODEL_SOURCE_DIR="${TERMLM_RELEASE_MODEL_DIR:-$HOME/.local/share/termlm/models}"
@@ -114,6 +115,7 @@ cp -R "$ROOT_DIR/plugins/zsh" "$BUNDLE_ROOT/plugins/zsh"
 cp "$ROOT_DIR/scripts/release/install_bundle.sh" "$BUNDLE_ROOT/install.sh"
 chmod 0755 "$BUNDLE_ROOT/install.sh"
 cp "$ROOT_DIR/README.md" "$BUNDLE_ROOT/README.md"
+cp "$ROOT_DIR/LICENSE" "$BUNDLE_ROOT/LICENSE"
 
 ensure_model_file() {
   local filename="$1"
@@ -166,7 +168,7 @@ if [[ "$MODE" == "with-models" ]]; then
 
   model_files=("$E4B_FILE" "$EMBED_FILE")
   model_urls=("$E4B_URL" "$EMBED_URL")
-  model_shas=("${TERMLM_RELEASE_MODEL_E4B_SHA256:-}" "${TERMLM_RELEASE_EMBED_SHA256:-$EMBED_SHA256_DEFAULT}")
+  model_shas=("${TERMLM_RELEASE_MODEL_E4B_SHA256:-$E4B_SHA256_DEFAULT}" "${TERMLM_RELEASE_EMBED_SHA256:-$EMBED_SHA256_DEFAULT}")
   if [[ "$INCLUDE_E2B" == "1" ]]; then
     model_files+=("$E2B_FILE")
     model_urls+=("$E2B_URL")

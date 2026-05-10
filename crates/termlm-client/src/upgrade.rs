@@ -64,6 +64,7 @@ pub async fn run_upgrade(
     tag_override: Option<String>,
 ) -> Result<()> {
     let repo = resolve_repo(repo_override);
+    let api_base = github_api_base();
     let platform = platform_id().ok_or_else(|| {
         anyhow!(
             "unsupported platform for upgrade: os={} arch={}",
@@ -79,7 +80,14 @@ pub async fn run_upgrade(
         .build()
         .context("build upgrade HTTP client")?;
 
-    let release = fetch_release(&client, &repo, tag_override.as_deref(), token.as_deref()).await?;
+    let release = fetch_release(
+        &client,
+        &repo,
+        tag_override.as_deref(),
+        token.as_deref(),
+        &api_base,
+    )
+    .await?;
     let asset = select_upgrade_asset(&release.assets, platform).ok_or_else(|| {
         anyhow!(
             "release {} has no no-models bundle for platform {}",
@@ -214,6 +222,14 @@ fn resolve_repo(repo_override: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string())
 }
 
+fn github_api_base() -> String {
+    std::env::var("TERMLM_GITHUB_API_BASE")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| GITHUB_API_BASE.to_string())
+}
+
 fn github_token() -> Option<String> {
     std::env::var("TERMLM_GITHUB_TOKEN")
         .ok()
@@ -226,11 +242,12 @@ async fn fetch_release(
     repo: &str,
     tag: Option<&str>,
     token: Option<&str>,
+    api_base: &str,
 ) -> Result<GitHubRelease> {
     let url = if let Some(tag) = tag {
-        format!("{}/{repo}/releases/tags/{tag}", GITHUB_API_BASE)
+        format!("{api_base}/{repo}/releases/tags/{tag}")
     } else {
-        format!("{}/{repo}/releases/latest", GITHUB_API_BASE)
+        format!("{api_base}/{repo}/releases/latest")
     };
 
     let mut req = client
@@ -860,5 +877,18 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *termlm-b.tar.g
         unsafe { std::env::set_var("TERMLM_UPGRADE_ALLOW_MISSING_CHECKSUMS", "0") };
         assert!(!allow_missing_checksums());
         unsafe { std::env::remove_var("TERMLM_UPGRADE_ALLOW_MISSING_CHECKSUMS") };
+    }
+
+    #[test]
+    fn github_api_base_defaults_and_overrides() {
+        unsafe { std::env::remove_var("TERMLM_GITHUB_API_BASE") };
+        assert_eq!(github_api_base(), GITHUB_API_BASE.to_string());
+
+        unsafe { std::env::set_var("TERMLM_GITHUB_API_BASE", "http://127.0.0.1:8080/repos/") };
+        assert_eq!(github_api_base(), "http://127.0.0.1:8080/repos".to_string());
+
+        unsafe { std::env::set_var("TERMLM_GITHUB_API_BASE", "   ") };
+        assert_eq!(github_api_base(), GITHUB_API_BASE.to_string());
+        unsafe { std::env::remove_var("TERMLM_GITHUB_API_BASE") };
     }
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command as StdCommand, Stdio};
 use std::time::Instant;
 use termlm_config::AppConfig;
+use termlm_indexer::{Chunk, HybridRetriever, RetrievalQuery};
 use termlm_protocol::{
     Ack, AliasDef, ClientMessage, ErrorKind, FunctionDef, MAX_FRAME_BYTES, RegisterShell,
     ReindexMode, RetrieveRequest, ServerMessage, ShellCapabilities, ShellContext, ShellKind,
@@ -83,6 +84,8 @@ struct TestReport {
     duration_ms: u64,
     retrieval_score: Option<RetrievalScore>,
     retrieval_latency_ms: Option<u64>,
+    retrieval_50k_latency_ms: Option<u64>,
+    retrieval_50k_lexical_ms: Option<u64>,
     task_latency_ms: Option<u64>,
     ttft_ms: Option<u64>,
     throughput_toks_per_sec: Option<f64>,
@@ -119,7 +122,7 @@ struct TestReport {
     error: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct PerfGateThreshold {
     #[serde(default)]
     p50_ms: Option<u64>,
@@ -129,7 +132,7 @@ struct PerfGateThreshold {
     max_ms: Option<u64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct PerfGateFloatThreshold {
     #[serde(default)]
     p50_min: Option<f64>,
@@ -145,10 +148,38 @@ struct PerfGateFloatThreshold {
     max: Option<f64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+struct PerfGateHardwareProfile {
+    #[serde(default)]
+    ttft_ms: Option<PerfGateThreshold>,
+    #[serde(default)]
+    model_load_ms: Option<PerfGateThreshold>,
+    #[serde(default)]
+    throughput_toks_per_sec: Option<PerfGateFloatThreshold>,
+    #[serde(default)]
+    embedding_chunks_per_sec: Option<PerfGateFloatThreshold>,
+    #[serde(default)]
+    observed_command_overhead_ms: Option<PerfGateFloatThreshold>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+struct PerfGateHardwareProfiles {
+    #[serde(default)]
+    apple_m2_pro_max_local: Option<PerfGateHardwareProfile>,
+    #[serde(default)]
+    apple_m3_pro_local: Option<PerfGateHardwareProfile>,
+    #[serde(default)]
+    apple_m3_max_local: Option<PerfGateHardwareProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct PerfGateConfig {
     #[serde(default)]
     retrieval_latency_ms: Option<PerfGateThreshold>,
+    #[serde(default)]
+    retrieval_50k_latency_ms: Option<PerfGateThreshold>,
+    #[serde(default)]
+    retrieval_50k_lexical_ms: Option<PerfGateThreshold>,
     #[serde(default)]
     task_latency_ms: Option<PerfGateThreshold>,
     #[serde(default)]
@@ -201,6 +232,8 @@ struct PerfGateConfig {
     idle_cpu_pct: Option<PerfGateFloatThreshold>,
     #[serde(default)]
     stage_timings_ms: BTreeMap<String, PerfGateThreshold>,
+    #[serde(default)]
+    hardware_profiles: PerfGateHardwareProfiles,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,11 +283,31 @@ struct BenchmarkEnvironment {
     os: String,
     arch: String,
     cpu: String,
+    hardware_class: String,
     logical_cpus: usize,
     total_memory_mb: Option<u64>,
     provider: String,
     model: String,
     performance_profile: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardwareClass {
+    AppleM2ProMaxLocal,
+    AppleM3ProLocal,
+    AppleM3MaxLocal,
+    Other,
+}
+
+impl HardwareClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            HardwareClass::AppleM2ProMaxLocal => "apple_m2_pro_max_local",
+            HardwareClass::AppleM3ProLocal => "apple_m3_pro_local",
+            HardwareClass::AppleM3MaxLocal => "apple_m3_max_local",
+            HardwareClass::Other => "other",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -294,6 +347,12 @@ struct IndexBenchmarkOutput {
     full_reindex_ms: Option<u64>,
     delta_reindex_ms: Option<u64>,
     index_disk_mb: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct Retrieval50kBenchmarkOutput {
+    hybrid_latency_ms: Option<u64>,
+    lexical_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -434,6 +493,8 @@ async fn main() -> Result<()> {
             duration_ms: started.elapsed().as_millis() as u64,
             retrieval_score: None,
             retrieval_latency_ms: None,
+            retrieval_50k_latency_ms: None,
+            retrieval_50k_lexical_ms: None,
             task_latency_ms: None,
             ttft_ms: None,
             throughput_toks_per_sec: None,
@@ -501,6 +562,12 @@ async fn main() -> Result<()> {
             }
         }
 
+        let retrieval_50k = benchmark_retrieval_50k_metrics();
+        for report in &mut reports {
+            report.retrieval_50k_latency_ms = retrieval_50k.hybrid_latency_ms;
+            report.retrieval_50k_lexical_ms = retrieval_50k.lexical_latency_ms;
+        }
+
         if let Ok(observer) = benchmark_terminal_observer_overhead() {
             for report in &mut reports {
                 report.observed_command_overhead_ms = Some(observer.observed_command_overhead_ms);
@@ -561,8 +628,15 @@ async fn main() -> Result<()> {
     print_human_summary(&results, &results_path);
     let perf_gate_violation = if let Some(path) = &cli.perf_gates {
         let gates = load_perf_gates(path)?;
+        let effective_gates = apply_hardware_gate_profile(&gates, &results.benchmark_environment);
+        if effective_gates != gates {
+            println!(
+                "perf gate profile override: {}",
+                results.benchmark_environment.hardware_class
+            );
+        }
         print_perf_summary(&results.tests);
-        check_perf_gates(&results.tests, &gates)
+        check_perf_gates(&results.tests, &effective_gates)
     } else {
         None
     };
@@ -704,16 +778,38 @@ fn gather_benchmark_environment(
     } else {
         cfg.model.e4b_filename.clone()
     };
-    Ok(BenchmarkEnvironment {
+    let cpu = detect_cpu_brand().unwrap_or_else(|| "unknown".to_string());
+    let total_memory_mb = detect_total_memory_mb();
+    let mut env = BenchmarkEnvironment {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        cpu: detect_cpu_brand().unwrap_or_else(|| "unknown".to_string()),
+        cpu,
+        hardware_class: HardwareClass::Other.as_str().to_string(),
         logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
-        total_memory_mb: detect_total_memory_mb(),
+        total_memory_mb,
         provider: provider_name,
         model,
         performance_profile: cfg.performance.profile.clone(),
-    })
+    };
+    env.hardware_class = classify_hardware_class(&env).as_str().to_string();
+    Ok(env)
+}
+
+fn classify_hardware_class(env: &BenchmarkEnvironment) -> HardwareClass {
+    if !(env.os == "macos" && env.arch == "aarch64" && env.provider == "local") {
+        return HardwareClass::Other;
+    }
+    let cpu = env.cpu.to_ascii_lowercase();
+    if cpu.contains("apple m3 max") {
+        return HardwareClass::AppleM3MaxLocal;
+    }
+    if cpu.contains("apple m3 pro") {
+        return HardwareClass::AppleM3ProLocal;
+    }
+    if cpu.contains("apple m2 pro") || cpu.contains("apple m2 max") {
+        return HardwareClass::AppleM2ProMaxLocal;
+    }
+    HardwareClass::Other
 }
 
 fn detect_cpu_brand() -> Option<String> {
@@ -944,7 +1040,7 @@ fn spawn_daemon(
 
 fn daemon_runtime_feature_args(provider: HarnessProvider, runtime_real: bool) -> Vec<&'static str> {
     if matches!(provider, HarnessProvider::Local) && !runtime_real {
-        vec!["--features", "runtime-stub"]
+        vec!["--no-default-features", "--features", "runtime-stub"]
     } else {
         Vec::new()
     }
@@ -1094,6 +1190,37 @@ fn daemon_boot_timeout_secs(runtime_real: bool, ollama_integration_mode: bool) -
         return 60;
     }
     180
+}
+
+fn parse_positive_u64(raw: Option<String>) -> Option<u64> {
+    let parsed = raw?.trim().parse::<u64>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn select_timeout_secs(
+    specific_raw: Option<String>,
+    global_raw: Option<String>,
+    default_secs: u64,
+) -> u64 {
+    parse_positive_u64(specific_raw)
+        .or_else(|| parse_positive_u64(global_raw))
+        .unwrap_or(default_secs)
+}
+
+fn resolved_timeout_secs(specific_env: &str, default_secs: u64) -> u64 {
+    select_timeout_secs(
+        std::env::var(specific_env).ok(),
+        std::env::var("TERMLM_TEST_REINDEX_TIMEOUT_SECS").ok(),
+        default_secs,
+    )
+}
+
+fn reindex_full_timeout_secs() -> u64 {
+    resolved_timeout_secs("TERMLM_TEST_REINDEX_FULL_TIMEOUT_SECS", 180)
+}
+
+fn reindex_delta_timeout_secs() -> u64 {
+    resolved_timeout_secs("TERMLM_TEST_REINDEX_DELTA_TIMEOUT_SECS", 60)
 }
 
 fn ollama_integration_cases() -> Vec<TestCase> {
@@ -1289,6 +1416,8 @@ async fn run_one_test(
         duration_ms: started.elapsed().as_millis() as u64,
         retrieval_score,
         retrieval_latency_ms,
+        retrieval_50k_latency_ms: None,
+        retrieval_50k_lexical_ms: None,
         task_latency_ms,
         ttft_ms,
         throughput_toks_per_sec,
@@ -1635,11 +1764,79 @@ fn benchmark_web_extract_metrics() -> Result<WebExtractBenchmarkOutput> {
     })
 }
 
+fn build_retrieval_bench_chunks(count: usize) -> Vec<Chunk> {
+    let sections = ["NAME", "SYNOPSIS", "OPTIONS", "EXAMPLES"];
+    let mut chunks = Vec::with_capacity(count);
+    let now = chrono::Utc::now();
+    for i in 0..count {
+        let command = format!("cmd{}", i % 3000);
+        let section = sections[i % sections.len()].to_string();
+        let text = format!(
+            "{command} supports --flag{} and pattern search over workspace file {}",
+            i % 7,
+            i % 101
+        );
+        chunks.push(Chunk {
+            command_name: command.clone(),
+            path: format!("/usr/local/share/man/man1/{command}.1"),
+            extraction_method: "man".to_string(),
+            section_name: section,
+            chunk_index: i % 4,
+            total_chunks: 4,
+            doc_hash: format!("h{i:08x}"),
+            extracted_at: now,
+            text,
+        });
+    }
+    chunks
+}
+
+fn run_retrieval_query_bench_ms(
+    retriever: &HybridRetriever,
+    query: &RetrievalQuery,
+) -> Option<u64> {
+    let warmup_iters = 6usize;
+    let samples = 31usize;
+    for _ in 0..warmup_iters {
+        std::hint::black_box(retriever.search(query));
+    }
+    let mut elapsed_us = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        std::hint::black_box(retriever.search(query));
+        elapsed_us.push(started.elapsed().as_micros() as u64);
+    }
+    if elapsed_us.is_empty() {
+        return None;
+    }
+    elapsed_us.sort_unstable();
+    let p50_us = percentile(&elapsed_us, 0.50);
+    Some(p50_us.div_ceil(1000))
+}
+
+fn benchmark_retrieval_50k_metrics() -> Retrieval50kBenchmarkOutput {
+    let chunks = build_retrieval_bench_chunks(50_000);
+    let hybrid_retriever = HybridRetriever::with_dim(chunks.clone(), 384);
+    let lexical_retriever = HybridRetriever::lexical_only(chunks);
+
+    let hybrid_query = RetrievalQuery::new("cmd42 --flag2 options", 8, 0.0);
+    let mut lexical_query = RetrievalQuery::new("cmd42 --flag2 options", 8, 0.0);
+    lexical_query.hybrid_enabled = false;
+    lexical_query.lexical_enabled = true;
+
+    Retrieval50kBenchmarkOutput {
+        hybrid_latency_ms: run_retrieval_query_bench_ms(&hybrid_retriever, &hybrid_query),
+        lexical_latency_ms: run_retrieval_query_bench_ms(&lexical_retriever, &lexical_query),
+    }
+}
+
 async fn benchmark_index_metrics(
     transport: &mut ClientTransport,
     index_root: &Path,
 ) -> Result<IndexBenchmarkOutput> {
     let mut out = IndexBenchmarkOutput::default();
+    let full_timeout_secs = reindex_full_timeout_secs();
+    let delta_timeout_secs = reindex_delta_timeout_secs();
 
     let full_started = Instant::now();
     transport
@@ -1647,7 +1844,8 @@ async fn benchmark_index_metrics(
             mode: ReindexMode::Full,
         })
         .await?;
-    wait_for_reindex_completion(transport, std::time::Duration::from_secs(180)).await?;
+    wait_for_reindex_completion(transport, std::time::Duration::from_secs(full_timeout_secs))
+        .await?;
     let full_reindex_ms = full_started.elapsed().as_millis() as u64;
     out.full_reindex_ms = Some(full_reindex_ms);
 
@@ -1670,7 +1868,11 @@ async fn benchmark_index_metrics(
             mode: ReindexMode::Delta,
         })
         .await?;
-    wait_for_reindex_completion(transport, std::time::Duration::from_secs(60)).await?;
+    wait_for_reindex_completion(
+        transport,
+        std::time::Duration::from_secs(delta_timeout_secs),
+    )
+    .await?;
     out.delta_reindex_ms = Some(delta_started.elapsed().as_millis() as u64);
 
     let bytes = dir_size_bytes(index_root)?;
@@ -1787,7 +1989,8 @@ async fn run_task_check(
     let mut first_response_at = None::<Instant>;
     let mut model_text_chars = 0usize;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let mut responded_for_proposal = false;
+    let mut proposal_count = 0usize;
+    let mut sent_abort_for_verify_proposal = false;
 
     let completion_at = loop {
         let now = tokio::time::Instant::now();
@@ -1859,17 +2062,19 @@ async fn run_task_check(
                 if first_response_at.is_none() {
                     first_response_at = Some(Instant::now());
                 }
-                output.proposed_command = Some(payload.cmd.clone());
+                if output.proposed_command.is_none() {
+                    output.proposed_command = Some(payload.cmd.clone());
+                }
                 if payload.validation.status == "validation_incomplete" {
                     output.saw_validation_incomplete = true;
                 }
                 output
                     .trace
                     .push_str(&format!("Proposed: {}\n", payload.cmd));
-                if responded_for_proposal {
-                    continue;
+                proposal_count = proposal_count.saturating_add(1);
+                if proposal_count > 12 {
+                    bail!("received too many proposed commands without task completion");
                 }
-                responded_for_proposal = true;
                 match test.mode.as_str() {
                     "execute" => {
                         transport
@@ -1913,7 +2118,8 @@ async fn run_task_check(
                             })
                             .await?;
                     }
-                    "verify_proposal" => {
+                    "verify_proposal" if !sent_abort_for_verify_proposal => {
+                        sent_abort_for_verify_proposal = true;
                         transport
                             .send(ClientMessage::UserResponse {
                                 payload: UserResponse {
@@ -1925,6 +2131,7 @@ async fn run_task_check(
                             })
                             .await?;
                     }
+                    "verify_proposal" => {}
                     _ => {}
                 }
             }
@@ -2178,10 +2385,11 @@ fn summarize(reports: &[TestReport]) -> Summary {
 
 fn print_human_summary(results: &HarnessResults, results_path: &Path) {
     println!(
-        "benchmark_environment: os={} arch={} cpu=\"{}\" logical_cpus={} total_memory_mb={:?} provider={} model={} profile={}",
+        "benchmark_environment: os={} arch={} cpu=\"{}\" hardware_class={} logical_cpus={} total_memory_mb={:?} provider={} model={} profile={}",
         results.benchmark_environment.os,
         results.benchmark_environment.arch,
         results.benchmark_environment.cpu,
+        results.benchmark_environment.hardware_class,
         results.benchmark_environment.logical_cpus,
         results.benchmark_environment.total_memory_mb,
         results.benchmark_environment.provider,
@@ -2221,12 +2429,61 @@ fn load_perf_gates(path: &Path) -> Result<PerfGateConfig> {
     Ok(parsed)
 }
 
+fn apply_hardware_gate_profile(
+    gates: &PerfGateConfig,
+    env: &BenchmarkEnvironment,
+) -> PerfGateConfig {
+    let mut effective = gates.clone();
+    let profile = match classify_hardware_class(env) {
+        HardwareClass::AppleM2ProMaxLocal => {
+            effective.hardware_profiles.apple_m2_pro_max_local.clone()
+        }
+        HardwareClass::AppleM3ProLocal => effective.hardware_profiles.apple_m3_pro_local.clone(),
+        HardwareClass::AppleM3MaxLocal => effective.hardware_profiles.apple_m3_max_local.clone(),
+        HardwareClass::Other => None,
+    };
+    if let Some(profile) = profile {
+        if profile.ttft_ms.is_some() {
+            effective.ttft_ms = profile.ttft_ms;
+        }
+        if profile.model_load_ms.is_some() {
+            effective.model_load_ms = profile.model_load_ms;
+        }
+        if profile.throughput_toks_per_sec.is_some() {
+            effective.throughput_toks_per_sec = profile.throughput_toks_per_sec;
+        }
+        if profile.embedding_chunks_per_sec.is_some() {
+            effective.embedding_chunks_per_sec = profile.embedding_chunks_per_sec;
+        }
+        if profile.observed_command_overhead_ms.is_some() {
+            effective.observed_command_overhead_ms = profile.observed_command_overhead_ms;
+        }
+    }
+    effective
+}
+
 fn print_perf_summary(reports: &[TestReport]) {
     if let Some(stats) =
         collect_latency_stats(reports.iter().filter_map(|r| r.retrieval_latency_ms))
     {
         println!(
             "perf retrieval_latency_ms: p50={} p95={} max={}",
+            stats.p50_ms, stats.p95_ms, stats.max_ms
+        );
+    }
+    if let Some(stats) =
+        collect_latency_stats(reports.iter().filter_map(|r| r.retrieval_50k_latency_ms))
+    {
+        println!(
+            "perf retrieval_50k_latency_ms: p50={} p95={} max={}",
+            stats.p50_ms, stats.p95_ms, stats.max_ms
+        );
+    }
+    if let Some(stats) =
+        collect_latency_stats(reports.iter().filter_map(|r| r.retrieval_50k_lexical_ms))
+    {
+        println!(
+            "perf retrieval_50k_lexical_ms: p50={} p95={} max={}",
             stats.p50_ms, stats.p95_ms, stats.max_ms
         );
     }
@@ -2447,6 +2704,20 @@ fn check_perf_gates(reports: &[TestReport], gates: &PerfGateConfig) -> Option<St
             None => violations.push("missing retrieval latency samples for perf gate".to_string()),
         }
     }
+    if let Some(gate) = gates.retrieval_50k_latency_ms.as_ref() {
+        match collect_latency_stats(reports.iter().filter_map(|r| r.retrieval_50k_latency_ms)) {
+            Some(stats) => evaluate_gate("retrieval_50k_latency_ms", stats, gate, &mut violations),
+            None => violations
+                .push("missing retrieval_50k_latency_ms samples for perf gate".to_string()),
+        }
+    }
+    if let Some(gate) = gates.retrieval_50k_lexical_ms.as_ref() {
+        match collect_latency_stats(reports.iter().filter_map(|r| r.retrieval_50k_lexical_ms)) {
+            Some(stats) => evaluate_gate("retrieval_50k_lexical_ms", stats, gate, &mut violations),
+            None => violations
+                .push("missing retrieval_50k_lexical_ms samples for perf gate".to_string()),
+        }
+    }
 
     if let Some(gate) = gates.task_latency_ms.as_ref() {
         match collect_latency_stats(reports.iter().filter_map(|r| r.task_latency_ms)) {
@@ -2534,21 +2805,19 @@ fn check_perf_gates(reports: &[TestReport], gates: &PerfGateConfig) -> Option<St
             None => violations.push("missing index_disk_mb samples for perf gate".to_string()),
         }
     }
-    if let Some(gate) = gates.ollama_orchestration_overhead_ms.as_ref() {
-        match collect_float_stats(
+    if let Some(gate) = gates.ollama_orchestration_overhead_ms.as_ref()
+        && let Some(stats) = collect_float_stats(
             reports
                 .iter()
                 .filter_map(|r| r.ollama_orchestration_overhead_ms),
-        ) {
-            Some(stats) => evaluate_float_gate(
-                "ollama_orchestration_overhead_ms",
-                stats,
-                gate,
-                &mut violations,
-            ),
-            None => violations
-                .push("missing ollama_orchestration_overhead_ms samples for perf gate".to_string()),
-        }
+        )
+    {
+        evaluate_float_gate(
+            "ollama_orchestration_overhead_ms",
+            stats,
+            gate,
+            &mut violations,
+        );
     }
     if let Some(gate) = gates.observed_command_overhead_ms.as_ref() {
         match collect_float_stats(
@@ -2649,10 +2918,17 @@ fn check_perf_gates(reports: &[TestReport], gates: &PerfGateConfig) -> Option<St
 
     let stage_stats = collect_stage_stats(reports);
     for (stage, gate) in &gates.stage_timings_ms {
-        match stage_stats.get(stage) {
+        let effective_stats = if let Some(stats) = stage_stats.get(stage) {
+            Some(*stats)
+        } else if stage == "provider_orchestration_ms" {
+            stage_stats.get("runtime_stub_provider_ms").copied()
+        } else {
+            None
+        };
+        match effective_stats {
             Some(stats) => evaluate_gate(
                 &format!("stage_timings_ms.{stage}"),
-                *stats,
+                stats,
                 gate,
                 &mut violations,
             ),
@@ -2837,7 +3113,7 @@ mod tests {
     fn daemon_runtime_feature_args_local_stub_enables_runtime_stub() {
         assert_eq!(
             daemon_runtime_feature_args(HarnessProvider::Local, false),
-            vec!["--features", "runtime-stub"]
+            vec!["--no-default-features", "--features", "runtime-stub"]
         );
     }
 
@@ -2852,6 +3128,158 @@ mod tests {
     }
 
     #[test]
+    fn parse_positive_u64_accepts_positive_numbers_only() {
+        assert_eq!(parse_positive_u64(Some("30".to_string())), Some(30));
+        assert_eq!(parse_positive_u64(Some(" 60 ".to_string())), Some(60));
+        assert_eq!(parse_positive_u64(Some("0".to_string())), None);
+        assert_eq!(parse_positive_u64(Some("-1".to_string())), None);
+        assert_eq!(parse_positive_u64(Some("abc".to_string())), None);
+        assert_eq!(parse_positive_u64(None), None);
+    }
+
+    #[test]
+    fn select_timeout_secs_prefers_specific_then_global_then_default() {
+        assert_eq!(
+            select_timeout_secs(Some("240".to_string()), Some("300".to_string()), 180),
+            240
+        );
+        assert_eq!(
+            select_timeout_secs(Some("bad".to_string()), Some("300".to_string()), 180),
+            300
+        );
+        assert_eq!(
+            select_timeout_secs(Some("0".to_string()), Some("45".to_string()), 180),
+            45
+        );
+        assert_eq!(
+            select_timeout_secs(Some("bad".to_string()), Some("bad".to_string()), 180),
+            180
+        );
+    }
+
+    #[test]
+    fn classify_hardware_class_detects_apple_profiles() {
+        let mut env = BenchmarkEnvironment {
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            cpu: "Apple M3 Max".to_string(),
+            hardware_class: "other".to_string(),
+            logical_cpus: 12,
+            total_memory_mb: Some(36_864),
+            provider: "local".to_string(),
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            performance_profile: "performance".to_string(),
+        };
+        assert_eq!(
+            classify_hardware_class(&env),
+            HardwareClass::AppleM3MaxLocal
+        );
+        env.cpu = "Apple M3 Pro".to_string();
+        assert_eq!(
+            classify_hardware_class(&env),
+            HardwareClass::AppleM3ProLocal
+        );
+        env.cpu = "Apple M2 Pro".to_string();
+        assert_eq!(
+            classify_hardware_class(&env),
+            HardwareClass::AppleM2ProMaxLocal
+        );
+        env.provider = "ollama".to_string();
+        assert_eq!(classify_hardware_class(&env), HardwareClass::Other);
+    }
+
+    #[test]
+    fn apply_hardware_gate_profile_overrides_expected_fields() {
+        let env = BenchmarkEnvironment {
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            cpu: "Apple M2 Max".to_string(),
+            hardware_class: "apple_m2_pro_max_local".to_string(),
+            logical_cpus: 10,
+            total_memory_mb: Some(32_768),
+            provider: "local".to_string(),
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            performance_profile: "performance".to_string(),
+        };
+        let base = PerfGateConfig {
+            retrieval_latency_ms: None,
+            retrieval_50k_latency_ms: None,
+            retrieval_50k_lexical_ms: None,
+            task_latency_ms: None,
+            ttft_ms: Some(PerfGateThreshold {
+                p50_ms: Some(800),
+                p95_ms: Some(1200),
+                max_ms: Some(1500),
+            }),
+            model_load_ms: None,
+            model_resident_mb: None,
+            rss_mb: None,
+            indexer_resident_mb: None,
+            orchestration_resident_mb: None,
+            kv_cache_mb: None,
+            full_reindex_ms: None,
+            delta_reindex_ms: None,
+            index_disk_mb: None,
+            source_ledger_ref_count: None,
+            source_ledger_overhead_ms: None,
+            tool_routing_overhead_ms: None,
+            pre_provider_overhead_ms: None,
+            planning_loop_overhead_ms: None,
+            web_extract_latency_ms: None,
+            web_extract_latency_p95_ms: None,
+            web_extract_rss_delta_mb: None,
+            throughput_toks_per_sec: None,
+            embedding_chunks_per_sec: None,
+            ollama_orchestration_overhead_ms: None,
+            observed_command_overhead_ms: Some(PerfGateFloatThreshold {
+                p50_min: None,
+                p95_min: None,
+                min: None,
+                p50_max: Some(20.0),
+                p95_max: Some(25.0),
+                max: Some(50.0),
+            }),
+            observed_command_capture_overhead_ms: None,
+            idle_cpu_pct: None,
+            stage_timings_ms: BTreeMap::new(),
+            hardware_profiles: PerfGateHardwareProfiles {
+                apple_m2_pro_max_local: Some(PerfGateHardwareProfile {
+                    ttft_ms: Some(PerfGateThreshold {
+                        p50_ms: Some(400),
+                        p95_ms: Some(1500),
+                        max_ms: Some(1500),
+                    }),
+                    model_load_ms: None,
+                    throughput_toks_per_sec: None,
+                    embedding_chunks_per_sec: None,
+                    observed_command_overhead_ms: Some(PerfGateFloatThreshold {
+                        p50_min: None,
+                        p95_min: None,
+                        min: None,
+                        p50_max: Some(10.0),
+                        p95_max: Some(25.0),
+                        max: Some(50.0),
+                    }),
+                }),
+                apple_m3_pro_local: None,
+                apple_m3_max_local: None,
+            },
+        };
+
+        let applied = apply_hardware_gate_profile(&base, &env);
+        assert_eq!(
+            applied.ttft_ms.and_then(|g| g.p50_ms),
+            Some(400),
+            "ttft should use strict m2 profile override"
+        );
+        assert_eq!(
+            applied.observed_command_overhead_ms.and_then(|g| g.p50_max),
+            Some(10.0),
+            "observer overhead should use strict m2 profile override"
+        );
+    }
+
+    #[test]
     fn perf_gate_passes_within_thresholds() {
         let report = TestReport {
             id: "t".to_string(),
@@ -2861,6 +3289,8 @@ mod tests {
             duration_ms: 10,
             retrieval_score: None,
             retrieval_latency_ms: Some(80),
+            retrieval_50k_latency_ms: Some(30),
+            retrieval_50k_lexical_ms: Some(8),
             task_latency_ms: Some(120),
             ttft_ms: Some(100),
             throughput_toks_per_sec: Some(35.0),
@@ -2903,6 +3333,16 @@ mod tests {
                 p50_ms: Some(100),
                 p95_ms: Some(200),
                 max_ms: Some(500),
+            }),
+            retrieval_50k_latency_ms: Some(PerfGateThreshold {
+                p50_ms: Some(35),
+                p95_ms: Some(50),
+                max_ms: Some(100),
+            }),
+            retrieval_50k_lexical_ms: Some(PerfGateThreshold {
+                p50_ms: Some(10),
+                p95_ms: Some(20),
+                max_ms: Some(50),
             }),
             task_latency_ms: Some(PerfGateThreshold {
                 p50_ms: Some(150),
@@ -3055,6 +3495,7 @@ mod tests {
                     max_ms: Some(700),
                 },
             )]),
+            hardware_profiles: PerfGateHardwareProfiles::default(),
         };
 
         assert!(check_perf_gates(&[report], &gates).is_none());

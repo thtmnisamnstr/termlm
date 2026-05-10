@@ -4,25 +4,31 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag/version string for packaging (for example: v0.1.0-alpha)"
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
-    runs-on: macos-14
+  build-and-package:
+    runs-on: macos-14-arm64
     timeout-minutes: 360
     env:
-      TAG_NAME: ${{ github.ref_name }}
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
-      - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
       - run: if ! command -v rg >/dev/null 2>&1; then brew install ripgrep; fi
       - run: if ! command -v expect >/dev/null 2>&1; then brew install expect; fi
       - run: if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
@@ -102,9 +108,24 @@ jobs:
           find dist -maxdepth 1 -type f -name '*.sha256' -print | sort | while IFS= read -r checksum_file; do
             cat "$checksum_file"
           done > dist/SHA256SUMS
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+      - name: Summarize release artifacts
+        run: |
+          {
+            echo "### Release Artifact Build"
+            echo ""
+            echo "- Tag: \`${TAG_NAME}\`"
+            echo ""
+            echo "Built files:"
+            ls -1 dist | sed 's/^/- `/' | sed 's/$/`/'
+            echo ""
+            echo "SHA256SUMS:"
+            echo '```text'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v6
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            dist/*
+          name: release-dist-${{ env.TAG_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error

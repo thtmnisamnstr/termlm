@@ -12,7 +12,11 @@
 cargo run -p termlm-test -- --suite tests/fixtures/termlm-test-suite.toml --mode all --perf-gates tests/perf/perf-gates.toml
 ```
 
-`tests/perf/perf-gates.toml` is the CI contract. Any threshold violation fails the run.
+`tests/perf/perf-gates.toml` is the performance gate contract. Any threshold violation fails the run in extended validation or local full CI.
+The gate set now includes hardware-class override profiles for dedicated Apple targets:
+`apple_m2_pro_max_local`, `apple_m3_pro_local`, and `apple_m3_max_local`. These apply strict spec targets
+for model load, throughput, embedding throughput, TTFT, and terminal observer overhead while preserving stable defaults
+for non-target hosted runners.
 
 ## 2) Hardware Matrix Evidence
 
@@ -31,14 +35,38 @@ Outputs:
 Useful controls:
 
 ```bash
+TERMLM_PERF_MATRIX_SUITE=tests/fixtures/termlm-perf-suite.toml \
+TERMLM_PERF_MATRIX_CASES=local_stub_all \
+bash tests/perf/hardware_matrix.sh
+
+TERMLM_PERF_MATRIX_GATES=tests/perf/perf-gates.toml \
+TERMLM_PERF_MATRIX_REAL_GATES=tests/perf/real-runtime-gates.toml \
+TERMLM_PERF_MATRIX_CASES=local_stub_all \
+bash tests/perf/hardware_matrix.sh
+
+TERMLM_PERF_MATRIX_REINDEX_TIMEOUT_SECS=300 \
+TERMLM_PERF_MATRIX_CASES=local_stub_all \
+bash tests/perf/hardware_matrix.sh
+
 TERMLM_PERF_MATRIX_CASES=ollama_integration \
 TERMLM_PERF_MATRIX_REQUIRE_OLLAMA=1 \
 bash tests/perf/hardware_matrix.sh
 
 TERMLM_PERF_MATRIX_LOCAL_MODEL_PATH="$HOME/.local/share/termlm/models/gemma-4-E4B-it-Q4_K_M.gguf" \
 TERMLM_PERF_MATRIX_REQUIRE_REAL_LOCAL=1 \
+TERMLM_PERF_MATRIX_REAL_GATES=tests/perf/real-runtime-gates.toml \
+TERMLM_PERF_MATRIX_CASES=local_real_e2e \
 bash tests/perf/hardware_matrix.sh
 ```
+
+`TERMLM_PERF_MATRIX_SUITE` defaults to `tests/fixtures/termlm-test-suite.toml`.
+`TERMLM_PERF_MATRIX_GATES` defaults to `tests/perf/perf-gates.toml`.
+`TERMLM_PERF_MATRIX_REAL_GATES` defaults to `tests/perf/real-runtime-gates.toml`.
+`TERMLM_PERF_MATRIX_REINDEX_TIMEOUT_SECS` defaults to `300`.
+CI lanes set this to `tests/fixtures/termlm-perf-suite.toml` for deterministic runtime while preserving perf gate coverage.
+If reindex-wait windows are too short on large local PATH environments, tune:
+`TERMLM_TEST_REINDEX_TIMEOUT_SECS`, `TERMLM_TEST_REINDEX_FULL_TIMEOUT_SECS`, and
+`TERMLM_TEST_REINDEX_DELTA_TIMEOUT_SECS`.
 
 ## 3) Key Metrics Enforced
 
@@ -47,6 +75,8 @@ Core latency/throughput:
 - `ttft_ms`
 - `task_latency_ms`
 - `retrieval_latency_ms`
+- `retrieval_50k_latency_ms`
+- `retrieval_50k_lexical_ms`
 - `throughput_toks_per_sec`
 - `planning_loop_overhead_ms`
 - `tool_routing_overhead_ms`
@@ -94,7 +124,11 @@ These isolate retrieval scoring and extraction regressions independent of provid
 
 ## 5) CI Coverage
 
-- `macos-14` lane runs full quality gates, adapter contracts, compatibility tests, and performance matrix (`local_stub_all`)
-- optional real-runtime local lane runs when model artifact is present
-- separate scheduled/manual Ollama parity workflow: `.github/workflows/ollama-parity.yml`
-- `ubuntu-24.04` smoke lane enforces formatting, clippy, and workspace tests
+- `.github/workflows/ci.yml` is the fast push/PR gate:
+  - `ubuntu-24.04`: docs links, shell lint, fmt, clippy, workspace tests
+  - `macos-14-arm64`: workspace compile/test smoke (`cargo test --no-run`) + macOS compatibility profile
+- `.github/workflows/extended-validation.yml` is manual and runs full evidence lanes:
+  - release-profile tests, adapter contract, terminal/plugin/SSH compatibility matrix, release smoke
+  - hardware matrix (`local_stub_all`) on `tests/fixtures/termlm-perf-suite.toml`
+  - optional real-runtime local lane when model artifact is present, validated by `tests/perf/real-runtime-gates.toml`
+- `.github/workflows/ollama-parity.yml` is manual and runs the isolated `ollama_integration` parity lane.

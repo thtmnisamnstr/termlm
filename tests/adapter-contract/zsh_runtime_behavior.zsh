@@ -173,4 +173,85 @@ termlm-handle-proposed-event "task-abort" "echo hi" "true"
 assert_eq "$_TERMLM_WAITING_MODEL" "0" "aborted command should stop waiting"
 assert_eq "$_TERMLM_TASK_ID" "" "aborted command should clear active task id"
 
+tmp_cfg_dir="$(mktemp -d "${TMPDIR:-/tmp}/termlm-runtime-ollama.XXXXXX")"
+tmp_cfg="${tmp_cfg_dir}/config.toml"
+mock_client="${tmp_cfg_dir}/mock-client.zsh"
+cat > "$tmp_cfg" <<'CFG'
+[inference]
+provider = "ollama"
+
+[ollama]
+endpoint = "http://127.0.0.1:11434"
+CFG
+cat > "$mock_client" <<'EOF'
+#!/usr/bin/env zsh
+set -euo pipefail
+if [[ "${1:-}" == "status" ]]; then
+  mode="${TERMLM_MOCK_STATUS_MODE:-healthy}"
+  case "$mode" in
+    healthy)
+      print -r -- "provider: ollama"
+      print -r -- "provider_healthy: true"
+      exit 0
+      ;;
+    unhealthy)
+      print -r -- "provider: ollama"
+      print -r -- "provider_healthy: false"
+      exit 0
+      ;;
+    fail)
+      exit 1
+      ;;
+  esac
+fi
+exit 0
+EOF
+chmod +x "$mock_client"
+
+TERMLM_CONFIG_PATH="$tmp_cfg"
+termlm-client-bin() {
+  print -r -- "$mock_client"
+}
+
+_TERMLM_NO_LLM_WARNING_SHOWN=0
+export TERMLM_MOCK_STATUS_MODE="unhealthy"
+warn_file="${tmp_cfg_dir}/warn.out"
+termlm-maybe-warn-no-llm-provider > "$warn_file"
+warn_out="$(<"$warn_file")"
+assert_contains "$warn_out" "no configured LLM provider is available" "unhealthy ollama status should emit startup warning"
+assert_contains "$warn_out" "https://github.com/thtmnisamnstr/termlm/blob/main/docs/configuration.md#use-ollama-for-generation-local-embeddings-still-default" "startup warning should include full docs URL"
+termlm-maybe-warn-no-llm-provider > "$warn_file"
+warn_again="$(<"$warn_file")"
+assert_eq "$warn_again" "" "startup warning should only print once per shell session"
+
+_TERMLM_NO_LLM_WARNING_SHOWN=0
+export TERMLM_MOCK_STATUS_MODE="healthy"
+termlm-maybe-warn-no-llm-provider > "$warn_file"
+healthy_warn="$(<"$warn_file")"
+assert_eq "$healthy_warn" "" "healthy ollama provider should not emit startup warning"
+
+_TERMLM_NO_LLM_WARNING_SHOWN=0
+export TERMLM_MOCK_STATUS_MODE="fail"
+termlm-maybe-warn-no-llm-provider > "$warn_file"
+failed_warn="$(<"$warn_file")"
+assert_contains "$failed_warn" "configured provider=ollama could not be reached" "status failure should emit ollama unavailable warning"
+
+missing_models_dir="${tmp_cfg_dir}/missing-models"
+mkdir -p "$missing_models_dir"
+cat > "$tmp_cfg" <<CFG
+[inference]
+provider = "local"
+
+[model]
+variant = "E4B"
+models_dir = "${missing_models_dir}"
+e4b_filename = "gemma-4-E4B-it-Q4_K_M.gguf"
+CFG
+
+_TERMLM_NO_LLM_WARNING_SHOWN=0
+termlm-maybe-warn-no-llm-provider > "$warn_file"
+missing_warn="$(<"$warn_file")"
+assert_contains "$missing_warn" "bundled local model is missing" "missing local bundled model should emit startup warning"
+rm -rf -- "$tmp_cfg_dir"
+
 print -r -- "zsh runtime behavior checks passed."

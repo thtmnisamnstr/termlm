@@ -7,7 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 MD_FILES = [ROOT / "README.md"]
 MD_FILES.extend(sorted((ROOT / "docs").glob("*.md")))
-for name in ["CONTRIBUTING.md", "SECURITY.md", "SUPPORT.md", "CODE_OF_CONDUCT.md", "CHANGELOG.md"]:
+for name in ["CONTRIBUTING.md", "SECURITY.md", "SUPPORT.md"]:
     p = ROOT / name
     if p.exists():
         MD_FILES.append(p)

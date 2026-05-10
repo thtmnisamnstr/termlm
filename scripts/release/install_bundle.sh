@@ -14,6 +14,9 @@ Environment overrides:
   TERMLM_MODELS_DIR           (default: ~/.local/share/termlm/models)
   TERMLM_GITHUB_REPO          (default: thtmnisamnstr/termlm)
   TERMLM_RELEASE_TAG          (override release tag when using chunked model assets)
+  TERMLM_INSTALL_WAIT_FOR_READY (default: 1; set to 0 to skip daemon/index readiness wait)
+  TERMLM_INSTALL_READY_TIMEOUT_SECS (default: 1800)
+  TERMLM_INSTALL_READY_POLL_SECS (default: 2)
 USAGE
 }
 
@@ -98,6 +101,35 @@ PY
     fi
   fi
   echo ""
+}
+
+detect_bundle_artifact_kind() {
+  local manifest_path="$ROOT_DIR/bundle-manifest.json"
+  if [[ -f "$manifest_path" ]] && command -v python3 >/dev/null 2>&1; then
+    local kind
+    kind="$(python3 - "$manifest_path" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+kind = str(payload.get("artifact_kind", "")).strip().lower()
+if kind in {"with-models", "no-models"}:
+    print(kind)
+else:
+    print("")
+PY
+)"
+    if [[ -n "$kind" ]]; then
+      echo "$kind"
+      return
+    fi
+  fi
+  if [[ -d "$ROOT_DIR/models" ]]; then
+    echo "with-models"
+  else
+    echo "no-models"
+  fi
 }
 
 download_chunked_models() {
@@ -186,6 +218,248 @@ finally:
 PY
 }
 
+is_truthy() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    1|true|yes|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_positive_int_or_default() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -ge 1 ]]; then
+    echo "$value"
+  else
+    echo "$fallback"
+  fi
+}
+
+write_embed_only_bootstrap_config() {
+  local out_path="$1"
+  local source_config="$HOME/.config/termlm/config.toml"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for embed-only bootstrap config generation" >&2
+    exit 1
+  fi
+  python3 - "$source_config" "$out_path" "$MODELS_DIR" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+try:
+    import tomllib
+except Exception:  # pragma: no cover
+    tomllib = None
+
+source_config, out_path, models_dir = sys.argv[1:4]
+
+cfg = {}
+if tomllib is not None and os.path.exists(source_config):
+    try:
+        with open(source_config, "rb") as f:
+            cfg = tomllib.load(f)
+    except Exception:
+        cfg = {}
+
+def get(path, default):
+    cur = cfg
+    for part in path:
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+def as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    return default
+
+def as_int(value, default):
+    if isinstance(value, int):
+        return value
+    return default
+
+def as_string(value, default):
+    if isinstance(value, str) and value.strip():
+        return value
+    return default
+
+socket_path = as_string(get(("daemon", "socket_path"), ""), "$XDG_RUNTIME_DIR/termlm.sock")
+pid_file = as_string(get(("daemon", "pid_file"), ""), "$XDG_RUNTIME_DIR/termlm.pid")
+log_file = as_string(get(("daemon", "log_file"), ""), "~/.local/state/termlm/termlm.log")
+
+ollama_endpoint = as_string(get(("ollama", "endpoint"), ""), "http://127.0.0.1:11434")
+ollama_model = as_string(get(("ollama", "model"), ""), "gemma4:e4b")
+ollama_keep_alive = as_string(get(("ollama", "keep_alive"), ""), "5m")
+ollama_request_timeout = as_int(get(("ollama", "request_timeout_secs"), 300), 300)
+ollama_connect_timeout = as_int(get(("ollama", "connect_timeout_secs"), 3), 3)
+ollama_allow_remote = as_bool(get(("ollama", "allow_remote"), False), False)
+ollama_allow_plain_http_remote = as_bool(
+    get(("ollama", "allow_plain_http_remote"), False), False
+)
+
+embed_filename = as_string(
+    get(("indexer", "embed_filename"), ""),
+    "bge-small-en-v1.5.Q4_K_M.gguf",
+)
+
+lines = [
+    "[daemon]",
+    f"socket_path = {json.dumps(socket_path)}",
+    f"pid_file = {json.dumps(pid_file)}",
+    f"log_file = {json.dumps(log_file)}",
+    "",
+    "[model]",
+    f"models_dir = {json.dumps(models_dir)}",
+    "auto_download = true",
+    "",
+    "[inference]",
+    'provider = "ollama"',
+    "startup_failure_behavior = \"fail\"",
+    "",
+    "[ollama]",
+    f"endpoint = {json.dumps(ollama_endpoint)}",
+    f"model = {json.dumps(ollama_model)}",
+    f"keep_alive = {json.dumps(ollama_keep_alive)}",
+    f"request_timeout_secs = {ollama_request_timeout}",
+    f"connect_timeout_secs = {ollama_connect_timeout}",
+    f"allow_remote = {'true' if ollama_allow_remote else 'false'}",
+    f"allow_plain_http_remote = {'true' if ollama_allow_plain_http_remote else 'false'}",
+    "healthcheck_on_start = false",
+    "",
+    "[indexer]",
+    "enabled = true",
+    'embedding_provider = "local"',
+    f"embed_filename = {json.dumps(embed_filename)}",
+    "",
+]
+
+out_parent = pathlib.Path(out_path).parent
+out_parent.mkdir(parents=True, exist_ok=True)
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines))
+
+print(embed_filename)
+PY
+}
+
+wait_for_runtime_ready() {
+  local termlm_bin="$BIN_DIR/termlm"
+  local termlm_core_bin="$BIN_DIR/termlm-core"
+  local timeout_secs
+  local poll_secs
+  local embed_only_bootstrap=0
+  local embed_filename=""
+  local bootstrap_config=""
+  timeout_secs="$(validate_positive_int_or_default "${TERMLM_INSTALL_READY_TIMEOUT_SECS:-1800}" "1800")"
+  poll_secs="$(validate_positive_int_or_default "${TERMLM_INSTALL_READY_POLL_SECS:-2}" "2")"
+
+  if [[ ! -x "$termlm_bin" || ! -x "$termlm_core_bin" ]]; then
+    echo "cannot wait for runtime readiness: installed binaries missing under $BIN_DIR" >&2
+    exit 1
+  fi
+
+  if [[ "$BUNDLE_ARTIFACT_KIND" == "no-models" ]]; then
+    embed_only_bootstrap=1
+    local bootstrap_tmp
+    bootstrap_tmp="$(mktemp "${TMPDIR:-/tmp}/termlm-install-bootstrap.XXXXXX")"
+    bootstrap_config="${bootstrap_tmp}.toml"
+    mv "$bootstrap_tmp" "$bootstrap_config"
+    embed_filename="$(write_embed_only_bootstrap_config "$bootstrap_config")"
+    if [[ -z "$embed_filename" ]]; then
+      echo "failed to determine embedding filename for no-models bootstrap" >&2
+      exit 1
+    fi
+  fi
+
+  cleanup_bootstrap() {
+    if [[ $embed_only_bootstrap -eq 1 ]]; then
+      "$termlm_bin" stop >/dev/null 2>&1 || true
+      if [[ -n "$bootstrap_config" ]]; then
+        rm -f "$bootstrap_config"
+      fi
+    fi
+  }
+  trap cleanup_bootstrap RETURN
+
+  "$termlm_bin" stop >/dev/null 2>&1 || true
+  if [[ $embed_only_bootstrap -eq 1 ]]; then
+    if ! "$termlm_core_bin" --config "$bootstrap_config" --detach >/dev/null 2>&1; then
+      echo "failed to start termlm-core for no-models embed/index bootstrap" >&2
+      exit 1
+    fi
+  else
+    if ! "$termlm_core_bin" --detach >/dev/null 2>&1; then
+      echo "failed to start termlm-core for readiness bootstrap" >&2
+      exit 1
+    fi
+  fi
+
+  # Trigger a delta refresh explicitly; harmless if one is already running.
+  "$termlm_bin" reindex --mode delta >/dev/null 2>&1 || true
+
+  echo "Waiting for termlm runtime/model/index readiness (timeout ${timeout_secs}s)..."
+  local deadline=$((SECONDS + timeout_secs))
+  local last_status=""
+  while (( SECONDS < deadline )); do
+    local status_out=""
+    if status_out="$("$termlm_bin" status 2>/dev/null)"; then
+      last_status="$status_out"
+      local provider
+      local provider_healthy
+      local phase
+      local percent
+      provider="$(printf '%s\n' "$status_out" | awk -F': ' '/^provider:/ {print $2; exit}')"
+      provider_healthy="$(printf '%s\n' "$status_out" | awk -F': ' '/^provider_healthy:/ {print $2; exit}')"
+      phase="$(printf '%s\n' "$status_out" | sed -n 's/^index_progress: phase=\([^ ]*\) percent=.*/\1/p' | head -n 1)"
+      percent="$(printf '%s\n' "$status_out" | sed -n 's/^index_progress: phase=[^ ]* percent=\([0-9.][0-9.]*\).*/\1/p' | head -n 1)"
+
+      local index_ready=0
+      local provider_ready=1
+
+      if [[ "$phase" == "complete" || "$phase" == "idle" ]]; then
+        if [[ -n "$percent" ]] && awk "BEGIN { exit !($percent >= 100.0) }"; then
+          index_ready=1
+        fi
+      fi
+
+      if [[ "$provider" == "local" && "$provider_healthy" != "true" ]]; then
+        provider_ready=0
+      fi
+
+      if [[ "$index_ready" -eq 1 && "$provider_ready" -eq 1 ]]; then
+        if [[ $embed_only_bootstrap -eq 1 ]]; then
+          local embed_path="$MODELS_DIR/$embed_filename"
+          if [[ ! -s "$embed_path" ]]; then
+            echo "embedding bootstrap incomplete: expected ${embed_path} to exist" >&2
+            exit 1
+          fi
+        fi
+        echo "termlm runtime is ready."
+        return 0
+      fi
+    fi
+    sleep "$poll_secs"
+  done
+
+  echo "timed out waiting for termlm readiness after ${timeout_secs}s" >&2
+  if [[ -n "$last_status" ]]; then
+    echo "last observed status:" >&2
+    printf '%s\n' "$last_status" >&2
+  fi
+  exit 1
+}
+
+BUNDLE_ARTIFACT_KIND="$(detect_bundle_artifact_kind)"
+
 if [[ $SKIP_MODELS -eq 0 && -d "$ROOT_DIR/models" ]]; then
   mkdir -p "$MODELS_DIR"
   if compgen -G "$ROOT_DIR/models/*.gguf" >/dev/null 2>&1; then
@@ -200,8 +474,16 @@ if [[ $SKIP_MODELS -eq 0 && -d "$ROOT_DIR/models" ]]; then
   fi
 fi
 
+if [[ $SKIP_MODELS -eq 0 ]]; then
+  if is_truthy "${TERMLM_INSTALL_WAIT_FOR_READY:-1}"; then
+    wait_for_runtime_ready
+  else
+    echo "Skipping runtime/index readiness wait (TERMLM_INSTALL_WAIT_FOR_READY=0)"
+  fi
+fi
+
 echo "Installed termlm binaries to: $BIN_DIR"
 echo "Installed zsh plugin to:      $SHARE_DIR/plugins/zsh"
-if [[ $SKIP_MODELS -eq 0 && -d "$ROOT_DIR/models" ]]; then
-  echo "Installed models to:          $MODELS_DIR"
+if [[ $SKIP_MODELS -eq 0 ]]; then
+  echo "Installed model assets to:    $MODELS_DIR"
 fi

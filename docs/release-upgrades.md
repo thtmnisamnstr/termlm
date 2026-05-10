@@ -29,7 +29,7 @@ A valid bundle contains:
 ```json
 {
   "schema_version": 1,
-  "version": "0.1.0",
+  "version": "0.1.0-alpha",
   "target": "darwin-arm64",
   "artifact_kind": "no-models",
   "includes_models": false
@@ -54,6 +54,11 @@ Optional:
 
 - `gemma-4-E2B-it-Q4_K_M.gguf` when `TERMLM_RELEASE_INCLUDE_E2B=1`
 
+Default checksum posture in `scripts/release/package_release.sh`:
+
+- E4B and embedding artifacts are checksum-validated by default
+- E2B checksum must be supplied when included (`TERMLM_RELEASE_MODEL_E2B_SHA256`)
+
 ## install.sh Behavior
 
 Inside a release bundle:
@@ -73,11 +78,36 @@ For chunked models, `install.sh` resolves the release tag from `bundle-manifest.
 `TERMLM_RELEASE_TAG` and downloads model chunks from GitHub release assets, verifies each chunk,
 assembles the final model file, and verifies the final model checksum.
 
+Install completion semantics:
+
+- `with-models` bundle install completes only after:
+  - model chunk download/assembly (unless `--skip-models`)
+  - daemon bootstrap is healthy
+  - index bootstrap reaches complete/idle at `100%`
+- `no-models` bundle install completes only after:
+  - embedding model bootstrap (if missing)
+  - index bootstrap reaches complete/idle at `100%`
+  - verification that the embedding GGUF exists locally
+
+`no-models` install intentionally does **not** fetch the local inference GGUF during install.
+
+Readiness wait controls:
+
+- `TERMLM_INSTALL_WAIT_FOR_READY=0` to skip readiness wait
+- `TERMLM_INSTALL_READY_TIMEOUT_SECS` (default `1800`)
+- `TERMLM_INSTALL_READY_POLL_SECS` (default `2`)
+
 For first-time installs, repository bootstrap helper:
 
 ```bash
 scripts/install.sh
 ```
+
+Bootstrap installer hardening:
+
+- requires `curl`, `python3`, and `shasum`
+- verifies `SHA256SUMS` before extraction
+- performs safe archive extraction (rejects absolute/parent paths and link/device entries)
 
 ## `termlm upgrade` Behavior
 
@@ -99,6 +129,7 @@ Environment controls:
 
 - `TERMLM_GITHUB_REPO` (default `thtmnisamnstr/termlm`)
 - `TERMLM_GITHUB_TOKEN`/`GITHUB_TOKEN` for API/auth rate-limit handling
+- `TERMLM_GITHUB_API_BASE` (testing override for release API base; default `https://api.github.com/repos`)
 - `TERMLM_INSTALL_BIN_DIR`
 - `TERMLM_INSTALL_SHARE_DIR`
 - `TERMLM_UPGRADE_ALLOW_MISSING_CHECKSUMS=1` (testing override, not recommended for production)
@@ -111,6 +142,51 @@ scripts/release/package_release.sh --mode no-models --version vX.Y.Z --target da
 scripts/release/package_release.sh --mode with-models --version vX.Y.Z --target darwin-arm64 --out dist
 cat dist/*.sha256 > dist/SHA256SUMS
 ```
+
+## Manual Release Build and Upload (When GitHub Actions Is Unavailable)
+
+Run from repository root:
+
+```bash
+rm -rf dist
+mkdir -p dist
+
+cargo build -p termlm-client -p termlm-core --release --locked
+
+scripts/release/package_release.sh \
+  --mode no-models \
+  --version vX.Y.Z \
+  --target darwin-arm64 \
+  --out dist
+
+scripts/release/package_release.sh \
+  --mode with-models \
+  --version vX.Y.Z \
+  --target darwin-arm64 \
+  --out dist
+
+find dist -maxdepth 1 -type f -name '*.sha256' -print | sort | while IFS= read -r f; do
+  cat "$f"
+done > dist/SHA256SUMS
+```
+
+If you apply signing/notarization, regenerate `SHA256SUMS` after signing.
+
+Validate release artifacts locally before publishing:
+
+```bash
+bash tests/release/release_smoke.sh
+bash tests/release/upgrade_rehearsal.sh
+```
+
+Publish by uploading all files in `dist/` to the GitHub Release for the same tag:
+
+- `termlm-<version>-darwin-arm64-no-models.tar.gz` and `.sha256`
+- `termlm-<version>-darwin-arm64-with-models.tar.gz` and `.sha256`
+- all `termlm-<version>-darwin-arm64-model-*.part-*` chunk assets and each `.sha256`
+- `SHA256SUMS`
+
+Do not omit model chunk assets for with-models releases.
 
 Optional codesign/notary hardening for public releases:
 
@@ -136,6 +212,9 @@ After signing/notarization, regenerate `SHA256SUMS` from `dist/*.sha256` before 
 CI release workflow:
 
 - `.github/workflows/release.yml`
+- triggers on tag push (`v*`) and manual dispatch (`workflow_dispatch`)
+- builds/validates/packages release artifacts and uploads `dist/*` as a workflow artifact bundle
+- does **not** create or publish GitHub Releases/tags automatically (release publication is manual)
 - optional codesign/notary lane is auto-enabled when all relevant secrets are present:
   - `APPLE_SIGNING_CERT_P12_BASE64`
   - `APPLE_SIGNING_CERT_PASSWORD`
@@ -143,4 +222,20 @@ CI release workflow:
   - `APPLE_NOTARY_APPLE_ID`
   - `APPLE_NOTARY_APP_PASSWORD`
   - `APPLE_NOTARY_TEAM_ID`
-- GitHub artifact provenance attestation is generated for `dist/*` release assets
+- Optional future hardening: GitHub artifact provenance attestation for `dist/*` release assets.
+
+## Local Upgrade Rehearsal
+
+End-to-end local rehearsal (no external release dependency):
+
+```bash
+bash tests/release/upgrade_rehearsal.sh
+```
+
+This validates:
+
+- first install from `with-models` bundle
+- `termlm upgrade` selection of `no-models` bundle
+- checksum verification via `SHA256SUMS`
+- install receipt fields (`artifact_kind=no-models`, `includes_models=false`)
+- model preservation and temp artifact cleanup

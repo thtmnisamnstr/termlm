@@ -19,12 +19,10 @@ tokio-util.workspace = true
 toml.workspace = true
 uuid.workspace = true
 termlm-config = { path = "../termlm-config" }
+termlm-indexer = { path = "../termlm-indexer" }
 termlm-protocol = { path = "../termlm-protocol" }
 termlm-safety = { path = "../termlm-safety" }
 termlm-web = { path = "../termlm-web" }
-
-[dev-dependencies]
-termlm-indexer = { path = "../termlm-indexer" }
 
 [[test]]
 name = "mock_daemon"

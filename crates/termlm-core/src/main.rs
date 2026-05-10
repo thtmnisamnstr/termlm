@@ -1354,7 +1354,7 @@ async fn process_start_task(
                     transport,
                     &payload,
                     &session,
-                    true,
+                    false,
                     &classification,
                     &payload.prompt,
                 )
@@ -1401,7 +1401,7 @@ async fn process_start_task(
                         transport,
                         &payload,
                         &session,
-                        true,
+                        false,
                         &classification,
                         &payload.prompt,
                     )

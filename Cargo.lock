@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-client"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-config"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "serde",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-core"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-indexer"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-inference"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-local-tools"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-protocol"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "chrono",
  "serde",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-safety"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "once_cell",
  "regex",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-test"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "termlm-web"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "async-trait",

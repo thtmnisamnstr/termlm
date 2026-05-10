@@ -1,0 +1,149 @@
+# termlm perf-focused behavioral suite
+# Smaller deterministic subset used by hardware matrix lanes.
+
+# Run with: termlm-test --suite termlm-test-suite.toml --mode all
+
+[suite]
+version                = "1.0.0"
+total_tests            = 12
+default_approval_mode  = "auto"
+default_timeout_secs   = 30
+sandbox_root_template  = "${TMPDIR:-/tmp}/termlm-tests-{uuid}"
+
+[shell_context]
+aliases   = { g = "git", ll = "ls -lah", gst = "git status" }
+functions = { mkcd = 'mkcd () { mkdir -p "$1" && cd "$1"; }' }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATEGORY 1: LISTING (LST-001 … LST-010)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Selected tests
+
+[[test]]
+id = "LST-001"
+category = "listing"
+prompt = "list files by modification date, newest first"
+setup = ["touch alpha.txt", "sleep 1", "touch bravo.md", "sleep 1", "touch charlie.log"]
+mode = "execute"
+expected = { command_regex = ['\bls\b.*-l?t\b', '\bls\b.*--sort=time'], must_succeed = true, stdout_order = ["charlie.log", "bravo.md", "alpha.txt"] }
+relevant_commands = ["ls"]
+
+
+[[test]]
+id = "LST-002"
+category = "listing"
+prompt = "show me the 10 largest files in this directory"
+setup = ["for i in 1 2 3 4 5 6 7 8 9 10 11 12; do dd if=/dev/zero of=file$i.bin bs=1024 count=$((i*10)) status=none; done"]
+mode = "execute"
+expected = { command_regex = ['\b(ls\b.*-l?S|du\b.*\bsort\b.*\bhead\b|find\b.*-size)'], must_succeed = true, stdout_contains = ["file12.bin"] }
+relevant_commands = ["ls", "du", "find", "sort", "head"]
+
+
+[[test]]
+id = "SRC-001"
+category = "search"
+prompt = "find files containing TODO"
+setup = ["echo 'TODO: fix this' > a.py", "echo 'done' > b.py", "echo 'TODO again' > c.txt"]
+mode = "execute"
+expected = { command_regex = ['\b(grep|rg|ag)\b.*-r.*TODO', '\brg\b.*TODO', '\bgrep\b.*-r.*TODO'], must_succeed = true, stdout_contains = ["a.py"] }
+relevant_commands = ["grep", "rg", "ag", "ack"]
+
+
+[[test]]
+id = "SRC-002"
+category = "search"
+prompt = "search for 'def main' in all Python files"
+setup = ["echo 'def main():' > app.py", "echo 'def main():' > srv.py", "echo 'def main' > notes.txt"]
+mode = "execute"
+expected = { command_regex = ['\b(grep|rg)\b.*(--include[= ]\*?\.?py|\*\.py|-t\s*py|-g\s+\*\.py)'], must_succeed = true, stdout_contains = ["app.py", "srv.py"] }
+relevant_commands = ["grep", "rg"]
+
+
+[[test]]
+id = "OPS-001"
+category = "file_ops"
+prompt = "delete all .log files older than 7 days"
+setup = [
+  "for i in 1 2 3; do touch -t 202504010000 old$i.log; done",
+  "for i in 1 2 3; do touch new$i.log; done",
+]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*\.log\b.*-mtime\s*\+7\b.*(-delete|-exec\s+rm)'], must_succeed = true, filesystem_state_after = { not_exists = ["old1.log", "old2.log", "old3.log"], exists = ["new1.log", "new2.log", "new3.log"] } }
+relevant_commands = ["find", "rm"]
+
+
+[[test]]
+id = "OPS-003"
+category = "file_ops"
+prompt = "create a directory called archive"
+setup = []
+mode = "execute"
+expected = { command_regex = ['\bmkdir\b(\s+-p)?\s+archive'], must_succeed = true, filesystem_state_after = { exists = ["archive"] } }
+relevant_commands = ["mkdir"]
+
+
+[[test]]
+id = "TXT-001"
+category = "text"
+prompt = "count the number of lines in input.txt"
+setup = ["printf 'a\\nb\\nc\\nd\\ne\\n' > input.txt"]
+mode = "execute"
+expected = { command_regex = ['\bwc\b\s+-l\s+input\.txt'], must_succeed = true, stdout_contains = ["5"] }
+relevant_commands = ["wc"]
+
+
+[[test]]
+id = "TXT-003"
+category = "text"
+prompt = "show the last 50 lines of bigfile.txt"
+setup = ["seq 1 200 > bigfile.txt"]
+mode = "execute"
+expected = { command_regex = ['\btail\b.*-n?\s*50.*bigfile\.txt'], must_succeed = true, stdout_contains = ["200"] }
+relevant_commands = ["tail"]
+
+
+[[test]]
+id = "SYS-003"
+category = "system"
+prompt = "show disk usage by filesystem"
+setup = []
+mode = "execute"
+expected = { command_regex = ['\bdf\b\s+-h?H?'], must_succeed = true }
+relevant_commands = ["df"]
+
+
+[[test]]
+id = "GIT-001"
+category = "git"
+prompt = "show me my git status"
+setup = [
+  "git init -q -b main",
+  "git config user.email t@e.com && git config user.name t",
+  "echo hi > a.txt && git add a.txt && git commit -q -m init",
+  "echo modified >> a.txt",
+]
+mode = "execute"
+expected = { command_regex = ['\bgit\s+status\b'], must_succeed = true, stdout_contains = ["modified", "a.txt"] }
+relevant_commands = ["git"]
+
+
+[[test]]
+id = "ORC-001"
+category = "orchestration"
+prompt = "find every empty directory under here and delete them"
+setup = ["mkdir empty1 empty2 nonempty", "touch nonempty/keep"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-type\s+d.*-empty.*(-delete|-exec\s+rmdir)'], must_succeed = true, filesystem_state_after = { exists = ["nonempty"], not_exists = ["empty1", "empty2"] } }
+relevant_commands = ["find", "rmdir"]
+
+
+[[test]]
+id = "DOC-001"
+category = "documentation"
+prompt = "what flag does find use to filter by file size"
+setup = []
+mode = "verify_proposal"
+expected = { command_regex = ['^(?:lookup_command_docs|.*-size).*'] }
+relevant_commands = ["find"]
