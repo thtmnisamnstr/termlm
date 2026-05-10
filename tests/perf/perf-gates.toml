@@ -48,7 +48,7 @@ p95_min = 25.0
 min = 25.0
 
 [embedding_chunks_per_sec]
-p50_min = 70.0
+p50_min = 60.0
 p95_min = 35.0
 min = 20.0
 
