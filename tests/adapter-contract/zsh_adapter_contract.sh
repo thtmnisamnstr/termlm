@@ -114,10 +114,15 @@ run_zsh_check "source \"$LIB_OBSERVER\"; [[ \"\$(termlm-epoch-to-ms 1.234)\" == 
 run_zsh_check "source \"$LIB_OBSERVER\"; _TERMLM_OBS_CAPTURE_ALL=0; _TERMLM_SHELL_ID='shell'; _TERMLM_PENDING_TASK_ID=''; _TERMLM_RUN_DIR='/tmp/termlm-contract'; mkdir -p \"\$_TERMLM_RUN_DIR\"; termlm-preexec 'll /tmp' 'ls -l /tmp'; [[ \"\$_TERMLM_LAST_PREEXEC_CMD\" == 'll /tmp' && \"\$_TERMLM_LAST_PREEXEC_EXPANDED\" == 'ls -l /tmp' ]]"
 
 echo "checking automated runtime behavior flows..."
-if ! zsh "$RUNTIME_BEHAVIOR" >/dev/null 2>&1; then
+runtime_log="$(mktemp "${TMPDIR:-/tmp}/termlm-runtime-contract.XXXXXX")"
+pty_log="$(mktemp "${TMPDIR:-/tmp}/termlm-pty-contract.XXXXXX")"
+trap 'rm -f -- "$runtime_log" "$pty_log"' EXIT
+if ! zsh "$RUNTIME_BEHAVIOR" >"$runtime_log" 2>&1; then
+  cat "$runtime_log" >&2 || true
   fail "zsh runtime behavior contract failed"
 fi
-if ! zsh "$PTY_BEHAVIOR" >/dev/null 2>&1; then
+if ! zsh "$PTY_BEHAVIOR" >"$pty_log" 2>&1; then
+  cat "$pty_log" >&2 || true
   fail "zsh PTY behavior contract failed"
 fi
 
