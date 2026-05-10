@@ -9668,7 +9668,7 @@ fn peer_uid_matches(stream: &UnixStream) -> Result<bool> {
         }
         // SAFETY: geteuid reads current effective uid.
         let self_uid = unsafe { libc::geteuid() };
-        return Ok(cred.uid == self_uid);
+        Ok(cred.uid == self_uid)
     }
 
     #[cfg(not(target_os = "linux"))]

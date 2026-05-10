@@ -225,6 +225,11 @@ termlm-preexec() {
   _TERMLM_LAST_PREEXEC_CWD="$PWD"
   _TERMLM_OBS_CURRENT_SEQ=$(( _TERMLM_OBS_SEQ + 1 ))
 
+  # Some PTY/terminal combinations can tear down before zshexit runs; notify early on explicit shell exit commands.
+  if [[ -n "$_TERMLM_SHELL_ID" ]] && [[ "$_TERMLM_LAST_PREEXEC_CMD" =~ '^[[:space:]]*(exit|logout)([[:space:]]|$)' ]]; then
+    termlm-helper-send '{"op":"unregister_shell"}' >/dev/null 2>&1 || true
+  fi
+
   if [[ -z "$_TERMLM_SHELL_ID" || -n "$_TERMLM_PENDING_TASK_ID" ]]; then
     return
   fi

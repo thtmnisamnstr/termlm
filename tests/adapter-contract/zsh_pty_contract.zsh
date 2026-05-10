@@ -165,8 +165,10 @@ send -s -- "/p\r"
 expect -re {TERMLM_SESSION> }
 send -s -- "session followup\r"
 expect -re {TERMLM_SESSION> }
-# Ctrl-D exits the shell in this PTY harness and exercises unregister on shutdown.
-send -- "\004"
+# Leave session mode explicitly, then exit shell. Ctrl-D behavior can vary by TERM/keymap.
+send -s -- "/q\r"
+expect -re {TERMLM_NORMAL> }
+send -s -- "exit\r"
 expect eof
 EOF
 then
