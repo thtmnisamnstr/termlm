@@ -12,6 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
       - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
+      - run: if ! command -v rg >/dev/null 2>&1; then brew install ripgrep; fi
       - run: if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
       - run: python3 scripts/ci/check_docs_links.py
       - run: bash scripts/ci/lint_shell.sh
@@ -51,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
       - run: cargo install cargo-machete --locked
       - run: cargo machete --with-metadata --skip-target-dir
       - run: python3 scripts/ci/check_docs_links.py

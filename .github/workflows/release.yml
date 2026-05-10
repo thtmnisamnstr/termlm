@@ -25,12 +25,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 360
     env:
-      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
       - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
+      - run: if ! command -v rg >/dev/null 2>&1; then brew install ripgrep; fi
       - run: if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
       - run: python3 scripts/ci/check_docs_links.py
       - run: bash scripts/ci/lint_shell.sh

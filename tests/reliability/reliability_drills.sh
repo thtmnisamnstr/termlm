@@ -53,8 +53,10 @@ wait_for_daemon() {
 }
 
 start_daemon() {
-  [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" >/dev/null 2>&1 || true
-  [[ -n "${DAEMON_PID:-}" ]] && wait "$DAEMON_PID" >/dev/null 2>&1 || true
+  if [[ -n "${DAEMON_PID:-}" ]]; then
+    kill "$DAEMON_PID" >/dev/null 2>&1 || true
+    wait "$DAEMON_PID" >/dev/null 2>&1 || true
+  fi
   DAEMON_PID=""
 
   log "starting daemon"
