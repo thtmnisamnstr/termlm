@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/termlm-core",
+  "crates/termlm-protocol",
+  "crates/termlm-client",
+  "crates/termlm-config",
+  "crates/termlm-safety",
+  "crates/termlm-indexer",
+  "crates/termlm-inference",
+  "crates/termlm-web",
+  "crates/termlm-local-tools",
+  "crates/termlm-test",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+authors = ["termlm contributors"]
+
+[workspace.dependencies]
+arc-swap = "1"
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+memmap2 = "0.9"
+notify = "8"
+notify-debouncer-full = "0.7"
+once_cell = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "process", "io-util"] }
+tokio-serde = { version = "0.9", features = ["json"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+uuid = { version = "1", features = ["serde", "v7"] }
+url = "2"
+half = "2"
+criterion = "0.8"
+futures-core = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-stream = "0.1"
+robotstxt = "0.3"
+libc = "0.2"
+blake3 = "1"

@@ -1,0 +1,56 @@
+name: ollama-parity
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ollama-parity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ollama-parity:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
+      - run: if ! command -v ollama >/dev/null 2>&1; then brew install ollama; fi
+      - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
+      - run: ollama --version
+      - run: jq --version
+      - name: Run parity matrix lane
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/termlm-ollama-parity-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${OUT_DIR}"
+          echo "TERMLM_OLLAMA_PARITY_OUT=${OUT_DIR}" >> "${GITHUB_ENV}"
+          TERMLM_PERF_MATRIX_CASES=ollama_integration \
+          TERMLM_PERF_MATRIX_REQUIRE_OLLAMA=1 \
+          TERMLM_TEST_OLLAMA_MODEL=gemma3:1b \
+          bash tests/perf/hardware_matrix.sh "${OUT_DIR}"
+      - name: Validate manifest contract
+        run: |
+          MANIFEST="${TERMLM_OLLAMA_PARITY_OUT}/manifest.json"
+          test -s "${MANIFEST}"
+          jq -e '
+            .summary.failed == 0
+            and .summary.skipped == 0
+            and .summary.passed == 1
+            and .summary.total == 1
+            and (.cases | length) == 1
+            and .cases[0].name == "ollama_integration"
+            and .cases[0].status == "passed"
+          ' "${MANIFEST}" >/dev/null
+          jq -r '"ollama-parity summary: passed=\(.summary.passed) failed=\(.summary.failed) skipped=\(.summary.skipped) total=\(.summary.total)"' "${MANIFEST}" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload parity artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-parity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TERMLM_OLLAMA_PARITY_OUT }}
+          if-no-files-found: error

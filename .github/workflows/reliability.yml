@@ -1,0 +1,15 @@
+name: reliability-drills
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+
+jobs:
+  drills:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
+      - run: TERMLM_SOAK_ITERS=30 bash tests/reliability/reliability_drills.sh

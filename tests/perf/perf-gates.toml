@@ -1,0 +1,150 @@
+# Performance budgets enforced by termlm-test --perf-gates.
+# This file is intentionally strict and aligned with the v1 performance posture.
+# Max values are still wider than p95 to absorb occasional CI jitter.
+
+[retrieval_latency_ms]
+p50_ms = 35
+p95_ms = 80
+max_ms = 2500
+
+[task_latency_ms]
+p50_ms = 150
+p95_ms = 350
+max_ms = 2500
+
+[ttft_ms]
+p50_ms = 80
+p95_ms = 200
+max_ms = 1200
+
+[model_load_ms]
+p50_ms = 8000
+p95_ms = 30000
+max_ms = 30000
+
+[model_resident_mb]
+p95_ms = 5000
+max_ms = 5500
+
+[rss_mb]
+p95_ms = 300
+max_ms = 450
+
+[indexer_resident_mb]
+p95_ms = 300
+max_ms = 400
+
+[orchestration_resident_mb]
+p95_ms = 250
+max_ms = 400
+
+[kv_cache_mb]
+p95_ms = 96
+max_ms = 192
+
+[throughput_toks_per_sec]
+p50_min = 60.0
+p95_min = 25.0
+min = 25.0
+
+[embedding_chunks_per_sec]
+p50_min = 100.0
+p95_min = 50.0
+min = 20.0
+
+[full_reindex_ms]
+p50_ms = 180000
+p95_ms = 300000
+max_ms = 1800000
+
+[delta_reindex_ms]
+p50_ms = 5000
+p95_ms = 30000
+max_ms = 120000
+
+[index_disk_mb]
+p50_ms = 250
+p95_ms = 300
+max_ms = 600
+
+[ollama_orchestration_overhead_ms]
+p50_max = 75.0
+p95_max = 150.0
+max = 300.0
+
+[observed_command_overhead_ms]
+p50_max = 10.0
+p95_max = 25.0
+max = 50.0
+
+[observed_command_capture_overhead_ms]
+p50_max = 25.0
+p95_max = 50.0
+max = 100.0
+
+[idle_cpu_pct]
+p95_max = 0.5
+max = 1.5
+
+[source_ledger_ref_count]
+p50_ms = 128
+p95_ms = 256
+max_ms = 512
+
+[source_ledger_overhead_ms]
+p50_ms = 5
+p95_ms = 20
+max_ms = 50
+
+[tool_routing_overhead_ms]
+p50_ms = 10
+p95_ms = 25
+max_ms = 75
+
+[pre_provider_overhead_ms]
+p50_ms = 75
+p95_ms = 200
+max_ms = 1000
+
+[planning_loop_overhead_ms]
+p50_ms = 150
+p95_ms = 500
+max_ms = 1500
+
+[web_extract_latency_ms]
+p50_ms = 250
+p95_ms = 400
+max_ms = 1200
+
+[web_extract_latency_p95_ms]
+p50_ms = 350
+p95_ms = 500
+max_ms = 1500
+
+[web_extract_rss_delta_mb]
+p50_ms = 50
+p95_ms = 80
+max_ms = 128
+
+[stage_timings_ms.classify_ms]
+p50_ms = 8
+p95_ms = 12
+max_ms = 60
+
+[stage_timings_ms.assemble_context_ms]
+p50_ms = 20
+p95_ms = 60
+max_ms = 200
+
+[stage_timings_ms.local_shortcut_ms]
+p95_ms = 100
+max_ms = 800
+
+[stage_timings_ms.provider_orchestration_ms]
+p95_ms = 40
+max_ms = 300
+
+[stage_timings_ms.task_total_ms]
+p50_ms = 100
+p95_ms = 250
+max_ms = 1200

@@ -1,0 +1,43 @@
+[package]
+name = "termlm-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+regex.workspace = true
+tokio.workspace = true
+tokio-serde.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+uuid.workspace = true
+termlm-config = { path = "../termlm-config" }
+termlm-protocol = { path = "../termlm-protocol" }
+termlm-safety = { path = "../termlm-safety" }
+termlm-web = { path = "../termlm-web" }
+
+[dev-dependencies]
+termlm-indexer = { path = "../termlm-indexer" }
+
+[[test]]
+name = "mock_daemon"
+path = "../../tests/integration/mock_daemon.rs"
+
+[[test]]
+name = "mock_plugin"
+path = "../../tests/integration/mock_plugin.rs"
+
+[[test]]
+name = "indexer_e2e"
+path = "../../tests/integration/indexer_e2e.rs"
+
+[[test]]
+name = "rag_relevance"
+path = "../../tests/integration/rag_relevance.rs"

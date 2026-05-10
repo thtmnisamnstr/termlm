@@ -1,0 +1,20 @@
+/target/
+**/*.sock
+**/*.pid
+.DS_Store
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env and logs
+.env
+.env.*
+*.log
+
+# Coverage / artifacts
+coverage/
+dist/
+tmp/

@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: macos-14
+    timeout-minutes: 360
+    env:
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
+      - run: if ! command -v jq >/dev/null 2>&1; then brew install jq; fi
+      - run: if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
+      - run: python3 scripts/ci/check_docs_links.py
+      - run: bash scripts/ci/lint_shell.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --release --locked
+      - run: bash tests/adapter-contract/zsh_adapter_contract.sh
+      - run: bash tests/release/release_smoke.sh
+      - run: cargo build -p termlm-client -p termlm-core --release --locked
+      - name: Prepare release bundles
+        run: |
+          mkdir -p dist
+          scripts/release/package_release.sh \
+            --mode no-models \
+            --version "${TAG_NAME}" \
+            --target darwin-arm64 \
+            --out dist
+          scripts/release/package_release.sh \
+            --mode with-models \
+            --version "${TAG_NAME}" \
+            --target darwin-arm64 \
+            --out dist
+      - name: Import Apple codesigning certificate
+        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+      - name: Configure Apple notary profile
+        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' && secrets.APPLE_NOTARY_APPLE_ID != '' && secrets.APPLE_NOTARY_APP_PASSWORD != '' && secrets.APPLE_NOTARY_TEAM_ID != '' }}
+        env:
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials termlm-notary \
+            --apple-id "${APPLE_NOTARY_APPLE_ID}" \
+            --password "${APPLE_NOTARY_APP_PASSWORD}" \
+            --team-id "${APPLE_NOTARY_TEAM_ID}"
+      - name: Codesign and notarize release bundles
+        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          args=(--dist dist --identity "${APPLE_CODESIGN_IDENTITY}")
+          if [[ -n "${APPLE_NOTARY_APPLE_ID:-}" && -n "${APPLE_NOTARY_APP_PASSWORD:-}" && -n "${APPLE_NOTARY_TEAM_ID:-}" ]]; then
+            args+=(--notary-profile termlm-notary)
+          fi
+          scripts/release/sign_and_notarize.sh "${args[@]}"
+      - name: Assemble release checksums
+        run: |
+          find dist -maxdepth 1 -type f -name '*.sha256' -print | sort | while IFS= read -r checksum_file; do
+            cat "$checksum_file"
+          done > dist/SHA256SUMS
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            dist/*
+      - name: Generate release provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
