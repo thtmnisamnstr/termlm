@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to publish (e.g. v0.2.0)"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -25,7 +19,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 360
     env:
-      TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+      TAG_NAME: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
