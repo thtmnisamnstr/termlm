@@ -46,14 +46,34 @@ jobs:
             --version "${TAG_NAME}" \
             --target darwin-arm64 \
             --out dist
+      - name: Resolve signing configuration
+        id: signing
+        env:
+          APPLE_SIGNING_CERT_P12_BASE64: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 }}
+          APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          if [[ -n "${APPLE_SIGNING_CERT_P12_BASE64}" && -n "${APPLE_SIGNING_CERT_PASSWORD}" && -n "${APPLE_CODESIGN_IDENTITY}" ]]; then
+            echo "codesign=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "codesign=false" >> "${GITHUB_OUTPUT}"
+          fi
+          if [[ -n "${APPLE_NOTARY_APPLE_ID}" && -n "${APPLE_NOTARY_APP_PASSWORD}" && -n "${APPLE_NOTARY_TEAM_ID}" ]]; then
+            echo "notary=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "notary=false" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Import Apple codesigning certificate
-        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        if: ${{ steps.signing.outputs.codesign == 'true' }}
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 }}
           p12-password: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
       - name: Configure Apple notary profile
-        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' && secrets.APPLE_NOTARY_APPLE_ID != '' && secrets.APPLE_NOTARY_APP_PASSWORD != '' && secrets.APPLE_NOTARY_TEAM_ID != '' }}
+        if: ${{ steps.signing.outputs.codesign == 'true' && steps.signing.outputs.notary == 'true' }}
         env:
           APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
           APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
@@ -64,7 +84,7 @@ jobs:
             --password "${APPLE_NOTARY_APP_PASSWORD}" \
             --team-id "${APPLE_NOTARY_TEAM_ID}"
       - name: Codesign and notarize release bundles
-        if: ${{ secrets.APPLE_SIGNING_CERT_P12_BASE64 != '' && secrets.APPLE_SIGNING_CERT_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        if: ${{ steps.signing.outputs.codesign == 'true' }}
         env:
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
