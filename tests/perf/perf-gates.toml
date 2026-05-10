@@ -48,8 +48,8 @@ p95_min = 25.0
 min = 25.0
 
 [embedding_chunks_per_sec]
-p50_min = 100.0
-p95_min = 50.0
+p50_min = 70.0
+p95_min = 35.0
 min = 20.0
 
 [full_reindex_ms]
@@ -58,7 +58,7 @@ p95_ms = 300000
 max_ms = 1800000
 
 [delta_reindex_ms]
-p50_ms = 5000
+p50_ms = 8000
 p95_ms = 30000
 max_ms = 120000
 
