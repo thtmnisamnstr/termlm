@@ -1528,7 +1528,7 @@ fn sample_idle_cpu_pct(pid: u32) -> Option<f64> {
             return None;
         }
         let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return value.parse::<f64>().ok();
+        value.parse::<f64>().ok()
     }
 }
 

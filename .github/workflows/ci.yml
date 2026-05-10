@@ -41,7 +41,7 @@ jobs:
             echo "Skipping real-runtime E2E lane (model artifact not present at $MODEL_PATH)"
           fi
       - name: Upload hardware matrix artifacts
-        if: always()
+        if: ${{ always() && env.TERMLM_HW_MATRIX_OUT != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: hardware-matrix-${{ github.run_id }}-${{ github.run_attempt }}
