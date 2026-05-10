@@ -202,7 +202,10 @@ fi
 
 if ! wait_for_log_pattern "event:unregister_shell" 8; then
   # Allow a final direct check in case the bridge writes unregister right as polling ends.
-  if ! rg -q --fixed-strings -- "event:unregister_shell" "${MOCK_LOG}"; then
+  # Some zsh/PTY combinations can race the mock's final branch logging even though the raw
+  # unregister payload is sent and captured.
+  if ! rg -q --fixed-strings -- "event:unregister_shell" "${MOCK_LOG}" \
+    && ! rg -q --fixed-strings -- 'recv:{"op":"unregister_shell"}' "${MOCK_LOG}"; then
     fail "shell did not send unregister on exit"
   fi
 fi

@@ -9649,18 +9649,41 @@ fn build_provider(cfg: &AppConfig) -> Result<ProviderRuntime> {
 
 fn peer_uid_matches(stream: &UnixStream) -> Result<bool> {
     let fd = stream.as_raw_fd();
-    let mut euid: libc::uid_t = 0;
-    let mut egid: libc::gid_t = 0;
-
-    // SAFETY: getpeereid reads peer credentials for a connected Unix socket.
-    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("getpeereid failed");
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt(SO_PEERCRED) reads peer credentials for a connected Unix socket.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("getsockopt(SO_PEERCRED) failed");
+        }
+        // SAFETY: geteuid reads current effective uid.
+        let self_uid = unsafe { libc::geteuid() };
+        return Ok(cred.uid == self_uid);
     }
 
-    // SAFETY: geteuid reads current effective uid.
-    let self_uid = unsafe { libc::geteuid() };
-    Ok(euid == self_uid)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        // SAFETY: getpeereid reads peer credentials for a connected Unix socket.
+        let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("getpeereid failed");
+        }
+        // SAFETY: geteuid reads current effective uid.
+        let self_uid = unsafe { libc::geteuid() };
+        Ok(euid == self_uid)
+    }
 }
 
 fn init_logging(cfg: &AppConfig) {
