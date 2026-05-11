@@ -223,13 +223,12 @@ if [[ ! -x "$PAYLOAD_ROOT/install.sh" ]]; then
   exit 1
 fi
 
-INSTALL_ARGS=()
-if [[ "$SKIP_MODELS" == "1" ]]; then
-  INSTALL_ARGS+=(--skip-models)
-fi
-
 echo "Installing ${ASSET_NAME} (${RELEASE_TAG})..."
-"$PAYLOAD_ROOT/install.sh" "${INSTALL_ARGS[@]}"
+if [[ "$SKIP_MODELS" == "1" ]]; then
+  "$PAYLOAD_ROOT/install.sh" --skip-models
+else
+  "$PAYLOAD_ROOT/install.sh"
+fi
 
 echo "Done."
 
