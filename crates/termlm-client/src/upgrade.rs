@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use termlm_protocol::{ClientMessage, MAX_FRAME_BYTES, ServerMessage};
 use tokio::io::AsyncWriteExt;
@@ -147,6 +148,7 @@ pub async fn run_upgrade(
 
     shutdown_daemon_best_effort().await;
     install_payload(&payload_root, &layout)?;
+    verify_installed_payload(&layout)?;
 
     let manifest = manifest.unwrap_or(BundleManifest {
         schema_version: 1,
@@ -603,6 +605,46 @@ fn install_payload(payload_root: &Path, layout: &InstallLayout) -> Result<()> {
         bail!("release bundle missing zsh plugin directory");
     }
     install_dir_replace(&plugins_src, &layout.plugins_zsh_dir)?;
+    Ok(())
+}
+
+fn verify_installed_payload(layout: &InstallLayout) -> Result<()> {
+    let cli = layout.bin_dir.join("termlm");
+    let core = layout.bin_dir.join("termlm-core");
+    let plugin = layout.plugins_zsh_dir.join("termlm.plugin.zsh");
+    if !cli.is_file() {
+        bail!("installed CLI is missing: {}", cli.display());
+    }
+    if !core.is_file() {
+        bail!("installed daemon is missing: {}", core.display());
+    }
+    if !plugin.is_file() {
+        bail!("installed zsh plugin is missing: {}", plugin.display());
+    }
+
+    run_help_check(&cli)?;
+    run_help_check(&core)?;
+    Ok(())
+}
+
+fn run_help_check(path: &Path) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--help")
+        .output()
+        .with_context(|| format!("run {} --help", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "installed binary failed smoke check: {} --help exited {}{}",
+            path.display(),
+            output.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        );
+    }
     Ok(())
 }
 

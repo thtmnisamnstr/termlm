@@ -23,6 +23,8 @@ Notes:
 Environment:
   TERMLM_GITHUB_TOKEN  Optional GitHub token for higher API rate limits
   GITHUB_TOKEN         Fallback token env var
+  TERMLM_GITHUB_API_BASE
+                       Override release API repo base (default: https://api.github.com/repos)
 
 Prerequisites:
   curl, python3, shasum
@@ -96,7 +98,9 @@ case "${OS}:${ARCH}" in
 esac
 
 TOKEN="${TERMLM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-API_BASE="https://api.github.com/repos/${REPO}/releases"
+API_REPOS_BASE="${TERMLM_GITHUB_API_BASE:-https://api.github.com/repos}"
+API_REPOS_BASE="${API_REPOS_BASE%/}"
+API_BASE="${API_REPOS_BASE}/${REPO}/releases"
 if [[ -n "$TAG" ]]; then
   RELEASE_URL="${API_BASE}/tags/${TAG}"
 else
@@ -149,6 +153,7 @@ ASSET_NAME="$(sed -n '1p' "$PY_OUT")"
 ASSET_URL="$(sed -n '2p' "$PY_OUT")"
 SHA_URL="$(sed -n '3p' "$PY_OUT")"
 RELEASE_TAG="$(sed -n '4p' "$PY_OUT")"
+INSTALL_RELEASE_TAG="${RELEASE_TAG:-$TAG}"
 
 ARCHIVE_PATH="${TMP_ROOT}/${ASSET_NAME}"
 SHA_PATH="${TMP_ROOT}/SHA256SUMS"
@@ -223,16 +228,76 @@ if [[ ! -x "$PAYLOAD_ROOT/install.sh" ]]; then
   exit 1
 fi
 
+patch_payload_installer_compat() {
+  local installer="$1"
+  python3 - "$installer" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    original = path.read_text(encoding="utf-8")
+except UnicodeDecodeError:
+    raise SystemExit(0)
+
+patched = original.replace(
+    'split($i,a,\\"=\\"); print a[2]; exit',
+    'split($i,a,"="); print a[2]; exit',
+)
+patched = patched.replace(
+    'if [[ "$phase_complete" -eq 1 && "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 ]]; then',
+    'if [[ "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 && -s "$(dirname "$index_manifest_path")/vectors.f16" && -s "$(dirname "$index_manifest_path")/lexicon.bin" && -s "$(dirname "$index_manifest_path")/postings.bin" ]]; then',
+)
+
+if patched != original:
+    path.write_text(patched, encoding="utf-8")
+PY
+}
+
+verify_installed_payload() {
+  local bin_dir="${TERMLM_INSTALL_BIN_DIR:-$HOME/.local/bin}"
+  local share_dir="${TERMLM_INSTALL_SHARE_DIR:-$HOME/.local/share/termlm}"
+  if [[ ! -x "$bin_dir/termlm" ]]; then
+    echo "installed CLI is missing or not executable: $bin_dir/termlm" >&2
+    exit 1
+  fi
+  if [[ ! -x "$bin_dir/termlm-core" ]]; then
+    echo "installed daemon is missing or not executable: $bin_dir/termlm-core" >&2
+    exit 1
+  fi
+  if [[ ! -f "$share_dir/plugins/zsh/termlm.plugin.zsh" ]]; then
+    echo "installed zsh plugin is missing: $share_dir/plugins/zsh/termlm.plugin.zsh" >&2
+    exit 1
+  fi
+  "$bin_dir/termlm" --help >/dev/null || {
+    echo "installed CLI failed to run: $bin_dir/termlm --help" >&2
+    exit 1
+  }
+  "$bin_dir/termlm-core" --help >/dev/null || {
+    echo "installed daemon failed to run: $bin_dir/termlm-core --help" >&2
+    exit 1
+  }
+}
+
+patch_payload_installer_compat "$PAYLOAD_ROOT/install.sh"
+
 echo "Installing ${ASSET_NAME} (${RELEASE_TAG})..."
-if [[ "$SKIP_MODELS" == "1" ]]; then
-  "$PAYLOAD_ROOT/install.sh" --skip-models
-else
-  "$PAYLOAD_ROOT/install.sh"
+INSTALL_ENV=(TERMLM_GITHUB_REPO="$REPO")
+if [[ -n "$INSTALL_RELEASE_TAG" ]]; then
+  INSTALL_ENV+=(TERMLM_RELEASE_TAG="$INSTALL_RELEASE_TAG")
 fi
+
+if [[ "$SKIP_MODELS" == "1" ]]; then
+  env "${INSTALL_ENV[@]}" "$PAYLOAD_ROOT/install.sh" --skip-models
+else
+  env "${INSTALL_ENV[@]}" "$PAYLOAD_ROOT/install.sh"
+fi
+
+verify_installed_payload
 
 echo "Done."
 
 echo "Next steps:"
 echo "  1) Ensure ~/.local/bin is in PATH"
 echo "  2) Run: termlm init zsh"
-echo "  3) Open a new zsh session"
+echo "  3) Reload zsh with: exec zsh -l"

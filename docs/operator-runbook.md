@@ -170,9 +170,10 @@ TERMLM_TEST_OLLAMA=1 cargo run -p termlm-test -- --suite tests/fixtures/termlm-t
 Release packaging:
 
 ```bash
+VERSION=v0.1.0-alpha
 cargo build -p termlm-client -p termlm-core --release --locked
-scripts/release/package_release.sh --mode no-models --version vX.Y.Z --target darwin-arm64 --out dist
-scripts/release/package_release.sh --mode with-models --version vX.Y.Z --target darwin-arm64 --out dist
+scripts/release/package_release.sh --mode no-models --version "$VERSION" --target darwin-arm64 --out dist
+scripts/release/package_release.sh --mode with-models --version "$VERSION" --target darwin-arm64 --out dist
 cat dist/*.sha256 > dist/SHA256SUMS
 ```
 

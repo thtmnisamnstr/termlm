@@ -142,6 +142,9 @@ Environment controls:
 - `TERMLM_GITHUB_REPO` (default `thtmnisamnstr/termlm`)
 - `TERMLM_GITHUB_TOKEN`/`GITHUB_TOKEN` for API/auth rate-limit handling
 - `TERMLM_GITHUB_API_BASE` (testing override for release API base; default `https://api.github.com/repos`)
+- `TERMLM_GITHUB_DOWNLOAD_BASE` (testing override for GitHub release asset downloads; default `https://github.com`)
+- `TERMLM_MODEL_DOWNLOAD_RETRIES` (default `3`)
+- `TERMLM_MODEL_DOWNLOAD_TIMEOUT_SECS` (default `300`)
 - `TERMLM_INSTALL_BIN_DIR`
 - `TERMLM_INSTALL_SHARE_DIR`
 - `TERMLM_UPGRADE_ALLOW_MISSING_CHECKSUMS=1` (testing override, not recommended for production)
@@ -157,9 +160,10 @@ If you want to start with a completely fresh environment, uninstall termlm and r
 ### Packaging
 
 ```bash
+VERSION=v0.1.0-alpha
 cargo build -p termlm-client -p termlm-core --release --locked
-scripts/release/package_release.sh --mode no-models --version vX.Y.Z --target darwin-arm64 --out dist
-scripts/release/package_release.sh --mode with-models --version vX.Y.Z --target darwin-arm64 --out dist
+scripts/release/package_release.sh --mode no-models --version "$VERSION" --target darwin-arm64 --out dist
+scripts/release/package_release.sh --mode with-models --version "$VERSION" --target darwin-arm64 --out dist
 cat dist/*.sha256 > dist/SHA256SUMS
 ```
 
@@ -170,18 +174,19 @@ Run from repository root:
 ```bash
 rm -rf dist
 mkdir -p dist
+VERSION=v0.1.0-alpha
 
 cargo build -p termlm-client -p termlm-core --release --locked
 
 scripts/release/package_release.sh \
   --mode no-models \
-  --version vX.Y.Z \
+  --version "$VERSION" \
   --target darwin-arm64 \
   --out dist
 
 scripts/release/package_release.sh \
   --mode with-models \
-  --version vX.Y.Z \
+  --version "$VERSION" \
   --target darwin-arm64 \
   --out dist
 
@@ -233,8 +238,8 @@ CI release workflow:
 
 - `.github/workflows/release.yml`
 - triggers on tag push (`v*`) and manual dispatch (`workflow_dispatch`)
-- builds/validates/packages release artifacts and uploads `dist/*` as a workflow artifact bundle
-- does **not** create or publish GitHub Releases/tags automatically (release publication is manual)
+- rejects placeholder tags such as `vX.Y.Z`
+- builds/validates/packages release artifacts, uploads `dist/*` as a workflow artifact bundle, and publishes/clobbers the same files on the GitHub Release for the tag
 - optional codesign/notary lane is auto-enabled when all relevant secrets are present:
   - `APPLE_SIGNING_CERT_P12_BASE64`
   - `APPLE_SIGNING_CERT_PASSWORD`

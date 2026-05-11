@@ -22,9 +22,47 @@ Symptoms:
 
 Actions:
 
-1. `termlm-core --detach`
-2. `termlm status`
-3. verify runtime dir/socket permissions
+1. Verify the installed binaries are on PATH:
+
+   ```bash
+   command -v termlm
+   command -v termlm-core
+   ```
+
+2. Try a manual daemon start:
+
+   ```bash
+   termlm-core --detach
+   termlm status --verbose
+   ```
+
+3. If status is still unreachable, inspect the daemon log:
+
+   ```bash
+   tail -n 120 ~/.local/state/termlm/termlm.log
+   ```
+
+4. If no useful log was written, run the daemon in the foreground to see the startup error directly:
+
+   ```bash
+   termlm-core
+   ```
+
+5. Check the common startup blockers:
+
+   - config parse/validation errors in `~/.config/termlm/config.toml`
+   - missing local model files under `~/.local/share/termlm/models`
+   - unsupported local-provider platform
+   - invalid `XDG_RUNTIME_DIR` or socket/pid-file permissions
+   - an old daemon process still owning the configured socket
+
+6. After fixing the blocker, restart cleanly:
+
+   ```bash
+   termlm stop || true
+   termlm-core --detach
+   termlm status --verbose
+   ```
 
 ## Installer waits too long at readiness
 

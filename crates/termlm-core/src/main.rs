@@ -1398,7 +1398,7 @@ async fn process_start_task(
                     Ok(())
                 } else {
                     let fallback_started = std::time::Instant::now();
-                    if maybe_run_runtime_stub_provider(
+                    let handled_fallback = if maybe_run_runtime_stub_provider(
                         state,
                         transport,
                         &payload,
@@ -1409,6 +1409,18 @@ async fn process_start_task(
                     )
                     .await?
                     {
+                        true
+                    } else {
+                        maybe_run_heuristic_command_fallback(
+                            state,
+                            transport,
+                            &payload,
+                            &session,
+                            &classification,
+                        )
+                        .await?
+                    };
+                    if handled_fallback {
                         stage_timings.insert(
                             "provider_no_tool_call_ms".to_string(),
                             fallback_started.elapsed().as_millis() as u64,
@@ -5899,6 +5911,36 @@ async fn maybe_run_runtime_stub_provider(
         payload,
         session,
         provider_continuation,
+        classification,
+        CommandPlan {
+            cmd: draft.cmd,
+            rationale: draft.rationale,
+            intent: draft.intent,
+            expected_effect: draft.expected_effect,
+            commands_used: draft.commands_used,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn maybe_run_heuristic_command_fallback(
+    state: &Arc<DaemonState>,
+    transport: &mut ipc::ServerTransport,
+    payload: &termlm_protocol::StartTask,
+    session: &ShellSession,
+    classification: &tasks::ClassificationResult,
+) -> Result<bool> {
+    let Some(draft) = tasks::draft_command_for_prompt(&payload.prompt) else {
+        return Ok(false);
+    };
+
+    propose_command_for_execution(
+        state,
+        transport,
+        payload,
+        session,
+        true,
         classification,
         CommandPlan {
             cmd: draft.cmd,

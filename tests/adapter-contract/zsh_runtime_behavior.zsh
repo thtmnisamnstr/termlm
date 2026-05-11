@@ -61,6 +61,10 @@ reset_state() {
   _TERMLM_SAVED_PS1='$ '
   _TERMLM_WAITING_MODEL=0
   _TERMLM_TASK_ID=""
+  _TERMLM_CLARIFICATION_TASK_ID=""
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
   _TERMLM_PENDING_TASK_ID=""
   _TERMLM_PENDING_CMD=""
   _TERMLM_PENDING_CWD_BEFORE=""
@@ -83,7 +87,9 @@ termlm-approval-prompt() {
   print -r -- "$_TEST_APPROVAL_DECISION"
 }
 
+typeset -g _TEST_DECISION_ARGS=""
 termlm-send-decision() {
+  _TEST_DECISION_ARGS="$*"
   return 0
 }
 
@@ -154,6 +160,8 @@ reset_state
 _TERMLM_MODE="prompt"
 _TEST_APPROVAL_DECISION="approved"
 termlm-handle-proposed-event "task-approved" "echo hi" "true"
+assert_eq "$_TERMLM_APPROVAL_TASK_ID" "task-approved" "proposed command should enter approval state"
+termlm-handle-approval-key "y"
 assert_eq "$_TERMLM_PENDING_TASK_ID" "task-approved" "approved command should set pending task id"
 assert_eq "$_TERMLM_PENDING_CMD" "echo hi" "approved command should set pending command"
 assert_eq "$BUFFER" "wrapped:echo hi:1" "approved command should execute wrapped command via BUFFER"
@@ -163,13 +171,28 @@ reset_state
 _TERMLM_MODE="prompt"
 _TEST_APPROVAL_DECISION="rejected"
 termlm-handle-proposed-event "task-rejected" "echo hi" "true"
+assert_eq "$_TERMLM_APPROVAL_TASK_ID" "task-rejected" "rejected command should start in approval state"
+termlm-handle-approval-key "n"
 assert_eq "$_TERMLM_WAITING_MODEL" "1" "rejected command should continue waiting for model"
 assert_eq "$_TERMLM_MODE" "prompt" "rejected command should remain in prompt mode"
 
 reset_state
 _TERMLM_MODE="prompt"
+_TERMLM_TASK_ID="task-clarify"
+_TERMLM_CLARIFICATION_TASK_ID="task-clarify"
+BUFFER="use mkdir -p archive"
+_TEST_DECISION_ARGS=""
+termlm-accept-line
+assert_contains "$_TEST_DECISION_ARGS" "--decision clarification" "clarification reply should be sent as user_response"
+assert_contains "$_TEST_DECISION_ARGS" "--text use mkdir -p archive" "clarification reply should include prompt text"
+assert_eq "$_TERMLM_CLARIFICATION_TASK_ID" "" "clarification state should clear after reply"
+assert_eq "$_TERMLM_WAITING_MODEL" "1" "clarification reply should resume model wait"
+
+reset_state
+_TERMLM_MODE="prompt"
 _TEST_APPROVAL_DECISION="abort"
 termlm-handle-proposed-event "task-abort" "echo hi" "true"
+termlm-handle-approval-key $'\x1b'
 assert_eq "$_TERMLM_WAITING_MODEL" "0" "aborted command should stop waiting"
 assert_eq "$_TERMLM_TASK_ID" "" "aborted command should clear active task id"
 

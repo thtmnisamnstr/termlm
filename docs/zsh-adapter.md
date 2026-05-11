@@ -25,8 +25,9 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 - Proposed commands requiring approval use single-key decisions:
   - `y`: approve
   - `n` or Enter: reject
-  - `e`: edit in `$EDITOR`
+  - `e`: edit inline in the prompt before execution
   - `a`: approve all for current task only
+- Clarification replies are typed back into prompt/session mode rather than collected through a blocking nested editor.
 - Approved commands execute in real interactive zsh via `BUFFER` + `zle .accept-line`.
 
 ## Prompt Indicators
@@ -46,7 +47,7 @@ Config source: `[prompt]` in `~/.config/termlm/config.toml`, with env overrides:
 
 - Adapter ensures daemon availability (auto-starts `termlm-core --detach` if needed).
 - A persistent helper process (`termlm bridge`) maintains shell registration and stream handling.
-- The helper stream is consumed asynchronously through `zle -F`, so prompt editing remains responsive during output.
+- The helper stream is consumed asynchronously through `zle -F`, so prompt editing, approval, and clarification handling remain responsive during output.
 
 ## Hooks Registered
 

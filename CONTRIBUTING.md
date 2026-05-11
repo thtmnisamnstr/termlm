@@ -8,6 +8,14 @@ Thanks for contributing.
 - macOS with zsh for adapter/runtime contract validation
 - `cmake` in `PATH` for local provider build path
 
+Note: To clear termlm fully from your system for testing purposes (or otherwise), run:
+```
+termlm uninstall --yes
+rm -rf ~/.local/state/termlm
+rm -rf ~/.local/share/termlm
+rm -rf ~/.config/termlm
+```
+
 ## Development Loop
 
 1. Required pre-commit validation (minimum gate):

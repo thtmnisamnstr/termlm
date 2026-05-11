@@ -60,8 +60,8 @@ Lanes:
 
 - `.github/workflows/release.yml`
   - runs on `v*` tag push and manual dispatch
-  - performs release-grade validation + packaging and uploads `dist/*` as workflow artifacts
-  - does not auto-publish GitHub releases/tags
+  - rejects placeholder release tags
+  - performs release-grade validation + packaging, uploads `dist/*` as workflow artifacts, and publishes/clobbers those files on the GitHub Release for the tag
 - `.github/workflows/ollama-parity.yml`
   - manual Ollama parity evidence lane (`ollama_integration`)
 - `.github/workflows/reliability.yml`

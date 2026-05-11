@@ -78,12 +78,19 @@ require_pattern "$WIDGET_SELF_INSERT" 'termlm-enter-prompt-mode' "self-insert mu
 require_literal "$WIDGET_ACCEPT_LINE" "\"\$BUFFER\" =~ '^/p[[:space:]]*$'" "accept-line must intercept /p"
 require_literal "$WIDGET_ACCEPT_LINE" "\"\$BUFFER\" =~ '^/q[[:space:]]*$'" "accept-line must intercept /q"
 require_pattern "$WIDGET_ACCEPT_LINE" 'termlm-abandon-active-task' "accept-line must abort pending task on implicit command"
+require_pattern "$WIDGET_ACCEPT_LINE" '_TERMLM_CLARIFICATION_TASK_ID' "accept-line must route clarification replies through the prompt"
+if rg -q --fixed-strings -- 'vared -p' "$LIB_IPC"; then
+  fail "adapter must not invoke vared from async ZLE event handlers"
+fi
 
 echo "checking approval contract..."
-require_pattern "$WIDGET_APPROVAL" 'read -k 1 -s key' "approval must use single-key silent input"
 require_pattern "$WIDGET_APPROVAL" '\[y\]es.*\[n\]o\(default\).*\[e\]dit.*\[a\]ll-in-this-task' "approval UI must expose y/n/e/a controls"
-require_literal "$WIDGET_APPROVAL" "\$'\\r'|\$'\\n'|\"\") echo \"rejected\"" "Return/default must reject"
-require_literal "$WIDGET_APPROVAL" "echo \"edited:\$edited\"" "approval edit flow must return edited command payload"
+require_pattern "$WIDGET_SELF_INSERT" 'termlm-handle-approval-key' "approval keys must be handled by zle key widgets"
+require_pattern "$WIDGET_ACCEPT_LINE" 'termlm-finish-edited-approval' "edited approvals must be completed through accept-line"
+require_pattern "$LIB_IPC" 'termlm-reject-pending-approval' "Return/default must reject pending approval"
+if rg -q --fixed-strings -- 'read -k' "$WIDGET_APPROVAL" "$LIB_IPC"; then
+  fail "adapter must not block on read -k from async ZLE event handlers"
+fi
 
 echo "checking execution/capture contract..."
 require_literal "$LIB_CAPTURE" "echo \"( { \$cmd; } > >(tee \\\"\$out\\\") 2> >(tee \\\"\$err\\\" >&2) )\"" "capture wrapper must use subshell tee process substitution"

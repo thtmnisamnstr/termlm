@@ -118,6 +118,10 @@ termlm-enter-session-mode() {
 termlm-exit-session-mode() {
   _TERMLM_SESSION_MODE=0
   _TERMLM_TASK_ID=""
+  _TERMLM_CLARIFICATION_TASK_ID=""
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
   termlm-exit-prompt-mode
 }
 

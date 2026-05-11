@@ -3,12 +3,112 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/termlm-release-smoke.XXXXXX")"
-trap 'rm -rf "${TMP_ROOT}"' EXIT
+SERVER_PID=""
+
+cleanup() {
+  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+  fi
+  rm -rf "${TMP_ROOT}"
+}
+trap cleanup EXIT
 
 DIST_DIR="${TMP_ROOT}/dist"
 INSTALL_ROOT="${TMP_ROOT}/install-root"
 MODEL_SOURCE_DIR="${TMP_ROOT}/model-source"
 mkdir -p "${DIST_DIR}" "${INSTALL_ROOT}" "${MODEL_SOURCE_DIR}"
+
+fail() {
+  echo "release smoke failure: $*" >&2
+  exit 1
+}
+
+pick_free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+assemble_sha256sums() {
+  (
+    cd "${DIST_DIR}" && \
+      find . -maxdepth 1 -type f -name '*.sha256' -print | sort | while IFS= read -r checksum_file; do
+        cat "${checksum_file}"
+      done > SHA256SUMS
+  )
+}
+
+run_mock_server() {
+  local port="$1"
+  local server_root="$2"
+  python3 -m http.server "${port}" --bind 127.0.0.1 --directory "${server_root}" >/dev/null 2>&1 &
+  SERVER_PID=$!
+  sleep 1
+  kill -0 "${SERVER_PID}" >/dev/null 2>&1 || fail "mock release server failed to start"
+}
+
+run_top_level_install_rehearsal() {
+  local release_tag="v0.0.0-installer-live"
+  local server_root="${TMP_ROOT}/installer-server"
+  local port
+  port="$(pick_free_port)"
+
+  local api_dir="${server_root}/repos/example/termlm/releases"
+  local download_dir="${server_root}/downloads/${release_tag}"
+  local github_download_dir="${server_root}/github/example/termlm/releases/download/${release_tag}"
+  mkdir -p "${api_dir}" "${download_dir}" "${github_download_dir}"
+  cp "${DIST_DIR}/"* "${download_dir}/"
+  cp "${DIST_DIR}/"* "${github_download_dir}/"
+
+  local with_models_asset
+  with_models_asset="$(basename "${WITH_MODELS_ARCHIVE}")"
+  cat > "${api_dir}/latest" <<EOF
+{
+  "tag_name": "${release_tag}",
+  "assets": [
+    {
+      "name": "${with_models_asset}",
+      "browser_download_url": "http://127.0.0.1:${port}/downloads/${release_tag}/${with_models_asset}"
+    },
+    {
+      "name": "SHA256SUMS",
+      "browser_download_url": "http://127.0.0.1:${port}/downloads/${release_tag}/SHA256SUMS"
+    }
+  ]
+}
+EOF
+
+  run_mock_server "${port}" "${server_root}"
+
+  local top_install_root="${TMP_ROOT}/top-level-install-root"
+  local top_home="${top_install_root}/home"
+  local top_bin="${top_home}/.local/bin"
+  local top_share="${top_home}/.local/share/termlm"
+  local top_models="${top_share}/models"
+  mkdir -p "${top_home}"
+
+  HOME="${top_home}" \
+    TERMLM_INSTALL_BIN_DIR="${top_bin}" \
+    TERMLM_INSTALL_SHARE_DIR="${top_share}" \
+    TERMLM_MODELS_DIR="${top_models}" \
+    TERMLM_GITHUB_API_BASE="http://127.0.0.1:${port}/repos" \
+    TERMLM_GITHUB_DOWNLOAD_BASE="http://127.0.0.1:${port}/github" \
+    TERMLM_INSTALL_WAIT_FOR_READY=0 \
+    "${ROOT_DIR}/scripts/install.sh" --repo example/termlm >/dev/null
+
+  [[ -x "${top_bin}/termlm" ]] || fail "top-level installer did not install termlm"
+  [[ -x "${top_bin}/termlm-core" ]] || fail "top-level installer did not install termlm-core"
+  [[ -f "${top_share}/plugins/zsh/termlm.plugin.zsh" ]] || fail "top-level installer did not install zsh plugin"
+  [[ -f "${top_models}/gemma-4-E4B-it-Q4_K_M.gguf" ]] || fail "top-level installer did not assemble E4B model"
+  [[ -f "${top_models}/bge-small-en-v1.5.Q4_K_M.gguf" ]] || fail "top-level installer did not assemble embedding model"
+  [[ "$(<"${top_models}/gemma-4-E4B-it-Q4_K_M.gguf")" == "fake-e4b-model" ]] || fail "E4B model content mismatch"
+  [[ "$(<"${top_models}/bge-small-en-v1.5.Q4_K_M.gguf")" == "fake-embed-model" ]] || fail "embedding model content mismatch"
+}
 
 printf 'fake-e4b-model\n' > "${MODEL_SOURCE_DIR}/gemma-4-E4B-it-Q4_K_M.gguf"
 printf 'fake-embed-model\n' > "${MODEL_SOURCE_DIR}/bge-small-en-v1.5.Q4_K_M.gguf"
@@ -54,6 +154,7 @@ NEW_SHA_WITH_MODELS="$(shasum -a 256 "${WITH_MODELS_ARCHIVE}" | awk '{print tolo
 [[ -f "${WITH_MODELS_ARCHIVE}.sha256" ]]
 grep -qi "^${NEW_SHA_NO_MODELS}[[:space:]]" "${NO_MODELS_ARCHIVE}.sha256"
 grep -qi "^${NEW_SHA_WITH_MODELS}[[:space:]]" "${WITH_MODELS_ARCHIVE}.sha256"
+assemble_sha256sums
 
 python3 - "${NO_MODELS_ARCHIVE}" "no-models" "false" <<'PY'
 import json
@@ -110,5 +211,7 @@ TERMLM_INSTALL_SHARE_DIR="${INSTALL_ROOT}/share" \
 [[ -f "${INSTALL_ROOT}/share/plugins/zsh/termlm.plugin.zsh" ]]
 
 "${INSTALL_ROOT}/bin/termlm" --help >/dev/null
+
+run_top_level_install_rehearsal
 
 echo "release smoke checks passed"

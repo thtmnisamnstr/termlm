@@ -513,6 +513,10 @@ termlm-report-daemon-died() {
 termlm-mark-task-closed() {
   _TERMLM_WAITING_MODEL=0
   _TERMLM_TASK_ID=""
+  _TERMLM_CLARIFICATION_TASK_ID=""
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
 }
 
 termlm-abandon-active-task() {
@@ -565,6 +569,10 @@ termlm-start-task() {
 
   _TERMLM_WAITING_MODEL=1
   _TERMLM_TASK_ID="$task_id"
+  _TERMLM_CLARIFICATION_TASK_ID=""
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
   zle reset-prompt
 }
 
@@ -617,16 +625,13 @@ termlm-handle-run-task-line() {
       question_b64="$(termlm-json-field "$line" "question_b64")"
       question="$(termlm-base64-decode "$question_b64")"
       _TERMLM_TASK_ID="$task_id"
+      _TERMLM_CLARIFICATION_TASK_ID="$task_id"
       print -r -- "❓ ${question}"
-      local reply=""
-      vared -p '? ' reply
-      if ! termlm-send-decision "$task_id" --decision clarification --text "$reply"; then
-        print -r -- "termlm: clarification response failed"
-        _TERMLM_TASK_ID=""
-        [[ $_TERMLM_SESSION_MODE -eq 0 ]] && termlm-exit-prompt-mode || zle reset-prompt
-        return
+      if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+        termlm-enter-prompt-mode
+      else
+        zle reset-prompt
       fi
-      _TERMLM_WAITING_MODEL=1
       ;;
     proposed_command)
       _TERMLM_WAITING_MODEL=0
@@ -640,8 +645,7 @@ termlm-handle-run-task-line() {
     index_progress|provider_status|status_report|pong|index_update|retrieval_chunk|daemon_event)
       ;;
     task_complete)
-      _TERMLM_WAITING_MODEL=0
-      _TERMLM_TASK_ID=""
+      termlm-mark-task-closed
       if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
         termlm-exit-prompt-mode
       else
@@ -659,11 +663,11 @@ termlm-handle-run-task-line() {
       fi
       print -r -- "termlm: ${msg}"
       if [[ "$err_kind" == "bad_protocol" || "$err_kind" == "inference_provider_unavailable" || "$err_kind" == "BadProtocol" || "$err_kind" == "InferenceProviderUnavailable" ]]; then
-        _TERMLM_WAITING_MODEL=0
+        termlm-mark-task-closed
       fi
       ;;
     timeout)
-      _TERMLM_WAITING_MODEL=0
+      termlm-mark-task-closed
       print -r -- "termlm: request timed out"
       ;;
     *)
@@ -675,9 +679,6 @@ termlm-handle-proposed-event() {
   local task_id="$1"
   local cmd="$2"
   local requires="$3"
-  local approved_cmd=""
-  local rejected_continue=0
-  local aborted=0
 
   _TERMLM_TASK_ID="$task_id"
 
@@ -694,97 +695,118 @@ termlm-handle-proposed-event() {
   fi
 
   if [[ "$requires" == "true" ]]; then
-    local decision
-    decision="$(termlm-approval-prompt "$cmd")"
-    case "$decision" in
-      approved)
-        if termlm-send-decision "$task_id" --decision approved; then
-          approved_cmd="$cmd"
-        else
-          approved_cmd=""
-        fi
-        ;;
-      approve_all)
-        if termlm-send-decision "$task_id" --decision approve-all; then
-          approved_cmd="$cmd"
-        else
-          approved_cmd=""
-        fi
-        ;;
-      edited:*)
-        local edited="${decision#edited:}"
-        if termlm-send-decision "$task_id" --decision edited --edited-command "$edited"; then
-          approved_cmd="$edited"
-        else
-          approved_cmd=""
-        fi
-        ;;
-      abort)
-        termlm-send-decision "$task_id" --decision abort >/dev/null 2>&1 || true
-        aborted=1
-        ;;
-      *)
-        termlm-send-decision "$task_id" --decision rejected >/dev/null 2>&1 || true
-        rejected_continue=1
-        ;;
-    esac
-  else
-    approved_cmd="$cmd"
-  fi
-
-  if [[ -n "$approved_cmd" ]]; then
-    _TERMLM_PENDING_TASK_ID="$task_id"
-    _TERMLM_PENDING_CMD="$approved_cmd"
-    _TERMLM_PENDING_CWD_BEFORE="$PWD"
-    _TERMLM_PENDING_STARTED_AT="$EPOCHREALTIME"
-    (( _TERMLM_PENDING_SEQ += 1 ))
-    if termlm-capture-enabled; then
-      _TERMLM_PENDING_STDOUT_FILE="${_TERMLM_RUN_DIR}/stdout.${_TERMLM_PENDING_SEQ}"
-      _TERMLM_PENDING_STDERR_FILE="${_TERMLM_RUN_DIR}/stderr.${_TERMLM_PENDING_SEQ}"
-    else
-      _TERMLM_PENDING_STDOUT_FILE=""
-      _TERMLM_PENDING_STDERR_FILE=""
-    fi
-
-    if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-      termlm-exit-prompt-mode
-    else
-      zle reset-prompt
-    fi
-
-    local wrapped
-    wrapped="$(termlm-wrap-command-for-capture "$approved_cmd" "$_TERMLM_PENDING_SEQ")"
-    BUFFER="$wrapped"
-    zle .accept-line
-    return
-  fi
-
-  if (( rejected_continue == 1 )); then
-    _TERMLM_WAITING_MODEL=1
-    if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-      termlm-enter-prompt-mode
-    else
-      zle reset-prompt
-    fi
-    return
-  fi
-
-  if (( aborted == 1 )); then
     _TERMLM_WAITING_MODEL=0
-    _TERMLM_TASK_ID=""
-    if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-      termlm-exit-prompt-mode
-    else
-      zle reset-prompt
-    fi
+    _TERMLM_APPROVAL_TASK_ID="$task_id"
+    _TERMLM_APPROVAL_CMD="$cmd"
+    _TERMLM_EDITING_APPROVAL_TASK_ID=""
+    termlm-approval-prompt "$cmd"
+    zle reset-prompt
     return
   fi
 
-  _TERMLM_TASK_ID=""
+  termlm-run-approved-command "$task_id" "$cmd"
+}
+
+termlm-run-approved-command() {
+  local task_id="$1"
+  local approved_cmd="$2"
+
+  _TERMLM_PENDING_TASK_ID="$task_id"
+  _TERMLM_PENDING_CMD="$approved_cmd"
+  _TERMLM_PENDING_CWD_BEFORE="$PWD"
+  _TERMLM_PENDING_STARTED_AT="$EPOCHREALTIME"
+  (( _TERMLM_PENDING_SEQ += 1 ))
+  if termlm-capture-enabled; then
+    _TERMLM_PENDING_STDOUT_FILE="${_TERMLM_RUN_DIR}/stdout.${_TERMLM_PENDING_SEQ}"
+    _TERMLM_PENDING_STDERR_FILE="${_TERMLM_RUN_DIR}/stderr.${_TERMLM_PENDING_SEQ}"
+  else
+    _TERMLM_PENDING_STDOUT_FILE=""
+    _TERMLM_PENDING_STDERR_FILE=""
+  fi
+
   if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
     termlm-exit-prompt-mode
   else
     zle reset-prompt
+  fi
+
+  local wrapped
+  wrapped="$(termlm-wrap-command-for-capture "$approved_cmd" "$_TERMLM_PENDING_SEQ")"
+  BUFFER="$wrapped"
+  zle .accept-line
+}
+
+termlm-reject-pending-approval() {
+  local task_id="${_TERMLM_APPROVAL_TASK_ID:-}"
+  [[ -n "$task_id" ]] && termlm-send-decision "$task_id" --decision rejected >/dev/null 2>&1 || true
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  _TERMLM_WAITING_MODEL=1
+  if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+    termlm-enter-prompt-mode
+  else
+    zle reset-prompt
+  fi
+}
+
+termlm-handle-approval-key() {
+  local key="$1"
+  local task_id="${_TERMLM_APPROVAL_TASK_ID:-}"
+  local cmd="${_TERMLM_APPROVAL_CMD:-}"
+  [[ -n "$task_id" ]] || return 0
+
+  case "$key" in
+    y|Y)
+      _TERMLM_APPROVAL_TASK_ID=""
+      _TERMLM_APPROVAL_CMD=""
+      _TERMLM_EDITING_APPROVAL_TASK_ID=""
+      if termlm-send-decision "$task_id" --decision approved; then
+        termlm-run-approved-command "$task_id" "$cmd"
+      fi
+      ;;
+    a|A)
+      _TERMLM_APPROVAL_TASK_ID=""
+      _TERMLM_APPROVAL_CMD=""
+      _TERMLM_EDITING_APPROVAL_TASK_ID=""
+      if termlm-send-decision "$task_id" --decision approve-all; then
+        termlm-run-approved-command "$task_id" "$cmd"
+      fi
+      ;;
+    e|E)
+      _TERMLM_EDITING_APPROVAL_TASK_ID="$task_id"
+      BUFFER="$cmd"
+      CURSOR=${#BUFFER}
+      zle reset-prompt
+      ;;
+    $'\x1b')
+      termlm-send-decision "$task_id" --decision abort >/dev/null 2>&1 || true
+      _TERMLM_APPROVAL_TASK_ID=""
+      _TERMLM_APPROVAL_CMD=""
+      _TERMLM_EDITING_APPROVAL_TASK_ID=""
+      termlm-mark-task-closed
+      if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+        termlm-exit-prompt-mode
+      else
+        zle reset-prompt
+      fi
+      ;;
+    *)
+      termlm-reject-pending-approval
+      ;;
+  esac
+}
+
+termlm-finish-edited-approval() {
+  local edited="$1"
+  local task_id="${_TERMLM_EDITING_APPROVAL_TASK_ID:-}"
+  [[ -n "$task_id" ]] || return 0
+
+  _TERMLM_APPROVAL_TASK_ID=""
+  _TERMLM_APPROVAL_CMD=""
+  _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  if termlm-send-decision "$task_id" --decision edited --edited-command "$edited"; then
+    termlm-run-approved-command "$task_id" "$edited"
   fi
 }
 

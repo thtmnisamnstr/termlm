@@ -64,6 +64,14 @@ if [[ "$MODE" != "no-models" && "$MODE" != "with-models" ]]; then
   echo "--mode must be no-models or with-models" >&2
   exit 2
 fi
+if [[ "$VERSION" =~ [Xx]\.[Yy]\.[Zz] || "$VERSION" == *"<"* || "$VERSION" == *">"* ]]; then
+  echo "--version must be the concrete release tag/version, not a placeholder: ${VERSION}" >&2
+  exit 2
+fi
+if [[ "$VERSION" == *[[:space:]/\\]* ]]; then
+  echo "--version must not contain whitespace or path separators: ${VERSION}" >&2
+  exit 2
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/target/release"

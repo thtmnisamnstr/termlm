@@ -33,7 +33,11 @@ Then run:
 termlm init zsh
 ```
 
-Open a new zsh session.
+Then reload zsh in the current terminal, or open a new terminal tab:
+
+```bash
+exec zsh -l
+```
 
 ## How do I upgrade?
 

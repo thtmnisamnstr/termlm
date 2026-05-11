@@ -1,6 +1,7 @@
 # Getting Started
 
 This guide is for first-time installation and first-use validation.
+After it is installed, `termlm` is meant to feel like a small command helper inside your normal zsh prompt: ask for the shell task, inspect the proposed command, then approve or edit it.
 
 ## 1) Check Support Scope
 
@@ -26,6 +27,7 @@ Install notes:
 - installer waits for runtime/model/index readiness by default
 - readiness and model-chunk download phases emit periodic progress lines
 - first install can take several minutes depending on model/index state
+- a clean install downloads local model assets and builds both vector and lexical command-doc indexes
 
 Manual install is documented in [release-upgrades.md](release-upgrades.md).
 
@@ -35,7 +37,11 @@ Manual install is documented in [release-upgrades.md](release-upgrades.md).
 termlm init zsh
 ```
 
-Open a new zsh session after this step.
+Reload zsh in the current terminal, or open a new terminal tab:
+
+```bash
+exec zsh -l
+```
 
 ## 4) Health Check
 
@@ -44,13 +50,7 @@ termlm doctor --strict
 termlm status
 ```
 
-If status reports daemon unreachable, run:
-
-```bash
-termlm-core --detach
-```
-
-then retry `termlm status`.
+If either command fails, use [troubleshooting.md](troubleshooting.md). The zsh plugin will also try to start the daemon automatically the first time you enter prompt mode.
 
 ## 5) First Commands
 
@@ -65,8 +65,17 @@ Approval keys for proposed commands:
 
 - `y` approve current command
 - `n` reject current command
-- `e` edit command before execute
+- `e` edit command inline before execute
 - `a` approve all remaining commands in the task
+
+Try these first:
+
+```text
+? where am i
+? create a directory called archive
+? find files containing TODO
+? show me what changed in this git branch
+```
 
 ## 6) Upgrade and Uninstall
 

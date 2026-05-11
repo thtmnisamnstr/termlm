@@ -13,7 +13,12 @@ Environment overrides:
   TERMLM_INSTALL_SHARE_DIR    (default: ~/.local/share/termlm)
   TERMLM_MODELS_DIR           (default: ~/.local/share/termlm/models)
   TERMLM_GITHUB_REPO          (default: thtmnisamnstr/termlm)
+  TERMLM_GITHUB_DOWNLOAD_BASE (default: https://github.com)
   TERMLM_RELEASE_TAG          (override release tag when using chunked model assets)
+  TERMLM_GITHUB_TOKEN/GITHUB_TOKEN
+                              Optional token for private releases or rate limiting
+  TERMLM_MODEL_DOWNLOAD_RETRIES (default: 3)
+  TERMLM_MODEL_DOWNLOAD_TIMEOUT_SECS (default: 300)
   TERMLM_INSTALL_WAIT_FOR_READY (default: 1; set to 0 to skip daemon/index readiness wait)
   TERMLM_INSTALL_READY_TIMEOUT_SECS (default: 900)
   TERMLM_INSTALL_READY_POLL_SECS (default: 2)
@@ -47,6 +52,7 @@ BIN_DIR="${TERMLM_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 SHARE_DIR="${TERMLM_INSTALL_SHARE_DIR:-$HOME/.local/share/termlm}"
 MODELS_DIR="${TERMLM_MODELS_DIR:-$HOME/.local/share/termlm/models}"
 GITHUB_REPO="${TERMLM_GITHUB_REPO:-thtmnisamnstr/termlm}"
+GITHUB_DOWNLOAD_BASE="${TERMLM_GITHUB_DOWNLOAD_BASE:-https://github.com}"
 
 mkdir -p "$BIN_DIR" "$SHARE_DIR/plugins"
 
@@ -74,6 +80,31 @@ fi
 
 rm -rf "$SHARE_DIR/plugins/zsh"
 cp -R "$ROOT_DIR/plugins/zsh" "$SHARE_DIR/plugins/zsh"
+
+verify_installed_payload() {
+  if [[ ! -x "$BIN_DIR/termlm" ]]; then
+    echo "installed CLI is missing or not executable: $BIN_DIR/termlm" >&2
+    exit 1
+  fi
+  if [[ ! -x "$BIN_DIR/termlm-core" ]]; then
+    echo "installed daemon is missing or not executable: $BIN_DIR/termlm-core" >&2
+    exit 1
+  fi
+  if [[ ! -f "$SHARE_DIR/plugins/zsh/termlm.plugin.zsh" ]]; then
+    echo "installed zsh plugin is missing: $SHARE_DIR/plugins/zsh/termlm.plugin.zsh" >&2
+    exit 1
+  fi
+  "$BIN_DIR/termlm" --help >/dev/null || {
+    echo "installed CLI failed to run: $BIN_DIR/termlm --help" >&2
+    exit 1
+  }
+  "$BIN_DIR/termlm-core" --help >/dev/null || {
+    echo "installed daemon failed to run: $BIN_DIR/termlm-core --help" >&2
+    exit 1
+  }
+}
+
+verify_installed_payload
 
 resolve_release_tag() {
   if [[ -n "${TERMLM_RELEASE_TAG:-}" ]]; then
@@ -143,7 +174,7 @@ download_chunked_models() {
     exit 1
   fi
 
-  python3 - "$models_manifest" "$MODELS_DIR" "$GITHUB_REPO" "$release_tag" "$ROOT_DIR" <<'PY'
+  python3 - "$models_manifest" "$MODELS_DIR" "$GITHUB_REPO" "$release_tag" "$ROOT_DIR" "$GITHUB_DOWNLOAD_BASE" <<'PY'
 import hashlib
 import json
 import os
@@ -151,9 +182,10 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
-manifest_path, models_dir, repo, release_tag, bundle_root = sys.argv[1:6]
+manifest_path, models_dir, repo, release_tag, bundle_root, download_base = sys.argv[1:7]
 with open(manifest_path, "r", encoding="utf-8") as f:
     manifest = json.load(f)
 models = manifest.get("models", [])
@@ -184,8 +216,28 @@ def human_bytes(value: int) -> str:
         size /= 1024.0
     return f"{int(value)} B"
 
+def int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        print(f"  ignoring invalid {name}={raw!r}; using {default}", file=sys.stderr)
+        return default
+    return max(1, parsed)
+
 def download_with_progress(url: str, chunk_path: str, asset_name: str) -> None:
-    with urllib.request.urlopen(url) as response, open(chunk_path, "wb") as out:
+    token = os.environ.get("TERMLM_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": f"termlm-installer/{release_tag or 'unknown'}",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    timeout = int_env("TERMLM_MODEL_DOWNLOAD_TIMEOUT_SECS", 300)
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(chunk_path, "wb") as out:
         total_header = response.headers.get("Content-Length")
         total = int(total_header) if total_header and total_header.isdigit() else 0
         downloaded = 0
@@ -218,7 +270,38 @@ def download_with_progress(url: str, chunk_path: str, asset_name: str) -> None:
         else:
             print(f"  {asset_name}: download complete ({human_bytes(downloaded)})", file=sys.stderr)
 
-base_url = f"https://github.com/{repo}/releases/download/{release_tag}".rstrip("/")
+def download_with_retries(url: str, chunk_path: str, asset_name: str) -> None:
+    retries = int_env("TERMLM_MODEL_DOWNLOAD_RETRIES", 3)
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+            download_with_progress(url, chunk_path, asset_name)
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise SystemExit(
+                    f"model chunk not found: {asset_name}\n"
+                    f"  url: {url}\n"
+                    f"  release tag: {release_tag or '(empty)'}\n"
+                    "Check that every models-manifest.json chunk is uploaded to the GitHub release, "
+                    "or set TERMLM_RELEASE_TAG to the tag containing the chunk assets."
+                ) from None
+            last_error = f"HTTP {exc.code} {exc.reason}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < retries:
+            print(
+                f"  {asset_name}: download failed ({last_error}); retrying {attempt + 1}/{retries}",
+                file=sys.stderr,
+            )
+            time.sleep(min(2 * attempt, 10))
+
+    raise SystemExit(f"failed to download model chunk {asset_name} after {retries} attempt(s): {last_error}")
+
+base_url = f"{download_base.rstrip('/')}/{repo}/releases/download/{release_tag}".rstrip("/")
 
 try:
     for model in models:
@@ -248,7 +331,7 @@ try:
                         )
                     url = f"{base_url}/{asset_name}"
                     print(f"downloading model chunk: {asset_name}", file=sys.stderr)
-                    download_with_progress(url, chunk_path, asset_name)
+                    download_with_retries(url, chunk_path, asset_name)
 
                 actual_chunk_sha = sha256_file(chunk_path).lower()
                 if actual_chunk_sha != expected_chunk_sha:
@@ -653,7 +736,7 @@ PY
       fi
       progress_line="$(printf '%s\n' "$last_status" | awk -F': ' '/^index_progress:/ {print $2; exit}')"
       progress_phase="$(printf '%s\n' "$progress_line" | sed -E 's/^phase=([^[:space:]]+).*/\1/')"
-      progress_percent="$(printf '%s\n' "$progress_line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^percent=/){split($i,a,\"=\"); print a[2]; exit}}}')"
+      progress_percent="$(printf '%s\n' "$progress_line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^percent=/){split($i,a,"="); print a[2]; exit}}}')"
       provider_health="$(printf '%s\n' "$last_status" | awk -F': ' '/^provider_healthy:/ {print $2; exit}')"
       chunk_count="$(printf '%s\n' "$last_status" | awk -F': ' '/^index_chunk_count:/ {print $2; exit}')"
       [[ -z "$progress_line" ]] && progress_line="phase=unknown"
@@ -698,7 +781,16 @@ PY
         percent_complete=1
       fi
       local index_ready=0
-      if [[ "$phase_complete" -eq 1 && "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 ]]; then
+      local index_dir
+      index_dir="$(dirname "$index_manifest_path")"
+      local persisted_index_ready=0
+      if [[ "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 \
+        && -s "$index_dir/vectors.f16" \
+        && -s "$index_dir/lexicon.bin" \
+        && -s "$index_dir/postings.bin" ]]; then
+        persisted_index_ready=1
+      fi
+      if [[ "$persisted_index_ready" -eq 1 ]]; then
         index_ready=1
       fi
       if [[ "$phase_complete" -eq 1 && "$percent_complete" -eq 1 && "$manifest_chunk_count" == "0" ]]; then
@@ -748,6 +840,10 @@ if [[ $SKIP_MODELS -eq 0 && -d "$ROOT_DIR/models" ]]; then
     cp -R "$ROOT_DIR/models/." "$MODELS_DIR/"
   elif [[ -f "$ROOT_DIR/models/models-manifest.json" ]]; then
     tag="$(resolve_release_tag)"
+    if [[ "$tag" =~ [Xx]\.[Yy]\.[Zz] || "$tag" == *"<"* || "$tag" == *">"* ]]; then
+      echo "bundle manifest contains placeholder release tag '${tag}'; set TERMLM_RELEASE_TAG to the actual GitHub release tag" >&2
+      exit 1
+    fi
     download_chunked_models "$ROOT_DIR/models/models-manifest.json" "$tag"
   fi
 fi
