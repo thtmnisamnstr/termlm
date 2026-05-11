@@ -15,7 +15,7 @@ Environment overrides:
   TERMLM_GITHUB_REPO          (default: thtmnisamnstr/termlm)
   TERMLM_RELEASE_TAG          (override release tag when using chunked model assets)
   TERMLM_INSTALL_WAIT_FOR_READY (default: 1; set to 0 to skip daemon/index readiness wait)
-  TERMLM_INSTALL_READY_TIMEOUT_SECS (default: 1800)
+  TERMLM_INSTALL_READY_TIMEOUT_SECS (default: 900)
   TERMLM_INSTALL_READY_POLL_SECS (default: 2)
 USAGE
 }
@@ -359,7 +359,7 @@ wait_for_runtime_ready() {
   local embed_only_bootstrap=0
   local embed_filename=""
   local bootstrap_config=""
-  timeout_secs="$(validate_positive_int_or_default "${TERMLM_INSTALL_READY_TIMEOUT_SECS:-1800}" "1800")"
+  timeout_secs="$(validate_positive_int_or_default "${TERMLM_INSTALL_READY_TIMEOUT_SECS:-900}" "900")"
   poll_secs="$(validate_positive_int_or_default "${TERMLM_INSTALL_READY_POLL_SECS:-2}" "2")"
 
   if [[ ! -x "$termlm_bin" || ! -x "$termlm_core_bin" ]]; then

@@ -458,6 +458,10 @@ impl LocalLlamaProvider {
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_batch(n_ctx)
+            // Encoder path in llama.cpp requires n_ubatch >= submitted token count.
+            // Keep ubatch aligned with batch/context to avoid runtime asserts while
+            // embedding long chunks during install/index bootstrap.
+            .with_n_ubatch(n_ctx)
             .with_embeddings(true);
         if embedding_runtime.threads > 0 {
             ctx_params = ctx_params

@@ -94,7 +94,7 @@ Install completion semantics:
 Readiness wait controls:
 
 - `TERMLM_INSTALL_WAIT_FOR_READY=0` to skip readiness wait
-- `TERMLM_INSTALL_READY_TIMEOUT_SECS` (default `1800`)
+- `TERMLM_INSTALL_READY_TIMEOUT_SECS` (default `900`)
 - `TERMLM_INSTALL_READY_POLL_SECS` (default `2`)
 
 For first-time installs, repository bootstrap helper:
