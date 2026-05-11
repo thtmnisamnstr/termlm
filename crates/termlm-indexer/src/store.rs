@@ -193,7 +193,15 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 fn atomic_write_json<T: Serialize + ?Sized>(dst: &Path, value: &T) -> Result<()> {
+    ensure_parent_dir(dst)?;
     let tmp = dst.with_extension("tmp");
     let serialized = serde_json::to_vec_pretty(value)?;
 
@@ -213,6 +221,7 @@ fn atomic_write_json<T: Serialize + ?Sized>(dst: &Path, value: &T) -> Result<()>
 }
 
 fn atomic_write_bytes(dst: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_parent_dir(dst)?;
     let tmp = dst.with_extension("tmp");
     {
         let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;

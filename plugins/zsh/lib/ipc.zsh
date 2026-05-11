@@ -95,7 +95,7 @@ termlm-config-section-value() {
 termlm-expand-home-path() {
   local path="$1"
   if [[ "$path" == "~/"* ]]; then
-    print -r -- "$HOME/${path#~/}"
+    print -r -- "$HOME/${path#\~/}"
   else
     print -r -- "$path"
   fi
@@ -452,10 +452,13 @@ termlm-ensure-daemon() {
 
   local core_bin
   core_bin="$(termlm-core-bin)"
+  local daemon_log_file
+  daemon_log_file="$(termlm-daemon-log-file)"
+  mkdir -p -- "${daemon_log_file:h}" 2>/dev/null || true
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$core_bin" --detach >/dev/null 2>&1 &!
+    setsid "$core_bin" >>"$daemon_log_file" 2>&1 < /dev/null &!
   else
-    "$core_bin" --detach >/dev/null 2>&1 &!
+    "$core_bin" >>"$daemon_log_file" 2>&1 < /dev/null &!
   fi
 
   local waited_ms=0

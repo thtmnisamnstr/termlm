@@ -56,21 +56,12 @@ fn run_with_timeout(
         .env("TERM", "dumb")
         .env("MANPAGER", "cat")
         .env("MANWIDTH", "120")
+        // On macOS, pre_exec forces fork and can crash in multithreaded runtimes.
+        // Use process_group so the runtime can use its safe spawn path.
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
-    // SAFETY: runs in child just before exec; sets child PGID to itself so timeout can kill group.
-    unsafe {
-        cmd.pre_exec(|| {
-            let rc = libc::setpgid(0, 0);
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

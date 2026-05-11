@@ -78,6 +78,11 @@ For chunked models, `install.sh` resolves the release tag from `bundle-manifest.
 `TERMLM_RELEASE_TAG` and downloads model chunks from GitHub release assets, verifies each chunk,
 assembles the final model file, and verifies the final model checksum.
 
+The installer emits periodic progress for:
+
+- model chunk downloads (bytes + percent when available)
+- runtime/index readiness (`index_progress`, chunk counts, provider health)
+
 Install completion semantics:
 
 - `with-models` bundle install completes only after:
@@ -88,6 +93,7 @@ Install completion semantics:
   - embedding model bootstrap (if missing)
   - index bootstrap reaches complete/idle at `100%`
   - verification that the embedding GGUF exists locally
+  - temporary embed-only bootstrap daemon is stopped before installer exit
 
 `no-models` install intentionally does **not** fetch the local inference GGUF during install.
 
@@ -96,6 +102,12 @@ Readiness wait controls:
 - `TERMLM_INSTALL_WAIT_FOR_READY=0` to skip readiness wait
 - `TERMLM_INSTALL_READY_TIMEOUT_SECS` (default `900`)
 - `TERMLM_INSTALL_READY_POLL_SECS` (default `2`)
+
+Readiness failure diagnostics:
+
+- installer prints the last observed `termlm status --verbose` payload when available
+- installer tails daemon logs on failure
+- repeated `status --verbose` timeouts fail fast with diagnostics instead of waiting silently
 
 For first-time installs, repository bootstrap helper:
 
@@ -135,6 +147,14 @@ Environment controls:
 - `TERMLM_UPGRADE_ALLOW_MISSING_CHECKSUMS=1` (testing override, not recommended for production)
 
 ## Packaging Commands
+
+### Local environment cleanup
+If you want to start with a completely fresh environment, uninstall termlm and run these commands:
+1. `rm -rf ~/.local/state/termlm`
+2. `rm -rf ~/.local/share/termlm`
+3. `rm -rf ~/.config/termlm`
+
+### Packaging
 
 ```bash
 cargo build -p termlm-client -p termlm-core --release --locked

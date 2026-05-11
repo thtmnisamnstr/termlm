@@ -21,6 +21,12 @@ Quick install from releases:
 curl -fsSL https://raw.githubusercontent.com/thtmnisamnstr/termlm/main/scripts/install.sh | bash
 ```
 
+Install notes:
+
+- installer waits for runtime/model/index readiness by default
+- readiness and model-chunk download phases emit periodic progress lines
+- first install can take several minutes depending on model/index state
+
 Manual install is documented in [release-upgrades.md](release-upgrades.md).
 
 ## 3) Enable in zsh
@@ -53,6 +59,7 @@ At an empty prompt:
 - `?` enters one-shot prompt mode
 - `/p` enters session mode
 - `/q` exits session mode
+- clarification questions are answered at the `? ` prompt; `/p` stays in session until `/q`
 
 Approval keys for proposed commands:
 

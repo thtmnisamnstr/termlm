@@ -39,7 +39,7 @@ use termlm_indexer::{
 use termlm_inference::{
     ChatMessage, ChatRequest, InferenceProvider, LocalLlamaProvider, OllamaProvider,
     ProviderCapabilities, ProviderEvent, StructuredOutputMode, ToolSchema,
-    tool_parser::parse_json_tool_call,
+    tool_parser::{parse_json_tool_call, parse_tagged_tool_calls},
 };
 use termlm_protocol::{
     ClientMessage, ErrorKind, IndexProgress, ProposedCommand, RetrievedChunk, ServerMessage,
@@ -352,6 +352,18 @@ struct Cli {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("OBJC_DISABLE_INITIALIZE_FORK_SAFETY").is_none() {
+            // SAFETY: set once during daemon startup before any child-process
+            // extraction helpers are spawned. This avoids macOS ObjC fork-safety
+            // aborts when Metal-backed runtime threads are active.
+            unsafe {
+                std::env::set_var("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
+            }
+        }
+    }
+
     let cli = Cli::parse();
     maybe_detach(cli.detach)?;
 
@@ -568,27 +580,9 @@ async fn main() -> Result<()> {
                         break;
                     }
                     ControlMsg::MaybeShutdown => {
-                        let should_shutdown = {
-                            let reg = state.registry.lock().await;
-                            let tasks = state.tasks.lock().await;
-                            reg.is_empty() && tasks.is_empty()
-                        };
-                        if should_shutdown {
-                            let grace = state.config_snapshot().daemon.shutdown_grace_secs;
-                            let state2 = Arc::clone(&state);
-                            let ctrl2 = ctrl_tx.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-                                let can_shutdown = {
-                                    let reg = state2.registry.lock().await;
-                                    let tasks = state2.tasks.lock().await;
-                                    reg.is_empty() && tasks.is_empty()
-                                };
-                                if can_shutdown {
-                                    let _ = ctrl2.send(ControlMsg::ShutdownNow).await;
-                                }
-                            });
-                        }
+                        // Keep the daemon resident until an explicit `stop`/shutdown.
+                        // Install/bootstrap flows and non-interactive commands need the
+                        // runtime to stay up even when no shell is currently registered.
                     }
                 }
             }
@@ -1313,10 +1307,12 @@ async fn process_start_task(
         progress_started.elapsed().as_millis() as u64,
     );
 
-    let result = if matches!(
-        classification.classification,
-        tasks::TaskClassification::DocumentationQuestion
-    ) {
+    let allow_non_command_shortcuts = payload.mode != "?";
+    let result = if allow_non_command_shortcuts
+        && matches!(
+            classification.classification,
+            tasks::TaskClassification::DocumentationQuestion
+        ) {
         let docs_started = std::time::Instant::now();
         let out = process_documentation_question(state, transport, &payload, &session).await;
         stage_timings.insert(
@@ -1324,10 +1320,12 @@ async fn process_start_task(
             docs_started.elapsed().as_millis() as u64,
         );
         out
-    } else if matches!(
-        classification.classification,
-        tasks::TaskClassification::WebCurrentInfoQuestion
-    ) && state.config_snapshot().web.enabled
+    } else if allow_non_command_shortcuts
+        && matches!(
+            classification.classification,
+            tasks::TaskClassification::WebCurrentInfoQuestion
+        )
+        && state.config_snapshot().web.enabled
     {
         let web_started = std::time::Instant::now();
         let out = process_web_question(state, transport, &payload).await;
@@ -1338,7 +1336,11 @@ async fn process_start_task(
         out
     } else {
         let local_started = std::time::Instant::now();
-        let handled_local = try_handle_local_tool_request(state, transport, &payload).await?;
+        let handled_local = if allow_non_command_shortcuts {
+            try_handle_local_tool_request(state, transport, &payload).await?
+        } else {
+            false
+        };
         stage_timings.insert(
             "local_shortcut_ms".to_string(),
             local_started.elapsed().as_millis() as u64,
@@ -1751,80 +1753,78 @@ async fn process_user_response(
                 confidence: task.classification_confidence,
             };
 
-            if runtime_stub_provider_enabled()
-                && maybe_run_runtime_stub_provider(
+            // Session-mode clarification should continue orchestration (answer/question
+            // workflow), not force a command fallback.
+            if task.mode != "?" {
+                let handled = match try_provider_orchestration(
                     state,
                     transport,
                     &synth,
                     &session,
-                    task.provider_continuation,
                     &classification,
                     &refined_prompt,
+                    true,
                 )
-                .await?
-            {
-                if let Some(next_task) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                    next_task.provider_continuation = true;
-                    next_task.original_prompt = task.original_prompt.clone();
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        cancel_and_clear_task(state, payload.task_id).await;
+                        return Err(e);
+                    }
+                };
+
+                if handled {
+                    if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
+                        active.awaiting_clarification = false;
+                        active.provider_continuation = true;
+                        active.original_prompt = refined_prompt;
+                        active.created_at = std::time::Instant::now();
+                    }
+                    return Ok(());
                 }
+
+                if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
+                    active.awaiting_clarification = true;
+                    active.provider_continuation = true;
+                    active.original_prompt = refined_prompt;
+                    active.created_at = std::time::Instant::now();
+                }
+
+                transport
+                    .send(ServerMessage::NeedsClarification {
+                        task_id: payload.task_id,
+                        question: "I still need a more specific request. Include the exact outcome, target path/repo, and any constraints.".to_string(),
+                    })
+                    .await?;
                 return Ok(());
             }
 
-            if match try_provider_orchestration(
+            // Prompt mode keeps deterministic command fallback behavior.
+            let fallback = tasks::validation_incomplete_fallback(&refined_prompt);
+            let fallback_plan = CommandPlan {
+                cmd: fallback.cmd.trim().to_string(),
+                rationale: fallback.rationale,
+                intent: fallback.intent,
+                expected_effect: fallback.expected_effect,
+                commands_used: fallback.commands_used,
+            };
+            propose_command_for_execution(
                 state,
                 transport,
                 &synth,
                 &session,
+                true,
                 &classification,
-                &refined_prompt,
-                task.provider_continuation,
+                fallback_plan,
             )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    cancel_and_clear_task(state, payload.task_id).await;
-                    return Err(e);
-                }
-            } {
-                if let Some(next_task) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                    next_task.provider_continuation = true;
-                    next_task.original_prompt = task.original_prompt.clone();
-                }
-                return Ok(());
-            }
-
-            if maybe_run_runtime_stub_provider(
-                state,
-                transport,
-                &synth,
-                &session,
-                task.provider_continuation,
-                &classification,
-                &refined_prompt,
-            )
-            .await?
-            {
-                if let Some(next_task) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                    next_task.provider_continuation = true;
-                    next_task.original_prompt = task.original_prompt.clone();
-                }
-                return Ok(());
-            }
-
+            .await?;
             if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                active.awaiting_clarification = true;
+                active.awaiting_clarification = false;
                 active.provider_continuation = true;
+                active.original_prompt = refined_prompt;
                 active.created_at = std::time::Instant::now();
             }
-            transport
-                .send(ServerMessage::NeedsClarification {
-                    task_id: payload.task_id,
-                    question:
-                        "I still need a more explicit command outcome. Tell me exactly what should run."
-                            .to_string(),
-                })
-                .await?;
             return Ok(());
         }
     }
@@ -3670,9 +3670,11 @@ async fn process_web_question(
     }
 
     let mut text = String::new();
-    text.push_str("## Web results\n");
+    text.push_str("## Web Answer\n");
+    let mut source_extracts = String::new();
     let mut web_refs = Vec::<source_ledger::SourceRef>::new();
     let mut citation_sources = Vec::<(String, String)>::new();
+    let mut summary_points = Vec::<String>::new();
 
     let mut added = 0usize;
     for result in results
@@ -3751,25 +3753,59 @@ async fn process_web_question(
         {
             Ok((p, _)) => p,
             Err(e) => {
-                text.push_str(&format!("- {} (fetch failed: {e})\n", result.url));
+                source_extracts.push_str(&format!("- {} (fetch failed: {e})\n", result.url));
+                if !result.snippet.trim().is_empty() {
+                    let label = if result.title.trim().is_empty() {
+                        result.url.clone()
+                    } else {
+                        result.title.clone()
+                    };
+                    summary_points.push(format!(
+                        "{label}: {}",
+                        truncate_string(result.snippet.trim(), 220)
+                    ));
+                }
                 continue;
             }
         };
 
         added += 1;
-        text.push_str(&format!("\n### Result {added}\n"));
-        text.push_str(&format!("Source: {}\n", page.final_url));
+        source_extracts.push_str(&format!("\n### Result {added}\n"));
+        source_extracts.push_str(&format!("Source: {}\n", page.final_url));
         let page_title = page.title.clone();
         if let Some(title) = page_title.as_ref() {
-            text.push_str(&format!("Title: {title}\n"));
+            source_extracts.push_str(&format!("Title: {title}\n"));
+        }
+        let label = page_title
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| page.final_url.clone());
+        let summary_seed = page
+            .markdown
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with("```")
+                    && !line.starts_with('[')
+            })
+            .map(std::borrow::ToOwned::to_owned)
+            .filter(|line| line.len() > 20)
+            .unwrap_or_else(|| result.snippet.clone());
+        if !summary_seed.trim().is_empty() {
+            summary_points.push(format!(
+                "{label}: {}",
+                truncate_string(summary_seed.trim(), 220)
+            ));
         }
         citation_sources.push((
             page.final_url.clone(),
             page_title.clone().unwrap_or_else(|| "web page".to_string()),
         ));
-        text.push('\n');
-        text.push_str(&truncate_string(&page.markdown, 1600));
-        text.push('\n');
+        source_extracts.push('\n');
+        source_extracts.push_str(&truncate_string(&page.markdown, 900));
+        source_extracts.push('\n');
         web_refs.push(source_ledger::SourceRef {
             source_type: "web_read_page".to_string(),
             source_id: page.normalized_url.clone(),
@@ -3794,9 +3830,17 @@ async fn process_web_question(
         });
     }
 
-    if added == 0 {
-        text.push_str("No readable pages were returned from web results.");
+    if added == 0 && summary_points.is_empty() {
+        text.push_str("I could not extract readable web pages for this query.");
+    } else if summary_points.is_empty() {
+        text.push_str("I retrieved sources but could not extract a concise summary.");
+    } else {
+        text.push_str("Based on fetched sources:\n");
+        for (idx, point) in summary_points.iter().take(6).enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, point));
+        }
     }
+
     if web_cfg.citation_required {
         text.push_str("\n\n## Citations\n");
         let mut seen = BTreeSet::<String>::new();
@@ -3816,6 +3860,12 @@ async fn process_web_question(
             text.push_str("[1] no citation sources available\n");
         }
     }
+
+    if !source_extracts.trim().is_empty() {
+        text.push_str("\n\n## Source Extracts\n");
+        text.push_str(&truncate_string(&source_extracts, 4000));
+    }
+
     append_source_refs(state, web_refs).await;
 
     transport
@@ -3828,7 +3878,10 @@ async fn process_web_question(
         .send(ServerMessage::TaskComplete {
             task_id: payload.task_id,
             reason: TaskCompleteReason::ModelDone,
-            summary: "Web request completed.".to_string(),
+            summary: format!(
+                "Web request completed with {} source(s).",
+                added.max(summary_points.len())
+            ),
         })
         .await?;
     append_session_turn_if_session_mode(
@@ -5434,6 +5487,22 @@ async fn try_provider_orchestration(
         match evt {
             ProviderEvent::TextChunk { content } => {
                 text_buffer.push_str(&content);
+                if tool_calls.is_empty() && text_buffer.contains("tool_call") {
+                    if let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
+                        && !parsed_tagged.is_empty()
+                    {
+                        tool_calls = parsed_tagged;
+                        cancel_provider_task(state, payload.task_id).await;
+                        break;
+                    }
+                    if let Some(partial_call) =
+                        extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
+                    {
+                        tool_calls.push(partial_call);
+                        cancel_provider_task(state, payload.task_id).await;
+                        break;
+                    }
+                }
                 if cfg.inference.stream {
                     pending_stream_chunk.push_str(&content);
                     let should_emit = pending_stream_chunk.chars().count() >= 16
@@ -5475,6 +5544,19 @@ async fn try_provider_orchestration(
                 chunk: pending_stream_chunk.clone(),
             })
             .await?;
+    }
+
+    if tool_calls.is_empty()
+        && let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
+        && !parsed_tagged.is_empty()
+    {
+        tool_calls.extend(parsed_tagged);
+    }
+    if tool_calls.is_empty()
+        && let Some(partial_call) =
+            extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
+    {
+        tool_calls.push(partial_call);
     }
 
     if tool_calls.is_empty()
@@ -6626,12 +6708,43 @@ async fn provider_redraft_from_validation(
         };
 
         match evt {
-            ProviderEvent::TextChunk { content } => text_buffer.push_str(&content),
+            ProviderEvent::TextChunk { content } => {
+                text_buffer.push_str(&content);
+                if tool_calls.is_empty() && text_buffer.contains("tool_call") {
+                    if let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
+                        && !parsed_tagged.is_empty()
+                    {
+                        tool_calls = parsed_tagged;
+                        cancel_provider_task(state, payload.task_id).await;
+                        break;
+                    }
+                    if let Some(partial_call) =
+                        extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
+                    {
+                        tool_calls.push(partial_call);
+                        cancel_provider_task(state, payload.task_id).await;
+                        break;
+                    }
+                }
+            }
             ProviderEvent::ThinkingChunk { .. } => {}
             ProviderEvent::ToolCall { call } => tool_calls.push(call),
             ProviderEvent::Usage { .. } => {}
             ProviderEvent::Done => break,
         }
+    }
+
+    if tool_calls.is_empty()
+        && let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
+        && !parsed_tagged.is_empty()
+    {
+        tool_calls.extend(parsed_tagged);
+    }
+    if tool_calls.is_empty()
+        && let Some(partial_call) =
+            extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
+    {
+        tool_calls.push(partial_call);
     }
 
     if tool_calls.is_empty()
@@ -9370,6 +9483,49 @@ fn parse_zsh_builtins_from_man(text: &str) -> BTreeSet<String> {
     out
 }
 
+fn extract_execute_shell_command_from_partial_tagged_call(
+    text: &str,
+) -> Option<termlm_inference::ToolCall> {
+    let start = text.find("call:execute_shell_command")?;
+    let tail = &text[start..];
+    let cmd_pos = tail.find("cmd:")?;
+    let after_cmd = &tail[cmd_pos + 4..];
+
+    for marker in ["<|\"|>", "<|\\\"|>"] {
+        if let Some(open) = after_cmd.find(marker) {
+            let rest = &after_cmd[open + marker.len()..];
+            let candidate = if let Some(close) = rest.find(marker) {
+                rest[..close].trim()
+            } else {
+                let mut cutoff = rest.len();
+                for delim in [
+                    ",commands_used",
+                    ",expected_effect",
+                    ",intent",
+                    "<tool_call",
+                    "<|/tool_call|>",
+                    "\n",
+                    "}",
+                    ",",
+                ] {
+                    if let Some(pos) = rest.find(delim) {
+                        cutoff = cutoff.min(pos);
+                    }
+                }
+                rest[..cutoff].trim()
+            };
+            if !candidate.is_empty() {
+                return Some(termlm_inference::ToolCall {
+                    name: "execute_shell_command".to_string(),
+                    arguments: serde_json::json!({ "cmd": candidate }),
+                });
+            }
+        }
+    }
+
+    None
+}
+
 fn resolve_index_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/termlm/index")
@@ -10036,6 +10192,24 @@ mod tests {
 
         cfg.ollama.healthcheck_on_start = false;
         assert!(!should_enforce_startup_health(&cfg));
+    }
+
+    #[test]
+    fn partial_tagged_execute_shell_command_is_extractable() {
+        let raw = r#"prefix <|tool_call>call:execute_shell_command{cmd:<|"|>ls -1 | head -n 5<|"|>,intent:<|"|>List files<|"|>"#;
+        let parsed = extract_execute_shell_command_from_partial_tagged_call(raw)
+            .expect("extract partial execute_shell_command");
+        assert_eq!(parsed.name, "execute_shell_command");
+        assert_eq!(parsed.arguments["cmd"], "ls -1 | head -n 5");
+    }
+
+    #[test]
+    fn partial_tagged_execute_shell_command_without_cmd_closer_is_extractable() {
+        let raw = r#"prefix <|tool_call>call:execute_shell_command{cmd:<|"|>ls -1 | head -n 5"#;
+        let parsed = extract_execute_shell_command_from_partial_tagged_call(raw)
+            .expect("extract partial execute_shell_command without cmd closer");
+        assert_eq!(parsed.name, "execute_shell_command");
+        assert_eq!(parsed.arguments["cmd"], "ls -1 | head -n 5");
     }
 
     #[test]

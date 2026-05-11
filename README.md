@@ -58,6 +58,11 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/thtmnisamnstr/termlm/main/scripts/install.sh | bash
 ```
 
+Notes:
+
+- installer waits for runtime/model/index readiness by default and prints periodic progress
+- first install can take several minutes while models are prepared and docs are indexed
+
 Enable in zsh:
 
 ```bash
@@ -104,6 +109,7 @@ Upgrade behavior:
 - requires `SHA256SUMS` verification
 - installs binaries + zsh plugin
 - preserves local model files
+- bootstraps embedding/index readiness (without downloading bundled inference GGUF)
 - removes temporary download/extraction artifacts before exit
 
 ## Common Operations

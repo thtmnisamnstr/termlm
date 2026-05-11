@@ -26,6 +26,23 @@ Actions:
 2. `termlm status`
 3. verify runtime dir/socket permissions
 
+## Installer waits too long at readiness
+
+Symptoms:
+
+- install prints `Waiting for termlm runtime/model/index readiness ...` for a long time
+- install exits with readiness timeout
+
+Actions:
+
+1. run `pgrep -af termlm-core || true`
+2. run `termlm status --verbose`
+3. check daemon log tail: `tail -n 120 ~/.local/state/termlm/termlm.log`
+4. if needed, perform a clean reinstall reset:
+   - `rm -rf ~/.local/state/termlm`
+   - `rm -rf ~/.local/share/termlm`
+   - `rm -rf ~/.config/termlm`
+
 ## Plugin not activating in zsh
 
 Actions:

@@ -1,4 +1,4 @@
-use crate::tool_parser::parse_tagged_tool_calls;
+use crate::tool_parser::{extract_partial_execute_shell_command, parse_tagged_tool_calls};
 use crate::{
     ChatMessage, ChatRequest, InferenceProvider, ProviderCapabilities, ProviderEvent,
     ProviderHealth, ProviderKind, ProviderStream, ProviderUsage, StructuredOutputMode, ToolCall,
@@ -37,6 +37,8 @@ pub struct LocalLlamaProvider {
     runtime: Arc<Mutex<Option<Arc<LoadedRuntime>>>>,
     #[cfg(feature = "local-runtime")]
     embedding_runtime: Arc<Mutex<Option<Arc<LoadedEmbeddingRuntime>>>>,
+    #[cfg(feature = "local-runtime")]
+    embedding_request_lock: Arc<Mutex<()>>,
     cancel_flags: Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 
@@ -119,6 +121,8 @@ impl LocalLlamaProvider {
             runtime: Arc::new(Mutex::new(None)),
             #[cfg(feature = "local-runtime")]
             embedding_runtime: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-runtime")]
+            embedding_request_lock: Arc::new(Mutex::new(())),
             cancel_flags: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -416,7 +420,11 @@ impl LocalLlamaProvider {
     fn build_context_params(runtime: &LoadedRuntime, n_ctx: u32) -> LlamaContextParams {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx);
+            .with_n_batch(n_ctx)
+            // Keep ubatch aligned with batch/context. Prompt-prefill decode can
+            // fail on some local runtimes when n_ubatch stays below submitted
+            // token count.
+            .with_n_ubatch(n_ctx);
         if runtime.threads > 0 {
             params = params
                 .with_n_threads(runtime.threads)
@@ -454,7 +462,13 @@ impl LocalLlamaProvider {
             return Ok(Vec::new());
         }
 
-        let n_ctx = embedding_runtime.context_tokens.max(512);
+        let model_ctx = embedding_runtime.model.n_ctx_train();
+        let requested_ctx = embedding_runtime.context_tokens.max(128);
+        let n_ctx = if model_ctx > 0 {
+            requested_ctx.min(model_ctx).max(128)
+        } else {
+            requested_ctx
+        };
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_batch(n_ctx)
@@ -474,12 +488,14 @@ impl LocalLlamaProvider {
             .context("create local embedding context")?;
 
         let mut rows = Vec::with_capacity(texts.len());
+        let n_vocab = embedding_runtime.model.n_vocab();
         for text in texts {
             let mut tokens = embedding_runtime
                 .model
-                .str_to_token(&text, AddBos::Always)
-                .or_else(|_| embedding_runtime.model.str_to_token(&text, AddBos::Never))
+                .str_to_token(&text, AddBos::Never)
+                .or_else(|_| embedding_runtime.model.str_to_token(&text, AddBos::Always))
                 .context("tokenize embedding input")?;
+            tokens.retain(|tok| tok.0 >= 0 && tok.0 < n_vocab);
             if tokens.is_empty() {
                 rows.push(vec![0.0f32; embed_dim]);
                 continue;
@@ -489,11 +505,11 @@ impl LocalLlamaProvider {
             }
 
             ctx.clear_kv_cache();
-            let mut batch = LlamaBatch::new(n_ctx as usize, 1);
+            let mut batch = LlamaBatch::new(tokens.len(), 1);
             batch
                 .add_sequence(&tokens, 0, false)
                 .context("prepare embedding batch")?;
-            ctx.decode(&mut batch).context("decode embedding batch")?;
+            ctx.encode(&mut batch).context("encode embedding batch")?;
             let embedding = ctx.embeddings_seq_ith(0).context("read embedding vector")?;
             rows.push(Self::normalize_embedding_dim(embedding, embed_dim));
         }
@@ -515,6 +531,10 @@ impl LocalLlamaProvider {
 
         #[cfg(feature = "local-runtime")]
         {
+            // Local embedding/tokenization over a shared model can trigger
+            // intermittent llama.cpp asserts under concurrent requests.
+            // Serialize embedding requests to keep startup/reindex stable.
+            let _embed_guard = self.embedding_request_lock.lock().await;
             let embedding_runtime = self.ensure_embedding_runtime(embed_model_path).await?;
             let inputs = texts.to_vec();
             tokio::task::spawn_blocking(move || {
@@ -580,12 +600,26 @@ impl LocalLlamaProvider {
                 .context("tokenize fallback prompt")?;
         }
 
-        let prompt_token_count = prompt_tokens.len() as u64;
         let max_output_tokens = Self::max_output_tokens(&request);
-        let n_ctx = runtime
-            .context_tokens
-            .max((prompt_tokens.len() + max_output_tokens + 8) as u32)
-            .max(512);
+        let model_ctx = runtime.model.n_ctx_train();
+        let mut n_ctx = runtime.context_tokens.max(512);
+        if model_ctx > 0 {
+            n_ctx = n_ctx.min(model_ctx).max(512);
+        }
+        let reserve_tokens = max_output_tokens.saturating_add(8).max(32);
+        let max_prompt_tokens = (n_ctx as usize).saturating_sub(reserve_tokens).max(1);
+        if prompt_tokens.len() > max_prompt_tokens {
+            let trim_start = prompt_tokens.len().saturating_sub(max_prompt_tokens);
+            prompt_tokens = prompt_tokens[trim_start..].to_vec();
+        }
+        let prompt_token_count = prompt_tokens.len() as u64;
+        let required_ctx = (prompt_tokens.len().saturating_add(reserve_tokens))
+            .max(512)
+            .min(u32::MAX as usize) as u32;
+        n_ctx = n_ctx.max(required_ctx);
+        if model_ctx > 0 {
+            n_ctx = n_ctx.min(model_ctx).max(512);
+        }
 
         let mut ctx = runtime
             .model
@@ -674,6 +708,23 @@ impl LocalLlamaProvider {
                 break;
             }
 
+            // Some local templates stream complete tagged tool-call payloads and
+            // then continue generating silent/non-rendered tokens for a while.
+            // If we already have a valid tagged tool call, stop immediately so
+            // the orchestrator can receive a ToolCall event before idle timeout.
+            if generated.contains("tool_call")
+                && parse_tagged_tool_calls(&generated)
+                    .map(|calls| !calls.is_empty())
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            if generated.contains("call:execute_shell_command")
+                && extract_partial_execute_shell_command(&generated).is_some()
+            {
+                break;
+            }
+
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
@@ -695,11 +746,19 @@ impl LocalLlamaProvider {
             parsed_content = Self::parse_oaicompat_content(&parsed_json);
         }
 
-        if tool_calls.is_empty()
-            && !generated.is_empty()
+        if !generated.is_empty()
             && let Ok(parsed_tagged) = parse_tagged_tool_calls(&generated)
+            && !parsed_tagged.is_empty()
         {
+            // Prefer explicitly tagged tool calls from the raw generation
+            // stream. Some template parsers can decode partial/inexact calls
+            // from non-JSON output, while tagged calls preserve full args.
             tool_calls = parsed_tagged;
+        }
+        if tool_calls.is_empty()
+            && let Some(partial_call) = extract_partial_execute_shell_command(&generated)
+        {
+            tool_calls.push(partial_call);
         }
 
         if !request.stream

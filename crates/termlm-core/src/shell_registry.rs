@@ -40,10 +40,6 @@ impl ShellRegistry {
         self.sessions.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&Uuid, &ShellSession)> {
         self.sessions.iter()
     }
