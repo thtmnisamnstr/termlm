@@ -52,7 +52,7 @@ Architectural shape:
 │  │  ├── prompt/session modes          │  │         │  ├────────────────────────────────────────┤  │
 │  │  ├── approval prompt               │  │         │  │ Safety floor + command existence check │  │
 │  │  ├── shell-native execution        │  │         │  ├────────────────────────────────────────┤  │
-│  │  ├── shell-native capture wrapper  │  │         │  │ Live command docs index + RAG           │  │
+│  │  ├── transparent output capture    │  │         │  │ Live command docs index + RAG           │  │
 │  │  └── termlm-client helper              │  │         │  ├────────────────────────────────────────┤  │
 │  └────────────────────────────────────┘  │         │  │ Inference provider router               │  │
 └──────────────────────────────────────────┘         │  │  ├── local llama.cpp + Gemma 4          │  │
@@ -79,17 +79,19 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 
 ### 2.2 Zsh Approval‑Prompt UX
 
-- **FR‑9 — Approval prompt rendering:** For each proposed command requiring approval, the plugin MUST print a four‑line prompt to the TTY of the form:
+- **FR‑9 — Approval prompt rendering:** For each proposed command requiring approval, the plugin MUST print a prompt to the TTY of the form:
   ```
   ┌─ proposed command ─────────────────────────────────────────────
   │ <command, single line, truncated to terminal width with …>
-  └─ [y]es  [n]o(default)  [e]dit  [a]ll-in-this-task ─────────────
+  ├─ keys ─────────────────────────────────────────────────────────
+  │ y accept   n/Enter reject   e edit   a accept all   Esc cancel
+  └────────────────────────────────────────────────────────────────
   ```
-- **FR‑10 — Single‑key read:** Input MUST be read with `read -k 1 -s` (single character, silent). Allowed responses: `y`, `Y`, `n`, `N`, `e`, `E`, `a`, `A`, Return (treated as `n`), Escape (treated as abort/`q`), `Ctrl‑C` (treated as abort).
+- **FR‑10 — Single‑key read:** Input MUST be handled by the active ZLE keymap without blocking nested reads. Allowed responses: `y`, `Y`, `n`, `N`, `e`, `E`, `a`, `A`, Return (treated as `n`), Escape (treated as abort/`q`), `Ctrl‑C` (treated as abort).
 - **FR‑11 — Default decision:** Pressing Return (a bare newline) MUST be treated as `n` (reject). This is a deliberate safety bias.
 - **FR‑12 — Edit affordance:** `e` MUST open the proposed command in `$EDITOR` (default `vi` if unset) using a temporary file under `${TMPDIR:-/tmp}/termlm-edit-<task-id>.sh`. After save, the edited content (trimmed of trailing newline) is treated as approved.
 - **FR‑13 — Approve‑all‑in‑task:** `a` MUST set a per‑task flag `approve_all_remaining=true`; subsequent `ProposedCommand` events for the *same task* (same `task_id`) skip the approval prompt **except** when the safety floor matches or when the command also matches a critical pattern (the user must still see those — see FR‑18).
-- **FR‑14 — Rejection feedback:** On rejection, the plugin MUST send `UserResponse{decision: Rejected, reason?: <free-text optional>}` to the daemon. The daemon MUST inject a synthetic `tool_response` into the conversation reading "User declined to run this command." so the model can adapt and propose an alternative.
+- **FR‑14 — Rejection feedback:** On single-key rejection, the plugin MUST send `UserResponse{decision: Rejected}` to the daemon, end the current approval flow, restore `$PS1`, and return the user to a normal prompt. If a client sends a rejection with explicit free-text feedback, the daemon MAY inject a synthetic `tool_response` reading "User declined to run this command." so the model can adapt and propose an alternative.
 - **FR‑15 — Abort:** Escape or `Ctrl‑C` during the approval prompt MUST send `UserResponse{decision: Abort}`, end the task immediately, restore `$PS1`, and return the user to a normal empty prompt. No further model output for that task is rendered.
 
 ### 2.3 Approval Modes
@@ -138,11 +140,11 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 
 - **FR‑21 — Clarification round trip:** The model MAY emit a `NeedsClarification{question}` event (technically: a model assistant turn with text but no tool call **and** the daemon's policy says clarifications are allowed — see FR‑23). The plugin MUST display the question on its own line prefixed with `❓ `, switch to a single‑line input prompt `? `, read a normal line of input (with full ZLE editing using `vared`), and send it back as `UserResponse{decision: Clarification, text: <answer>}`.
 - **FR‑22 — Prompt indicator persistence:** While a task is open and waiting on either model output or user input, the prompt indicator MUST remain `?>` (or whatever `prompt.indicator` is set to). It only reverts to the saved `$PS1` after `TaskComplete`, abort, or session‑mode exit.
-- **FR‑23 — Clarification policy:** A clarification turn is identified at the orchestrator level by: (a) the model produced an assistant turn with no `tool_call` AND the assistant text ends with `?` AND the configured `behavior.allow_clarifications = true` (default `true`). Otherwise a no‑tool‑call assistant turn is treated as `TaskComplete` (FR‑26).
+- **FR‑23 — Clarification policy:** A clarification turn is identified at the orchestrator level when `behavior.allow_clarifications = true` (default `true`) and either: (a) the model produced an assistant turn with no `tool_call` and the assistant text ends with `?`, or (b) prompt mode (`?`) produced no executable tool call or extractable one-line command. In prompt mode, a no-command assistant turn MUST ask for a focused clarification instead of completing as plain text. In session mode, non-question assistant text without a tool call MAY complete the turn as a normal answer.
 - **FR‑24 — Multi‑step tool use:** The model MAY emit multiple `tool_call`s in sequence within a single task. After each approved/executed command, the daemon MUST capture stdout, stderr, and exit code (see FR‑35 for the capture mechanism), append the result as a provider-compatible tool response, and continue generation. Hard upper bound: `behavior.max_tool_rounds = 8` (configurable, default 8). When the limit is reached, the orchestrator MUST emit `TaskComplete{reason: ToolRoundLimit}`.
-- **FR‑25 — Implicit abort:** If the user types something while a task is pending model output (i.e. before the next `?>` prompt is rendered), and the typed string matches the regex `^[[:space:]]*[a-zA-Z_./][a-zA-Z0-9_./-]*([[:space:]]|$)` (a plausible shell command starting token), the plugin MUST: (a) send `UserResponse{decision: Abort}` to the daemon, (b) abandon the task, (c) restore `$PS1`, (d) place the typed string into `BUFFER`, (e) NOT auto‑accept (the user retains the chance to edit).
+- **FR‑25 — Implicit abort:** If the user types something while a task is pending model output (i.e. before the next `?>` prompt is rendered), and the typed string matches the regex `^[[:space:]]*[a-zA-Z_./][a-zA-Z0-9_./-]*([[:space:]]|$)` (a plausible shell command starting token), the plugin MUST: (a) send `UserResponse{decision: Abort}` to the daemon, (b) abandon the task, (c) restore `$PS1`, (d) place the typed string into `BUFFER`, and (e) invoke `zle .accept-line` so the user's submitted command runs normally.
   - Exception: if the typed string is one of the recognized session subcommands (`/q`), it is handled per FR‑8.
-- **FR‑26 — Task completion:** A task ends and the plugin MUST exit `?` mode (restoring `$PS1`) when the daemon emits `TaskComplete`. The daemon emits `TaskComplete` when: (i) the model returns a final assistant turn with no tool call AND text that does not match the clarification heuristic, (ii) the safety floor caused refusal AND the model refused to continue, (iii) `max_tool_rounds` was reached, (iv) user aborted, or (v) `clarification_timeout` elapsed (default 120 s).
+- **FR‑26 — Task completion:** A task ends and the plugin MUST exit `?` mode (restoring `$PS1`) when the daemon emits `TaskComplete`. The daemon emits `TaskComplete` when: (i) session mode receives a final assistant turn with no tool call and text that does not match the clarification heuristic, (ii) the safety floor caused refusal AND the model refused to continue, (iii) `max_tool_rounds` was reached, (iv) user aborted, or (v) `clarification_timeout` elapsed (default 120 s).
 
 ### 2.5 Zsh Session Mode (`/p`)
 
@@ -157,13 +159,9 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 
 - **FR‑33 — BUFFER + accept-line execution:** Approved commands MUST be executed by setting `BUFFER=<approved cmd>` and invoking `zle .accept-line`. Bypassing the shell (e.g. via `eval` from inside a widget) is FORBIDDEN. This guarantees: (a) the command appears in `$HISTFILE`, (b) up/down arrow recalls it, (c) all shell options, aliases, functions, and traps apply.
 - **FR‑34 — One command per `accept-line`:** Multi‑command tool sequences MUST be executed sequentially, one per `accept-line`. The plugin must wait for the previous command to finish before sending the next proposal back to the daemon. This is achieved using zsh's `precmd` hook: after each `accept-line`, the next `precmd` invocation tells the daemon "ready for next" via `Ack{task_id, last_command_exit_status, stdout_capture, stderr_capture}`.
-- **FR‑35 — Output capture:** Because the command runs in the live shell, stdout/stderr are NOT captured by default. To feed results back to the model the plugin MUST wrap the approved command using zsh process substitution into:
-  ```
-  { <approved-cmd>; } > >(tee "$TERMLM_RUN_DIR/stdout.<n>") 2> >(tee "$TERMLM_RUN_DIR/stderr.<n>" >&2)
-  ```
-  …only when `[capture] enabled = true` (default `true`). The `<n>` is the per‑task command counter. After the command completes (next `precmd`), the plugin reads those files (truncated to `[capture] max_bytes`, default 16 KB each), sends them in `Ack`, and deletes them. `$TERMLM_RUN_DIR` is `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/termlm-$UID/run-$$/`.
+- **FR‑35 — Output capture:** Because the command runs in the live shell, stdout/stderr are captured for termlm-issued commands by starting transparent zsh process-substitution capture from `preexec` and restoring stdout/stderr at the next `precmd`. The visible and historical command MUST remain exactly `<approved-cmd>`; internal capture plumbing MUST NOT be inserted into `BUFFER` or shown as the command. Capture is used only when `[capture] enabled = true` (default `true`). The `<n>` is the per-task command counter. After the command completes (next `precmd`), the plugin reads those files (truncated to `[capture] max_bytes`, default 16 KB each), sends them in `Ack`, and deletes them. `$TERMLM_RUN_DIR` is `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/termlm-$UID/run-$$/`.
 - **FR‑36 — Capture opt‑out:** If `[capture] enabled = false`, the daemon receives only `Ack{exit_status}` with no output. The model is told via system prompt that it cannot see command output in this mode.
-- **FR‑37 — Pipefail/pipe handling:** The capture wrapper MUST use a subshell so that `set -e`, aliases, and the user's `precmd` chain are not disturbed.
+- **FR‑37 — Pipefail/pipe handling:** Transparent capture MUST preserve shell parsing, aliases, functions, shell options, job control, Ctrl-C behavior, history, and the user's `precmd` chain. If capture setup fails, the command MUST still run normally and the adapter MUST send an `Ack` without captured output.
 
 ### 2.7 Streaming
 
@@ -319,6 +317,11 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   expose_on_status            = true
   include_in_debug_logs        = true         # structural refs only; never raw terminal/file/web content at info
 
+  [debug]
+  retrieval_trace_enabled      = false        # opt-in builder trace files for prompt retrieval
+  retrieval_trace_dir          = "~/.local/state/termlm/retrieval-traces"
+  retrieval_trace_max_files    = 25
+
 
   [capture]
   enabled    = true
@@ -328,6 +331,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   [terminal_context]
   enabled                          = true
   capture_all_interactive_commands = true
+  capture_command_output           = false
   max_entries                      = 50
   max_output_bytes_per_command     = 32768
   recent_context_max_tokens        = 6000
@@ -473,7 +477,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   Embedding implementation MUST be model-agnostic given `embed_filename`, `embed_dim`, query/document prefixes, and `index_version`. Changing model, dimension, or prefix scheme MUST force a re-embed through FR‑70.
 - **FR‑59 — Per-shell context capture.** Each shell adapter MUST send a `ShellContext{shell_id, shell_kind, context_hash, aliases, functions}` message to the daemon at the following times:
   1. Immediately after `RegisterShell`.
-  2. On every `precmd` invocation if a cheap hash of `${(k)aliases} + ${(k)functions}` has changed since the last send (this catches new aliases/functions defined mid-session).
+  2. On `precmd` invocations after the shell is registered if a cheap hash of `${(k)aliases} + ${(k)functions}` has changed since the last send (this catches new aliases/functions defined mid-session without starting termlm for unrelated normal shell commands).
 
   Collection in the v1 zsh adapter:
   ```zsh
@@ -603,7 +607,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   6. Request user approval/edit/reject/abort.
   7. Execute approved commands in the user's real interactive shell.
   8. Capture command result and send `Ack` back to daemon for termlm-initiated commands.
-  9. Observe all interactive commands after plugin load and send `ObservedCommand` terminal context events.
+  9. Observe interactive commands after the shell has started using termlm and send `ObservedCommand` terminal context events.
   10. Maintain prompt/session state.
 - **FR‑86 — Capability model:** `RegisterShell.capabilities` MUST include booleans for at least: `prompt_mode`, `session_mode`, `single_key_approval`, `edit_approval`, `execute_in_real_shell`, `command_completion_ack`, `stdout_stderr_capture`, `all_interactive_command_observation`, `terminal_context_capture`, `alias_capture`, `function_capture`, `builtin_inventory`, and `shell_native_history`. The daemon MUST reject adapters that lack required v1 capabilities for a requested feature, and SHOULD degrade gracefully for optional capabilities where explicitly documented.
 - **FR‑87 — Shell-native execution ownership:** The daemon MUST propose a raw logical command string and MUST NOT inject shell-specific capture wrappers, ZLE commands, Readline commands, fish `commandline` calls, or adapter-specific escaping. Each adapter owns wrapping, quoting, buffer insertion, accept/execute, capture, and completion detection for its shell.
@@ -627,9 +631,9 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 
 ### 2.14 Terminal Context Capture, Compression, and Privacy
 
-- **FR‑102 — All interactive command observation:** In v1, the zsh adapter MUST capture terminal context from all interactive commands after the plugin loads, including manually typed commands, commands recalled from history, aliases/functions, and termlm-proposed commands. Captured context feeds debugging/question tasks even when the command was not initiated by termlm.
+- **FR‑102 — All interactive command observation:** In v1, the zsh adapter MUST capture terminal context from interactive commands after the shell has started using termlm, including manually typed commands, commands recalled from history, aliases/functions, and termlm-proposed commands. Normal commands run before the first termlm interaction MUST NOT start the helper or daemon just to observe terminal context. Captured context feeds debugging/question tasks even when the command was not initiated by termlm.
 - **FR‑103 — Zsh observation mechanics:** The zsh adapter MUST use shell-native hooks to observe commands without bypassing the user's shell. `preexec` captures raw command text where available, expanded command text where available, cwd before execution, timestamp, and a monotonically increasing command sequence id. `precmd` captures exit status, cwd after execution, duration, and output capture metadata.
-- **FR‑104 — Output capture for observed commands:** When `[terminal_context].capture_all_interactive_commands = true`, the zsh adapter MUST capture stdout/stderr for observed commands subject to exclusions and size limits. The implementation MUST preserve history behavior, aliases/functions, shell options, job control, Ctrl-C behavior, and normal terminal rendering. Output is stored in redacted/truncated form and associated with the observed command sequence id.
+- **FR‑104 — Output capture for observed commands:** When `[terminal_context].capture_all_interactive_commands = true`, the zsh adapter MUST observe command metadata for manually typed commands. Capturing stdout/stderr for those manually typed commands is opt-in via `[terminal_context].capture_command_output = true` and remains subject to exclusions and size limits. The implementation MUST preserve history behavior, aliases/functions, shell options, job control, Ctrl-C behavior, and normal terminal rendering. Captured output is stored in redacted/truncated form and associated with the observed command sequence id.
 - **FR‑105 — Interactive/TUI exclusions and safe degradation:** The adapter MUST avoid intrusive capture for full-screen or TTY-attached interactive programs such as `vim`, `nvim`, `emacs`, `less`, `more`, `man`, `ssh`, `top`, `htop`, `fzf`, `watch`, pagers, editors, language REPLs, and interactive database clients. Excluded commands still produce an `ObservedCommand` entry with command, cwd, timestamps, exit status where available, duration, and `output_capture_status = "skipped_interactive_tty"` or `"excluded_interactive"`. The adapter MUST NOT attempt wrappers that could break job control, Ctrl-C behavior, terminal modes, or full-screen rendering.
 - **FR‑106 — Terminal context compressor:** The daemon MUST store a compact structured representation of each observed command: command, cwd, timestamp, exit code, duration, stdout/stderr head and tail, detected error lines, detected file paths, detected command names, truncation flags, redaction flags, and a local full-output reference when retained. Prompt injection MUST use this compact representation and MUST never summarize away the most recent failed command's exact relevant stderr/error lines.
 - **FR‑107 — Terminal secret redaction:** Terminal context MUST be redacted before storage, prompt injection, or logging. Redaction MUST cover API keys/tokens, password-looking environment variables, Authorization headers, cookies, SSH private key material, cloud credentials, database URLs with embedded passwords, and configured `[terminal_context].exclude_command_patterns`. Raw unredacted terminal output MUST NOT be logged.
@@ -641,7 +645,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 - **FR‑110 — Grounded command proposal object:** Internally, every proposed shell command MUST be represented as a structured proposal containing at least: `command`, `intent`, `expected_effect`, `commands_used`, `risk_level`, `destructive`, `requires_approval`, `grounding`, and `validation`. Providers MAY supply some fields through tool arguments, but the daemon MUST recompute or verify them and MUST NOT trust provider-supplied risk/safety metadata.
 - **FR‑111 — Proposal validation gates and conservative parsing:** A command may reach the approval UI only if validation passes: immutable safety floor, critical pattern classification, conservative shell parsing, first significant token existence, originating-shell built-in/alias/function resolution, docs availability or accepted stub status, plausible flag/subcommand support when docs are available, and prompt-intent sufficiency. Command validation MUST use a conservative shell-command parser for first significant command token, `sudo`/`env` wrappers, assignments, pipelines, redirections, command substitutions, shell functions, aliases, and compound commands where feasible; regex-only parsing is insufficient for validation decisions. If parsing is ambiguous, the daemon MUST NOT create a new approval step. It MUST instead feed parser feedback into the planning loop for revision, classify the command as critical if ambiguity intersects risky constructs, refuse if the immutable safety floor matches, ask a clarification, or provide a non-executing answer when validation cannot complete within `max_planning_rounds`. Validation failures become structured synthetic tool responses and count toward `max_planning_rounds` or `max_tool_rounds` as appropriate. The only user-facing approval prompts are the existing approval-mode prompts for surfaced commands.
 - **FR‑112 — Insufficient draft handling:** If validation determines that the draft command will not satisfy the prompt, the daemon MUST feed a concise validation finding back to the model and loop to a new draft rather than surfacing the command. If `max_planning_rounds` is exhausted, the daemon MUST either ask a clarification question or provide the safest validated partial answer/inspection command with an explicit `validation_incomplete` reason.
-- **FR‑113 — Documentation freshness metadata:** Retrieved docs and validation records MUST carry source metadata: command path, extraction method (`man`, `--help`, `-h`, built-in, alias, function), extraction timestamp, content hash prefix, and index version. This metadata SHOULD be visible in debug output and `termlm status --verbose`, and MAY be injected compactly into model context when useful. It reinforces that commands are grounded in the user's installed tools, not generic internet docs.
+- **FR‑113 — Documentation freshness metadata:** Retrieved docs and validation records MUST carry source metadata: command path, extraction method (`man`, `--help`, `-h`, built-in, alias, function), extraction timestamp, content hash prefix, and index version. This metadata SHOULD be visible in builder debug paths such as `termlm retrieve`, opt-in retrieval traces, and `termlm status --verbose`, and MAY be injected compactly into model context when useful. It reinforces that commands are grounded in the user's installed tools, not generic internet docs.
 
 ### 2.16 Lightweight HTTP-First Web Search and Read Tools
 
@@ -703,7 +707,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
 These tools are enabled by default because they are core to making `termlm` grounded in the user's actual terminal, workspace, and repository state. They are read-only and never require approval, but they MUST be bounded, redacted, and logged only as structural metadata.
 
 - **FR‑135 — Local read-only tool surface:** The daemon MUST expose these read-only model-facing tools by default: `search_terminal_context`, `read_file`, `search_files`, `list_workspace_files`, `project_metadata`, and `git_context`. They MAY be disabled by explicit config only for locked-down environments. The daemon MUST NOT expose side-effecting file-edit/write/install/package-manager tools; machine changes still go through `execute_shell_command` plus safety/approval.
-- **FR‑136 — `search_terminal_context`:** Searches older observed terminal commands and outputs beyond the automatically injected recent context. Results MUST be newest-first, command followed by output, redacted, bounded by result/token limits, and limited to terminal context captured after the plugin loaded unless the user explicitly enabled importing shell history. It is intended for prompts such as "that error from earlier" or "what command produced the permission error?".
+- **FR‑136 — `search_terminal_context`:** Searches older observed terminal commands and outputs beyond the automatically injected recent context. Results MUST be newest-first, command followed by output, redacted, bounded by result/token limits, and limited to terminal context captured after termlm was first used in that shell unless the user explicitly enabled importing shell history. It is intended for prompts such as "that error from earlier" or "what command produced the permission error?".
 - **FR‑137 — `read_file`:** Reads a bounded excerpt of a local plaintext-like file. It MUST support plaintext-like content by content detection, not by extension allowlist. Supported content includes source code in any programming language, scripts, markup, configs, manifests, lockfiles, logs, dotfiles, rc files, data formats, and extensionless plaintext. It MUST reject binary/media/archive content by content sniffing, NUL-byte detection, binary magic detection, or decode failure. It MUST redact secrets before returning content.
 - **FR‑138 — `search_files`:** Searches plaintext-like files under a resolved workspace/root with bounded output. It MUST use the same content-based plaintext detector as `read_file`; extension/name lists are hints only. It SHOULD respect `.gitignore` and common ignore rules by default; skip binary/media/archive files and large generated/vendor/cache/build directories unless explicitly requested and allowed by config; cap files scanned, bytes scanned, and matches returned; and redact secrets before returning matches.
 - **FR‑139 — Content-based plaintext detection:** Local file tools MUST decide readability primarily from sampled content. The detector MUST reject files with NUL bytes, known binary magic, or excessive undecodable bytes; accept valid UTF-8 and configured Unicode text encodings; and allow extensionless files when content is plaintext-like. File extensions MAY be used only for binary denylist hints, language labels, syntax hints, or prioritization. There MUST NOT be a finite allowlist of programming-language extensions.
@@ -832,7 +836,7 @@ termlm/
 │       │   └── safety-floor.zsh            (duplicate immutable floor)
 │       └── lib/
 │           ├── ipc.zsh                     (talks to termlm-client over fd)
-│           ├── capture.zsh                 (zsh stdout/stderr capture wrapper)
+│           ├── capture.zsh                 (zsh stdout/stderr capture helpers)
 │           ├── terminal-observer.zsh       (preexec/precmd observed command capture)
 │           ├── shell-context.zsh           (zsh aliases/functions capture)
 │           └── colors.zsh
@@ -902,7 +906,8 @@ termlm-core → planning loop: parse command → command-aware retrieval → saf
 termlm-core → ProposedCommand{cmd:"ls -lt", critical:false, requires_approval:true, grounding:[...]}
 zsh adapter → approval UI; user presses y
 zsh adapter → UserResponse{decision:Approved}
-zsh adapter → BUFFER="{ ls -lt; } > >(tee ...) 2> >(tee ... >&2)"; zle .accept-line
+zsh adapter → BUFFER="ls -lt"; zle .accept-line
+preexec → zsh adapter starts transparent stdout/stderr capture for this termlm-issued command
 precmd → zsh adapter reads capture files
 zsh adapter → Ack{exit_status, stdout_capture, stderr_capture}
 termlm-core → tool_response appended; generation continues or TaskComplete
@@ -1302,7 +1307,7 @@ Read-only local grounding tools are exposed by default when `[local_tools].enabl
 
 ### Phase 6 — Approval Modes, Capture, and Safety Defense-in-Depth
 
-**Deliverables:** Approval UI, edit flow, approve-all-in-task, critical-pattern matching, duplicate zsh-adapter-side safety floor, command capture wrapper, and `precmd` ack pipeline.
+**Deliverables:** Approval UI, edit flow, approve-all-in-task, critical-pattern matching, duplicate zsh-adapter-side safety floor, transparent command capture, and `precmd` ack pipeline.
 
 **Exit criteria:** `manual`, `manual_critical`, and `auto` modes behave correctly; Return rejects; Escape/Ctrl-C abort; captured stdout/stderr are truncated and deleted after ack.
 

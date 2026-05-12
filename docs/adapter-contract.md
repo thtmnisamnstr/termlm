@@ -11,7 +11,7 @@ Adapters are shell-specific UI/runtime shims over the shell-neutral daemon.
 5. Handle approval UX (`y/n/e/a`) and abort behavior.
 6. Execute approved commands in the real interactive shell.
 7. Send completion acknowledgements with exit status and optional captures.
-8. Observe all interactive commands after plugin load and forward redacted context.
+8. Observe interactive commands after the shell has started using termlm and forward redacted context.
 9. Preserve native shell history semantics.
 
 ## Capability Flags

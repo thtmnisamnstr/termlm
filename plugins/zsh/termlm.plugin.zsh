@@ -61,6 +61,7 @@ termlm-load-observer-settings
 
 zle -N self-insert termlm-self-insert
 zle -N accept-line termlm-accept-line
+zle -N zle-line-init termlm-line-init
 zle -N zle-line-pre-redraw termlm-line-pre-redraw
 zle -N termlm-delete-char-or-list
 zle -N termlm-cancel-prompt
@@ -74,6 +75,3 @@ bindkey -M termlm-prompt $'\e' termlm-cancel-prompt
 add-zsh-hook preexec termlm-preexec
 add-zsh-hook precmd termlm-precmd
 add-zsh-hook zshexit termlm-zshexit
-
-termlm-register-shell
-termlm-send-shell-context

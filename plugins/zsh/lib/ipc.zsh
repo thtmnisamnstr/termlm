@@ -450,11 +450,40 @@ termlm-daemon-boot-timeout-ms() {
   echo $(( boot_secs * 1000 ))
 }
 
+termlm-status-index-ready() {
+  local status_out="$1"
+  local progress_line progress_phase progress_percent chunk_count
+  progress_line="$(printf '%s\n' "$status_out" | awk -F': ' '/^index_progress:/ {print $2; exit}')"
+  progress_phase="$(printf '%s\n' "$progress_line" | sed -E 's/^phase=([^[:space:]]+).*/\1/')"
+  progress_percent="$(printf '%s\n' "$progress_line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^percent=/){split($i,a,"="); print a[2]; exit}}}')"
+  chunk_count="$(printf '%s\n' "$status_out" | awk -F': ' '/^index_chunk_count:/ {print $2; exit}')"
+
+  if [[ -z "$progress_line" && -z "$chunk_count" ]]; then
+    return 0
+  fi
+  if [[ "$chunk_count" == <-> && "$chunk_count" -gt 0 ]]; then
+    return 0
+  fi
+  if [[ "$progress_phase" == "complete" || "$progress_phase" == "idle" ]]; then
+    if awk -v pct="${progress_percent:-0}" 'BEGIN { exit !(pct+0 >= 100.0) }'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+termlm-daemon-ready() {
+  local client_bin="$1"
+  local status_out
+  status_out="$("$client_bin" status --verbose 2>/dev/null)" || return 1
+  termlm-status-index-ready "$status_out"
+}
+
 termlm-ensure-daemon() {
   local client_bin
   client_bin="$(termlm-client-bin)"
 
-  if "$client_bin" status >/dev/null 2>&1; then
+  if termlm-daemon-ready "$client_bin"; then
     return 0
   fi
 
@@ -463,11 +492,10 @@ termlm-ensure-daemon() {
   local daemon_log_file
   daemon_log_file="$(termlm-daemon-log-file)"
   mkdir -p -- "${daemon_log_file:h}" 2>/dev/null || true
-  if command -v setsid >/dev/null 2>&1; then
-    setsid "$core_bin" >>"$daemon_log_file" 2>&1 < /dev/null &!
-  else
-    "$core_bin" >>"$daemon_log_file" 2>&1 < /dev/null &!
-  fi
+  "$core_bin" --detach >>"$daemon_log_file" 2>&1 < /dev/null || {
+    print -r -- "termlm: failed to launch termlm-core"
+    return 1
+  }
 
   local waited_ms=0
   local announced=0
@@ -475,7 +503,7 @@ termlm-ensure-daemon() {
   max_wait_ms="$(termlm-daemon-boot-timeout-ms)"
   [[ "$max_wait_ms" == <-> && "$max_wait_ms" -gt 0 ]] || max_wait_ms=60000
   while (( waited_ms < max_wait_ms )); do
-    if "$client_bin" status >/dev/null 2>&1; then
+    if termlm-daemon-ready "$client_bin"; then
       return 0
     fi
 
@@ -546,6 +574,32 @@ termlm-mark-task-closed() {
 termlm-is-closed-task-event() {
   local task_id="$1"
   [[ -n "$task_id" && "$task_id" == "${_TERMLM_CLOSED_TASK_ID:-}" && "${_TERMLM_TASK_ID:-}" != "$task_id" ]]
+}
+
+termlm-is-current-task-event() {
+  local task_id="$1"
+  [[ -z "$task_id" ]] && return 0
+  [[ "$task_id" == "${_TERMLM_TASK_ID:-}" \
+    || "$task_id" == "${_TERMLM_PENDING_TASK_ID:-}" \
+    || "$task_id" == "${_TERMLM_APPROVAL_TASK_ID:-}" \
+    || "$task_id" == "${_TERMLM_CLARIFICATION_TASK_ID:-}" ]]
+}
+
+termlm-should-ignore-task-event() {
+  local task_id="$1"
+  if termlm-is-closed-task-event "$task_id"; then
+    return 0
+  fi
+  if [[ -z "${_TERMLM_TASK_ID:-}" \
+    && -z "${_TERMLM_PENDING_TASK_ID:-}" \
+    && -z "${_TERMLM_APPROVAL_TASK_ID:-}" \
+    && -z "${_TERMLM_CLARIFICATION_TASK_ID:-}" ]]; then
+    return 1
+  fi
+  if termlm-is-current-task-event "$task_id"; then
+    return 1
+  fi
+  return 0
 }
 
 termlm-abandon-active-task() {
@@ -681,7 +735,7 @@ termlm-handle-run-task-line() {
       task_id="$(termlm-json-field "$line" "task_id")"
       chunk_b64="$(termlm-json-field "$line" "chunk_b64")"
       chunk="$(termlm-base64-decode "$chunk_b64")"
-      if termlm-is-closed-task-event "$task_id"; then
+      if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
       if [[ -z "$_TERMLM_TASK_ID" ]]; then
@@ -697,7 +751,7 @@ termlm-handle-run-task-line() {
       task_id="$(termlm-json-field "$line" "task_id")"
       question_b64="$(termlm-json-field "$line" "question_b64")"
       question="$(termlm-base64-decode "$question_b64")"
-      if termlm-is-closed-task-event "$task_id"; then
+      if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
       _TERMLM_TASK_ID="$task_id"
@@ -717,7 +771,7 @@ termlm-handle-run-task-line() {
       cmd_b64="$(termlm-json-field "$line" "cmd_b64")"
       cmd="$(termlm-base64-decode "$cmd_b64")"
       requires="$(termlm-json-bool-field "$line" "requires_approval")"
-      if termlm-is-closed-task-event "$task_id"; then
+      if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
       termlm-finish-async-output-line
@@ -728,7 +782,7 @@ termlm-handle-run-task-line() {
     task_complete)
       local task_id
       task_id="$(termlm-json-field "$line" "task_id")"
-      if termlm-is-closed-task-event "$task_id"; then
+      if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
       if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
@@ -747,7 +801,7 @@ termlm-handle-run-task-line() {
       err_kind="$(termlm-json-field "$line" "kind")"
       msg_b64="$(termlm-json-field "$line" "message_b64")"
       msg="$(termlm-base64-decode "$msg_b64")"
-      if termlm-is-closed-task-event "$task_id"; then
+      if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
       if [[ -z "$_TERMLM_TASK_ID" && -n "$task_id" ]]; then
@@ -834,9 +888,8 @@ termlm-run-approved-command() {
     zle reset-prompt
   fi
 
-  local wrapped
-  wrapped="$(termlm-wrap-command-for-capture "$approved_cmd" "$_TERMLM_PENDING_SEQ")"
-  BUFFER="$wrapped"
+  BUFFER="$approved_cmd"
+  CURSOR=${#BUFFER}
   zle .accept-line
 }
 
@@ -848,9 +901,9 @@ termlm-reject-pending-approval() {
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
-  _TERMLM_WAITING_MODEL=1
+  termlm-mark-task-closed
   if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-    termlm-enter-prompt-mode
+    termlm-exit-prompt-mode
   else
     zle reset-prompt
   fi

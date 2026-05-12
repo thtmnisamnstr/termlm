@@ -137,6 +137,8 @@ enum Command {
         prompt: String,
         #[arg(long)]
         top_k: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     #[command(hide = true)]
     RunTask {
@@ -698,14 +700,30 @@ pub async fn run() -> Result<()> {
                 println!("{msg:?}");
             }
         }
-        Command::Retrieve { prompt, top_k } => {
+        Command::Retrieve {
+            prompt,
+            top_k,
+            json,
+        } => {
             transport
                 .send(ClientMessage::Retrieve {
-                    payload: RetrieveRequest { prompt, top_k },
+                    payload: RetrieveRequest {
+                        prompt: prompt.clone(),
+                        top_k,
+                    },
                 })
                 .await?;
-            if let Some(Ok(msg)) = transport.next().await {
-                println!("{msg:?}");
+            match transport.next().await {
+                Some(Ok(ServerMessage::RetrievalResult { chunks })) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&chunks)?);
+                    } else {
+                        print_retrieval_result(&prompt, top_k, &chunks);
+                    }
+                }
+                Some(Ok(msg)) => println!("unexpected response: {msg:?}"),
+                Some(Err(e)) => return Err(e.into()),
+                None => println!("daemon closed connection before returning retrieval results"),
             }
         }
         Command::RunTask {
@@ -1399,22 +1417,93 @@ fn base64_string(value: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
+fn print_retrieval_result(
+    prompt: &str,
+    top_k: Option<u32>,
+    chunks: &[termlm_protocol::RetrievedChunk],
+) {
+    println!("retrieval results");
+    println!("prompt: {}", prompt.trim());
+    if let Some(top_k) = top_k {
+        println!("top_k: {top_k}");
+    }
+    if chunks.is_empty() {
+        println!("no chunks retrieved");
+        return;
+    }
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let section = if chunk.section_name.trim().is_empty() {
+            "(no section)"
+        } else {
+            chunk.section_name.trim()
+        };
+        println!();
+        println!("{}. {} / {}", idx + 1, chunk.command_name, section);
+        println!(
+            "   rank={} score={} source={} chunk={}/{}",
+            retrieval_rank_label(chunk),
+            retrieval_score_label(chunk),
+            retrieval_source_label(chunk),
+            chunk.chunk_index + 1,
+            chunk.total_chunks
+        );
+        println!(
+            "   path={} extraction_method={} extracted_at={} doc_hash={}",
+            chunk.path,
+            chunk.extraction_method,
+            chunk.extracted_at.to_rfc3339(),
+            retrieval_hash_label(chunk)
+        );
+        if !chunk.text.trim().is_empty() {
+            println!("   text:");
+            for line in chunk.text.trim().lines() {
+                println!("     {line}");
+            }
+        }
+    }
+}
+
 fn render_retrieved_chunk_machine(chunk: &termlm_protocol::RetrievedChunk) -> String {
-    let hash = if chunk.doc_hash.is_empty() {
-        "unknown"
-    } else {
-        chunk.doc_hash.as_str()
-    };
     format!(
-        "### {} — {}\nSource: {}; extraction_method={}; extracted_at={}; doc_hash={}\n{}",
+        "### {} - {}\nSource: {}; rank={}; score={}; retrieval_source={}; extraction_method={}; extracted_at={}; doc_hash={}\n{}",
         chunk.command_name,
         chunk.section_name,
         chunk.path,
+        retrieval_rank_label(chunk),
+        retrieval_score_label(chunk),
+        retrieval_source_label(chunk),
         chunk.extraction_method,
         chunk.extracted_at.to_rfc3339(),
-        hash,
+        retrieval_hash_label(chunk),
         chunk.text
     )
+}
+
+fn retrieval_rank_label(chunk: &termlm_protocol::RetrievedChunk) -> String {
+    chunk
+        .retrieval_rank
+        .map(|rank| rank.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn retrieval_score_label(chunk: &termlm_protocol::RetrievedChunk) -> String {
+    chunk
+        .retrieval_score
+        .map(|score| format!("{score:.4}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn retrieval_source_label(chunk: &termlm_protocol::RetrievedChunk) -> &str {
+    chunk.retrieval_source.as_deref().unwrap_or("unknown")
+}
+
+fn retrieval_hash_label(chunk: &termlm_protocol::RetrievedChunk) -> &str {
+    if chunk.doc_hash.is_empty() {
+        "unknown"
+    } else {
+        chunk.doc_hash.as_str()
+    }
 }
 
 async fn register_shell(

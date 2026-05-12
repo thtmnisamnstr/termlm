@@ -70,6 +70,7 @@ termlm-accept-line() {
       fi
       BUFFER="$typed"
       CURSOR=${#BUFFER}
+      zle .accept-line
       return
     fi
 

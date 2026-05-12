@@ -131,13 +131,21 @@ termlm-line-pre-redraw() {
   local desired_prompt desired_session
   desired_prompt="$(termlm-current-prompt-indicator)"
   desired_session="$(termlm-current-session-indicator)"
-  if [[ "$_TERMLM_MODE" == "prompt" && "$PS1" != "$desired_prompt" ]]; then
-    PS1="$desired_prompt"
+  if [[ "$_TERMLM_MODE" == "prompt" ]]; then
+    if [[ "$PS1" != "$desired_prompt" ]]; then
+      PS1="$desired_prompt"
+    fi
     zle -K termlm-prompt
-  elif [[ $_TERMLM_SESSION_MODE -eq 1 && "$PS1" != "$desired_session" ]]; then
-    PS1="$desired_session"
+  elif [[ $_TERMLM_SESSION_MODE -eq 1 ]]; then
+    if [[ "$PS1" != "$desired_session" ]]; then
+      PS1="$desired_session"
+    fi
     zle -K termlm-prompt
   elif [[ "$_TERMLM_MODE" == "normal" && "$KEYMAP" == "termlm-prompt" ]]; then
     zle -K main
   fi
+}
+
+termlm-line-init() {
+  termlm-line-pre-redraw
 }

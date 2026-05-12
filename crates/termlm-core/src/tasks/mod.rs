@@ -43,6 +43,103 @@ pub struct DraftCommand {
     pub commands_used: Vec<String>,
 }
 
+pub fn clarification_question_for_ambiguous_prompt(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    let p = trimmed.to_ascii_lowercase();
+    let normalized = p
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_string();
+
+    if normalized.is_empty() {
+        return Some("What exact command behavior should run?".to_string());
+    }
+
+    if prompt_contains_incomplete_shell_snippet(trimmed) {
+        return Some(
+            "The command snippet looks incomplete. What exact complete command should I run?"
+                .to_string(),
+        );
+    }
+
+    if normalized == "do the usual" || normalized == "usual" {
+        return Some("What usual action should I run here?".to_string());
+    }
+    if normalized == "fix it" || normalized == "fix this" {
+        return Some("What should I fix, and what outcome should the command produce?".to_string());
+    }
+    if normalized == "clean this up" || normalized == "clean up this" {
+        return Some(
+            "What should I clean up, and which files or directories are in scope?".to_string(),
+        );
+    }
+    if normalized == "make this faster" || normalized == "speed this up" {
+        return Some("What should I measure or change to make this faster?".to_string());
+    }
+    if normalized == "rename my files" || normalized == "rename files" {
+        return Some(
+            "Which files should I rename, and what naming pattern should I use?".to_string(),
+        );
+    }
+    if normalized == "delete the old ones" || normalized == "remove the old ones" {
+        return Some(
+            "Which files should I delete, and how should I identify the old ones?".to_string(),
+        );
+    }
+    if p.contains("hyperdrive command") {
+        return Some(
+            "I do not know a real macOS hyperdrive command. What real tool or outcome should I use?"
+                .to_string(),
+        );
+    }
+    if (p.contains("delete") || p.contains("remove") || p.contains("move") || p.contains("rename"))
+        && (p.contains(" old ones") || p.contains(" these ") || p.contains(" those "))
+    {
+        return Some(
+            "Which exact files should I operate on, and what rule should select them?".to_string(),
+        );
+    }
+
+    None
+}
+
+fn prompt_contains_incomplete_shell_snippet(prompt: &str) -> bool {
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix('$') else {
+            continue;
+        };
+        let cmd = rest.trim();
+        if cmd.ends_with('|')
+            || cmd.ends_with("&&")
+            || cmd.ends_with("||")
+            || has_unbalanced_quote(cmd, '\'')
+            || has_unbalanced_quote(cmd, '"')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_unbalanced_quote(text: &str, quote: char) -> bool {
+    let mut escaped = false;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            count += 1;
+        }
+    }
+    count % 2 == 1
+}
+
 #[cfg(test)]
 pub fn classify_prompt(prompt: &str) -> ClassificationResult {
     classify_prompt_with_freshness_terms(prompt, &[])
@@ -222,6 +319,19 @@ pub fn extract_command_name_from_doc_prompt(prompt: &str) -> Option<String> {
 pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     let p = prompt.to_ascii_lowercase();
 
+    if (p.contains("brew") || p.contains("homebrew"))
+        && p.contains("install")
+        && let Some(pkg) = package_name_after_keyword(prompt, "install")
+    {
+        return Some(DraftCommand {
+            cmd: format!("brew install {pkg}"),
+            rationale: "Homebrew install request mapped to brew install.".to_string(),
+            intent: format!("Install {pkg} with Homebrew."),
+            expected_effect: "Installs the requested Homebrew formula or cask.".to_string(),
+            commands_used: vec!["brew".to_string()],
+        });
+    }
+
     if p.contains("again")
         && let Some(cmd) = extract_last_session_command(prompt)
     {
@@ -393,6 +503,31 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
         });
     }
 
+    if (p.contains("list") || p.contains("show"))
+        && (p.contains("files")
+            || p.contains("folders")
+            || p.contains("directory contents")
+            || p.contains("folder contents"))
+        && !p.contains("hidden")
+        && !p.contains("all files")
+        && !p.contains("newest")
+        && !p.contains("modified")
+        && !p.contains("named")
+        && !p.contains("called")
+        && !p.contains("larger than")
+        && !p.contains("bigger than")
+        && !p.contains("recursive")
+        && !p.contains("recursively")
+    {
+        return Some(DraftCommand {
+            cmd: "ls".to_string(),
+            rationale: "List visible directory entries in the current directory.".to_string(),
+            intent: "Show files in the current directory.".to_string(),
+            expected_effect: "Read-only directory listing.".to_string(),
+            commands_used: vec!["ls".to_string()],
+        });
+    }
+
     if p.contains("hidden")
         && (p.contains("file") || p.contains("directory") || p.contains("folder"))
     {
@@ -472,6 +607,23 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
         });
     }
 
+    if p.contains("current date")
+        || p == "date"
+        || p.contains("show date")
+        || p.contains("show the date")
+        || p.contains("print date")
+        || p.contains("print the date")
+    {
+        return Some(DraftCommand {
+            cmd: "date".to_string(),
+            rationale: "Print the system date and time using the platform default format."
+                .to_string(),
+            intent: "Show the current date.".to_string(),
+            expected_effect: "Read-only date/time output.".to_string(),
+            commands_used: vec!["date".to_string()],
+        });
+    }
+
     if (p.contains("create") || p.contains("make"))
         && (p.contains("directory") || p.contains("folder"))
         && let Some(name) = path_after_any_marker(prompt, &p, &[" named ", " called "])
@@ -515,6 +667,7 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     }
 
     if p.contains("current directory")
+        || p.contains("working directory")
         || p.contains("where am i")
         || p.contains("which directory")
         || p.contains("what directory")
@@ -1432,9 +1585,67 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     None
 }
 
+fn package_name_after_keyword(prompt: &str, keyword: &str) -> Option<String> {
+    let mut after_keyword = false;
+    for raw in prompt.split_whitespace() {
+        let token = trim_package_token(raw);
+        if token.is_empty() {
+            continue;
+        }
+        if token.eq_ignore_ascii_case(keyword) {
+            after_keyword = true;
+            continue;
+        }
+        if !after_keyword {
+            continue;
+        }
+
+        let lower = token.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "a" | "an"
+                | "the"
+                | "formula"
+                | "package"
+                | "cask"
+                | "command"
+                | "to"
+                | "with"
+                | "using"
+                | "via"
+                | "brew"
+                | "homebrew"
+                | "it"
+        ) {
+            continue;
+        }
+        if is_safe_package_token(&token) {
+            return Some(token);
+        }
+        return None;
+    }
+    None
+}
+
+fn trim_package_token(raw: &str) -> String {
+    raw.trim_matches(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@'))
+    })
+    .to_string()
+}
+
+fn is_safe_package_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 80
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@'))
+}
+
 pub fn high_confidence_shortcut_for_prompt(prompt: &str) -> Option<DraftCommand> {
     let p = prompt.to_ascii_lowercase();
     let pwd_request = p.contains("current directory")
+        || p.contains("working directory")
         || p.contains("where am i")
         || p.contains("which directory")
         || p.contains("what directory")
@@ -1458,6 +1669,12 @@ pub fn high_confidence_shortcut_for_prompt(prompt: &str) -> Option<DraftCommand>
         || (p.contains("git") && p.contains("status"))
         || (p.contains("tar.gz") && p.contains("archive"))
         || ((p.contains("current date") || p.contains("today")) && p.contains("iso"))
+        || p.contains("current date")
+        || p == "date"
+        || p.contains("show date")
+        || p.contains("show the date")
+        || p.contains("print date")
+        || p.contains("print the date")
         || ((p.contains("create") || p.contains("make"))
             && (p.contains("directory") || p.contains("folder"))
             && (p.contains(" named ") || p.contains(" called ")));
@@ -1656,6 +1873,41 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_prompts_get_clarification_questions() {
+        let cases = [
+            "do the usual",
+            "fix it",
+            "clean this up",
+            "rename my files",
+            "delete the old ones",
+            "$ ls -la |",
+            "$ grep \"foo",
+            "speed up my Mac with the macOS hyperdrive command",
+        ];
+
+        for prompt in cases {
+            assert!(
+                clarification_question_for_ambiguous_prompt(prompt).is_some(),
+                "prompt should require clarification: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn concrete_prompts_do_not_get_ambiguous_clarification_questions() {
+        for prompt in [
+            "which directory am I in?",
+            "list files in this directory",
+            "install ripgrep with Homebrew",
+        ] {
+            assert!(
+                clarification_question_for_ambiguous_prompt(prompt).is_none(),
+                "prompt should not require early clarification: {prompt}"
+            );
+        }
+    }
+
+    #[test]
     fn validation_incomplete_fallback_prefers_git_when_prompt_mentions_git() {
         let fallback = validation_incomplete_fallback("what changed in my git branch?");
         assert_eq!(fallback.cmd, "git status --short");
@@ -1683,6 +1935,7 @@ mod tests {
     #[test]
     fn draft_command_handles_common_smoke_prompts() {
         let cases = [
+            ("list files in this directory", "ls"),
             ("list the files in this directory one per line", "ls -1"),
             (
                 "find files named README.md under this directory",
@@ -1698,13 +1951,23 @@ mod tests {
             ),
             ("count lines in README.md", "wc -l README.md"),
             ("print the current date in ISO format", "date +%F"),
+            ("show the current date", "date"),
             ("show hidden files in the current directory", "ls -la"),
+            ("print the working directory", "pwd"),
             (
                 "create a directory named smoke-output if it does not exist",
                 "mkdir -p smoke-output",
             ),
             ("show today as an ISO date", "date +%F"),
             ("show files sorted newest first", "ls -lt"),
+            (
+                "search the web for Homebrew jq formula and propose the command to install jq",
+                "brew install jq",
+            ),
+            (
+                "install the ripgrep formula with Homebrew",
+                "brew install ripgrep",
+            ),
             ("find empty directories under here", "find . -type d -empty"),
             (
                 "make a tar.gz archive of the docs directory at /tmp/termlm-docs-test.tar.gz",
@@ -1730,5 +1993,10 @@ mod tests {
             high_confidence_shortcut_for_prompt("show hidden files in the current directory")
                 .expect("hidden files");
         assert_eq!(hidden.cmd, "ls -la");
+        let listing =
+            high_confidence_shortcut_for_prompt("list files in this directory").expect("ls");
+        assert_eq!(listing.cmd, "ls");
+        let date = high_confidence_shortcut_for_prompt("show the current date").expect("date");
+        assert_eq!(date.cmd, "date");
     }
 }

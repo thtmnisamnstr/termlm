@@ -8,6 +8,7 @@ typeset -g _TERMLM_OBS_SEQ=0
 typeset -g _TERMLM_OBS_CURRENT_SEQ=0
 typeset -g _TERMLM_OBS_EXCLUDE_TUI=1
 typeset -g _TERMLM_OBS_CAPTURE_ALL=1
+typeset -g _TERMLM_OBS_CAPTURE_OUTPUT=0
 typeset -g _TERMLM_OBS_MAX_BYTES=32768
 typeset -g _TERMLM_OBS_CAPTURE_ACTIVE=0
 typeset -g _TERMLM_OBS_STDOUT_FILE=""
@@ -37,6 +38,7 @@ termlm-load-observer-settings() {
 
   _TERMLM_OBS_EXCLUDE_TUI=1
   _TERMLM_OBS_CAPTURE_ALL=1
+  _TERMLM_OBS_CAPTURE_OUTPUT=0
   _TERMLM_OBS_MAX_BYTES=32768
   _TERMLM_OBS_EXCLUDE_PATTERNS=(
     '^\s*(env|printenv)(\s|$)'
@@ -77,6 +79,15 @@ termlm-load-observer-settings() {
         _TERMLM_OBS_CAPTURE_ALL=1
       else
         _TERMLM_OBS_CAPTURE_ALL=0
+      fi
+      continue
+    fi
+
+    if [[ "$line" =~ '^[[:space:]]*capture_command_output[[:space:]]*=[[:space:]]*(true|false)' ]]; then
+      if [[ "${match[1]}" == "true" ]]; then
+        _TERMLM_OBS_CAPTURE_OUTPUT=1
+      else
+        _TERMLM_OBS_CAPTURE_OUTPUT=0
       fi
       continue
     fi
@@ -166,47 +177,29 @@ termlm-observer-start-capture() {
   local seq="$1"
   [[ -z "$seq" || "$seq" == "0" ]] && return 1
 
+  _TERMLM_OBS_STDOUT_FILE="${_TERMLM_RUN_DIR}/obs.stdout.${seq}"
+  _TERMLM_OBS_STDERR_FILE="${_TERMLM_RUN_DIR}/obs.stderr.${seq}"
+
+  termlm-observer-start-capture-files "$_TERMLM_OBS_STDOUT_FILE" "$_TERMLM_OBS_STDERR_FILE"
+}
+
+termlm-observer-start-capture-files() {
+  local out="$1"
+  local err="$2"
   if (( _TERMLM_OBS_CAPTURE_ACTIVE == 1 )); then
     termlm-observer-stop-capture
   fi
 
-  _TERMLM_OBS_STDOUT_FILE="${_TERMLM_RUN_DIR}/obs.stdout.${seq}"
-  _TERMLM_OBS_STDERR_FILE="${_TERMLM_RUN_DIR}/obs.stderr.${seq}"
-
-  : >| "$_TERMLM_OBS_STDOUT_FILE" 2>/dev/null || return 1
-  : >| "$_TERMLM_OBS_STDERR_FILE" 2>/dev/null || return 1
-
-  local save_out save_err
-  exec {save_out}>&1 || return 1
-  exec {save_err}>&2 || {
-    eval "exec ${save_out}>&-" 2>/dev/null || true
-    return 1
-  }
-  _TERMLM_OBS_SAVE_STDOUT_FD="$save_out"
-  _TERMLM_OBS_SAVE_STDERR_FD="$save_err"
-
-  exec > >(tee "$_TERMLM_OBS_STDOUT_FILE" >&${_TERMLM_OBS_SAVE_STDOUT_FD}) || {
-    termlm-observer-stop-capture
-    return 1
-  }
-  exec 2> >(tee "$_TERMLM_OBS_STDERR_FILE" >&${_TERMLM_OBS_SAVE_STDERR_FD}) || {
-    termlm-observer-stop-capture
-    return 1
-  }
+  termlm-start-output-capture "$out" "$err" || return 1
+  _TERMLM_OBS_SAVE_STDOUT_FD="$_TERMLM_CAPTURE_SAVE_STDOUT_FD"
+  _TERMLM_OBS_SAVE_STDERR_FD="$_TERMLM_CAPTURE_SAVE_STDERR_FD"
 
   _TERMLM_OBS_CAPTURE_ACTIVE=1
   return 0
 }
 
 termlm-observer-stop-capture() {
-  if [[ "$_TERMLM_OBS_SAVE_STDOUT_FD" != "-1" ]]; then
-    eval "exec 1>&${_TERMLM_OBS_SAVE_STDOUT_FD}" 2>/dev/null || true
-    eval "exec ${_TERMLM_OBS_SAVE_STDOUT_FD}>&-" 2>/dev/null || true
-  fi
-  if [[ "$_TERMLM_OBS_SAVE_STDERR_FD" != "-1" ]]; then
-    eval "exec 2>&${_TERMLM_OBS_SAVE_STDERR_FD}" 2>/dev/null || true
-    eval "exec ${_TERMLM_OBS_SAVE_STDERR_FD}>&-" 2>/dev/null || true
-  fi
+  termlm-stop-output-capture
   _TERMLM_OBS_CAPTURE_ACTIVE=0
   _TERMLM_OBS_SAVE_STDOUT_FD=-1
   _TERMLM_OBS_SAVE_STDERR_FD=-1
@@ -230,10 +223,19 @@ termlm-preexec() {
     termlm-helper-send '{"op":"unregister_shell"}' >/dev/null 2>&1 || true
   fi
 
-  if [[ -z "$_TERMLM_SHELL_ID" || -n "$_TERMLM_PENDING_TASK_ID" ]]; then
+  if [[ -z "$_TERMLM_SHELL_ID" ]]; then
+    return
+  fi
+  if [[ -n "$_TERMLM_PENDING_TASK_ID" ]]; then
+    if termlm-capture-enabled && [[ -n "$_TERMLM_PENDING_STDOUT_FILE" && -n "$_TERMLM_PENDING_STDERR_FILE" ]]; then
+      termlm-observer-start-capture-files "$_TERMLM_PENDING_STDOUT_FILE" "$_TERMLM_PENDING_STDERR_FILE" >/dev/null 2>&1 || true
+    fi
     return
   fi
   if (( _TERMLM_OBS_CAPTURE_ALL != 1 )); then
+    return
+  fi
+  if (( _TERMLM_OBS_CAPTURE_OUTPUT != 1 )); then
     return
   fi
   if ! termlm-should-observe-command "$_TERMLM_LAST_PREEXEC_CMD"; then
@@ -245,13 +247,34 @@ termlm-preexec() {
 
 termlm-precmd() {
   local last_status=$?
-  termlm-send-shell-context
   termlm-load-capture-settings
   termlm-load-observer-settings
+
+  local helper_live=0
+  if [[ -n "${_TERMLM_SHELL_ID:-}" ]] && termlm-helper-is-alive; then
+    helper_live=1
+  fi
+
+  local termlm_active=0
+  if [[ "${_TERMLM_MODE:-normal}" != "normal" \
+    || "${_TERMLM_SESSION_MODE:-0}" -eq 1 \
+    || -n "${_TERMLM_TASK_ID:-}" \
+    || -n "${_TERMLM_PENDING_TASK_ID:-}" \
+    || -n "${_TERMLM_APPROVAL_TASK_ID:-}" \
+    || -n "${_TERMLM_CLARIFICATION_TASK_ID:-}" ]]; then
+    termlm_active=1
+  fi
+
+  if (( helper_live == 1 || termlm_active == 1 )); then
+    termlm-send-shell-context
+  fi
 
   local was_pending=0
   if [[ -n "$_TERMLM_PENDING_TASK_ID" ]]; then
     was_pending=1
+    if (( _TERMLM_OBS_CAPTURE_ACTIVE == 1 )); then
+      termlm-observer-stop-capture
+    fi
     local now="$EPOCHREALTIME"
     local elapsed_ms=0
 
@@ -319,7 +342,7 @@ termlm-precmd() {
     _TERMLM_OBS_CURRENT_SEQ=0
   fi
 
-  if [[ -n "$_TERMLM_LAST_PREEXEC_CMD" && -n "$_TERMLM_SHELL_ID" && $was_pending -eq 0 ]]; then
+  if [[ -n "$_TERMLM_LAST_PREEXEC_CMD" && -n "$_TERMLM_SHELL_ID" && $was_pending -eq 0 && $_TERMLM_OBS_CAPTURE_ALL -eq 1 ]]; then
     local now="$EPOCHREALTIME"
     local dur_ms=0
     if [[ -n "$_TERMLM_LAST_PREEXEC_TS" && "$_TERMLM_LAST_PREEXEC_TS" != "0" ]]; then
@@ -384,7 +407,9 @@ termlm-precmd() {
       observe_json+=",\"stderr_b64\":\"${stderr_b64}\""
     fi
     observe_json+="}"
-    termlm-helper-send "$observe_json" >/dev/null 2>&1 || true
+    if termlm-helper-is-alive; then
+      termlm-helper-send "$observe_json" >/dev/null 2>&1 || true
+    fi
   fi
 
   _TERMLM_LAST_PREEXEC_CMD=""

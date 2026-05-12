@@ -176,6 +176,12 @@ struct SearchResponseMeta {
     allow_local_address_results: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SearchPage {
+    body: String,
+    meta: SearchResponseMeta,
+}
+
 #[async_trait]
 impl SearchProvider for DuckDuckGoHtmlProvider {
     fn provider_name(&self) -> &'static str {
@@ -183,68 +189,34 @@ impl SearchProvider for DuckDuckGoHtmlProvider {
     }
 
     async fn search(&self, req: &SearchRequest) -> Result<SearchResultSet> {
-        let q = req.query.replace(' ', "+");
-        let url = format!("https://duckduckgo.com/html/?q={q}");
-        let body = self
-            .client
-            .get(url)
-            .send()
+        let mut results = match self
+            .fetch_search_page("https://duckduckgo.com/html/", req, "duckduckgo_html")
             .await
-            .context("request failed")?
-            .bytes()
-            .await
-            .context("body failed")?;
-        let body_len = body.len();
-        let body = String::from_utf8_lossy(&body).to_string();
-
-        let href_re =
-            Regex::new(r#"<a[^>]*class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>"#)
-                .expect("regex");
-        let snippet_re =
-            Regex::new(r#"<a[^>]*class=\"result__snippet\"[^>]*>(.*?)</a>"#).expect("regex");
-        let strip_tags = Regex::new(r"<[^>]+>").expect("regex");
-
-        let mut results = Vec::new();
-        for (idx, cap) in href_re.captures_iter(&body).enumerate() {
-            if results.len() >= req.max_results {
-                break;
+        {
+            Ok(page) => parse_duckduckgo_results(&page.body, self.provider_name(), req, page.meta),
+            Err(primary_error) => {
+                let page = self
+                    .fetch_search_page(
+                        "https://lite.duckduckgo.com/lite/",
+                        req,
+                        "duckduckgo_lite",
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "duckduckgo_html request failed ({primary_error:#}); duckduckgo_lite fallback failed"
+                        )
+                    })?;
+                parse_duckduckgo_results(&page.body, self.provider_name(), req, page.meta)
             }
-            let raw_url = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let Some(clean_url) = normalize_ddg_href(raw_url) else {
-                continue;
-            };
-            let Ok(normalized) = normalize_result_url(&clean_url, false, false) else {
-                continue;
-            };
-            let raw_title = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
-            let title = strip_tags.replace_all(raw_title, "").to_string();
-            let snippet = if let Some(full) = cap.get(0) {
-                let rest = &body[full.end()..body.len().min(full.end() + 1400)];
-                if let Some(scap) = snippet_re.captures(rest) {
-                    let s = scap.get(1).map(|m| m.as_str()).unwrap_or_default();
-                    strip_tags.replace_all(s, "").to_string()
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-            let content_hash_prefix = search_result_hash_prefix(&clean_url, &title, &snippet);
-            results.push(SearchResult {
-                url: clean_url,
-                normalized_url: normalized,
-                title,
-                snippet,
-                content_hash_prefix,
-                provider: self.provider_name().to_string(),
-                rank: idx + 1,
-                retrieved_at: Utc::now(),
-                status: Some(200),
-                content_type: Some("text/html".to_string()),
-                final_url: None,
-                response_bytes: Some(body_len),
-                extraction_method: Some("duckduckgo_html".to_string()),
-            });
+        };
+
+        if results.is_empty()
+            && let Ok(page) = self
+                .fetch_search_page("https://lite.duckduckgo.com/lite/", req, "duckduckgo_lite")
+                .await
+        {
+            results = parse_duckduckgo_results(&page.body, self.provider_name(), req, page.meta);
         }
 
         Ok(SearchResultSet {
@@ -253,6 +225,227 @@ impl SearchProvider for DuckDuckGoHtmlProvider {
             results,
         })
     }
+}
+
+impl DuckDuckGoHtmlProvider {
+    async fn fetch_search_page(
+        &self,
+        endpoint: &str,
+        req: &SearchRequest,
+        extraction_method: &str,
+    ) -> Result<SearchPage> {
+        let response = self
+            .client
+            .get(endpoint)
+            .query(&[("q", req.query.as_str())])
+            .send()
+            .await
+            .with_context(|| format!("{extraction_method} request failed"))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let final_url = Some(response.url().to_string());
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("{extraction_method} body failed"))?;
+        if !status.is_success() {
+            anyhow::bail!("{extraction_method} request failed: status {status}");
+        }
+        Ok(SearchPage {
+            body: String::from_utf8_lossy(&bytes).to_string(),
+            meta: SearchResponseMeta {
+                status: Some(status.as_u16()),
+                content_type,
+                final_url,
+                response_bytes: Some(bytes.len()),
+                extraction_method: extraction_method.to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
+            },
+        })
+    }
+}
+
+fn parse_duckduckgo_results(
+    body: &str,
+    provider_name: &str,
+    req: &SearchRequest,
+    meta: SearchResponseMeta,
+) -> Vec<SearchResult> {
+    let mut results = parse_duckduckgo_result_links(body, provider_name, req, &meta);
+    if results.is_empty() {
+        let mut generic_meta = meta.clone();
+        generic_meta.extraction_method = format!("{}_generic_links", meta.extraction_method);
+        results = parse_generic_html_links(body, provider_name, req, &generic_meta);
+    }
+    results
+}
+
+fn parse_duckduckgo_result_links(
+    body: &str,
+    provider_name: &str,
+    req: &SearchRequest,
+    meta: &SearchResponseMeta,
+) -> Vec<SearchResult> {
+    let href_re = Regex::new(
+        r#"(?is)<a\b[^>]*class\s*=\s*["'][^"']*\bresult__a\b[^"']*["'][^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#,
+    )
+    .expect("regex");
+    let snippet_re = Regex::new(
+        r#"(?is)<a\b[^>]*class\s*=\s*["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>(.*?)</a>"#,
+    )
+    .expect("regex");
+
+    let mut results = Vec::new();
+    for cap in href_re.captures_iter(body) {
+        if results.len() >= req.max_results {
+            break;
+        }
+        let raw_url = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let raw_title = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let snippet = if let Some(full) = cap.get(0) {
+            let rest = &body[full.end()..body.len().min(full.end() + 1400)];
+            snippet_re
+                .captures(rest)
+                .and_then(|scap| scap.get(1).map(|m| strip_html_text(m.as_str())))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        push_html_search_result(
+            &mut results,
+            provider_name,
+            req,
+            raw_url,
+            &strip_html_text(raw_title),
+            &snippet,
+            meta,
+        );
+    }
+    results
+}
+
+fn parse_generic_html_links(
+    body: &str,
+    provider_name: &str,
+    req: &SearchRequest,
+    meta: &SearchResponseMeta,
+) -> Vec<SearchResult> {
+    let anchor_re =
+        Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("regex");
+    let mut results = Vec::new();
+    for cap in anchor_re.captures_iter(body) {
+        if results.len() >= req.max_results {
+            break;
+        }
+        let raw_url = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let title = strip_html_text(cap.get(2).map(|m| m.as_str()).unwrap_or_default());
+        if is_generic_search_nav_title(&title) {
+            continue;
+        }
+        push_html_search_result(&mut results, provider_name, req, raw_url, &title, "", meta);
+    }
+    results
+}
+
+fn push_html_search_result(
+    results: &mut Vec<SearchResult>,
+    provider_name: &str,
+    req: &SearchRequest,
+    raw_url: &str,
+    title: &str,
+    snippet: &str,
+    meta: &SearchResponseMeta,
+) {
+    if results.len() >= req.max_results || title.trim().is_empty() {
+        return;
+    }
+    let Some(clean_url) = normalize_ddg_href(raw_url) else {
+        return;
+    };
+    let Ok(normalized) = normalize_result_url(
+        &clean_url,
+        meta.allow_plain_http_results,
+        meta.allow_local_address_results,
+    ) else {
+        return;
+    };
+    if is_duckduckgo_internal_url(&normalized)
+        || results.iter().any(|r| r.normalized_url == normalized)
+    {
+        return;
+    }
+    let title = collapse_html_whitespace(title);
+    if title.is_empty() || is_generic_search_nav_title(&title) {
+        return;
+    }
+    let snippet = collapse_html_whitespace(snippet);
+    let content_hash_prefix = search_result_hash_prefix(&clean_url, &title, &snippet);
+    results.push(SearchResult {
+        url: clean_url,
+        normalized_url: normalized,
+        title,
+        snippet,
+        content_hash_prefix,
+        provider: provider_name.to_string(),
+        rank: results.len() + 1,
+        retrieved_at: Utc::now(),
+        status: meta.status,
+        content_type: meta.content_type.clone(),
+        final_url: meta.final_url.clone(),
+        response_bytes: meta.response_bytes,
+        extraction_method: Some(meta.extraction_method.clone()),
+    });
+}
+
+fn strip_html_text(raw: &str) -> String {
+    let strip_tags = Regex::new(r"(?is)<[^>]+>").expect("regex");
+    collapse_html_whitespace(&html_unescape_basic(&strip_tags.replace_all(raw, " ")))
+}
+
+fn collapse_html_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn html_unescape_basic(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn is_duckduckgo_internal_url(normalized_url: &str) -> bool {
+    Url::parse(normalized_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.contains("duckduckgo.com")))
+        .unwrap_or(false)
+}
+
+fn is_generic_search_nav_title(title: &str) -> bool {
+    let normalized = title.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "all"
+                | "images"
+                | "videos"
+                | "news"
+                | "maps"
+                | "shopping"
+                | "settings"
+                | "feedback"
+                | "privacy"
+                | "next"
+                | "previous"
+                | "more"
+                | "duckduckgo"
+        )
 }
 
 #[async_trait]
@@ -700,6 +893,42 @@ mod tests {
         let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs";
         let url = normalize_ddg_href(href).expect("decoded");
         assert_eq!(url, "https://example.com/docs");
+    }
+
+    #[test]
+    fn parses_duckduckgo_generic_links_when_result_class_is_missing() {
+        let html = r#"
+            <html><body>
+              <a href="/settings">Settings</a>
+              <a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fformulae.brew.sh%2Fformula%2Fjq">jq formula &amp; docs</a>
+            </body></html>
+        "#;
+        let req = SearchRequest {
+            query: "homebrew jq".to_string(),
+            freshness: None,
+            max_results: 3,
+        };
+        let results = parse_duckduckgo_results(
+            html,
+            "duckduckgo_html",
+            &req,
+            SearchResponseMeta {
+                status: Some(200),
+                content_type: Some("text/html".to_string()),
+                final_url: Some("https://lite.duckduckgo.com/lite/?q=homebrew+jq".to_string()),
+                response_bytes: Some(html.len()),
+                extraction_method: "duckduckgo_lite".to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://formulae.brew.sh/formula/jq");
+        assert_eq!(results[0].title, "jq formula & docs");
+        assert_eq!(
+            results[0].extraction_method.as_deref(),
+            Some("duckduckgo_lite_generic_links")
+        );
     }
 
     #[test]

@@ -11,6 +11,9 @@ termlm-self-insert() {
     fi
 
     if [[ -z "${${LBUFFER}//[[:space:]]/}" && -z "$RBUFFER" ]]; then
+      if [[ -n "${_TERMLM_TASK_ID:-}" || "${_TERMLM_WAITING_MODEL:-0}" -eq 1 ]]; then
+        termlm-mark-task-closed
+      fi
       termlm-enter-prompt-mode
       BUFFER=""
       CURSOR=0

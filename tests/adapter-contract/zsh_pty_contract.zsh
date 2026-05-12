@@ -10,6 +10,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/termlm-pty-contract.XXXXXX")"
 MOCK_CLIENT="${TMP_ROOT}/mock-termlm-client.sh"
 MOCK_LOG="${TMP_ROOT}/mock-bridge.log"
+EXPECT_LOG="${TMP_ROOT}/expect.log"
 ZDOTDIR_PATH="${TMP_ROOT}/zdotdir"
 STDOUT_CAPTURE="${TMP_ROOT}/stdout.decoded"
 
@@ -78,7 +79,7 @@ case "$cmd" in
         else
           cmd_text='echo pty-contract'
           cmd_b64="$(encode_b64 "${cmd_text}")"
-          print -r -- "{\"event\":\"proposed_command\",\"task_id\":\"${task_id}\",\"cmd_b64\":\"${cmd_b64}\",\"requires_approval\":false}"
+          print -r -- "{\"event\":\"proposed_command\",\"task_id\":\"${task_id}\",\"cmd_b64\":\"${cmd_b64}\",\"requires_approval\":true}"
           pending_task="${task_id}"
         fi
       elif [[ "$line" == *'"op":"ack"'* ]]; then
@@ -90,6 +91,8 @@ case "$cmd" in
         fi
       elif [[ "$line" == *'"op":"shell_context"'* ]]; then
         print -r -- "event:shell_context" >> "${log_file}"
+      elif [[ "$line" == *'"op":"observe_command"'* ]]; then
+        print -r -- "event:observe_command" >> "${log_file}"
       elif [[ "$line" == *'"op":"user_response"'* ]]; then
         decision="$(json_field "$line" "decision")"
         task_id="$(json_field "$line" "task_id")"
@@ -149,13 +152,16 @@ decode_b64_to_file() {
 
 export TERMLM_EXPECT_ZDOTDIR="${ZDOTDIR_PATH}"
 export TERMLM_EXPECT_TERM="${TERMLM_TEST_TERM:-xterm-256color}"
-if ! expect <<'EOF' >/dev/null 2>&1
+if ! expect <<'EOF' >"${EXPECT_LOG}" 2>&1
 set timeout 30
 set zdotdir $env(TERMLM_EXPECT_ZDOTDIR)
 set term $env(TERMLM_EXPECT_TERM)
 set send_slow {1 0.02}
 
 spawn env TERM=$term ZDOTDIR=$zdotdir zsh -i
+expect -re {TERMLM_NORMAL> }
+send -s -- "echo before-termlm\r"
+expect -re {before-termlm}
 expect -re {TERMLM_NORMAL> }
 send -s -- "?"
 expect -re {TERMLM_PROMPT> }
@@ -170,6 +176,14 @@ expect -re {TERMLM_NORMAL> }
 send -s -- "?"
 expect -re {TERMLM_PROMPT> }
 send -s -- "run pty contract\r"
+expect -re {proposed command}
+expect -re {y accept.*n/Enter reject.*e edit.*a accept all.*Esc cancel}
+send -s -- "y"
+expect -re {echo pty-contract}
+expect -re {pty-contract}
+expect -re {TERMLM_NORMAL> }
+send -s -- "echo normal-command\r"
+expect -re {normal-command}
 expect -re {TERMLM_NORMAL> }
 # Trigger a prompt-cycle so precmd emits pending ack deterministically in PTY automation.
 send -- "\r"
@@ -187,6 +201,7 @@ EOF
 then
   unset TERMLM_EXPECT_ZDOTDIR
   unset TERMLM_EXPECT_TERM
+  [[ -f "${EXPECT_LOG}" ]] && cat "${EXPECT_LOG}" >&2 || true
   fail "expect PTY run failed"
 fi
 unset TERMLM_EXPECT_ZDOTDIR
@@ -194,6 +209,9 @@ unset TERMLM_EXPECT_TERM
 
 wait_for_log_pattern "event:shell_registered" 8 || fail "shell did not register through bridge"
 wait_for_log_pattern "event:shell_context" 8 || fail "shell context event not observed"
+if rg -q --fixed-strings -- "before-termlm" "${MOCK_LOG}"; then
+  fail "normal command before first termlm use should not start helper or enter terminal context"
+fi
 
 wait_for_log_pattern "event:start_task" 8 || fail "no start_task observed for prompt mode"
 if ! rg -q 'event:start_task:[^:]+:\?' "${MOCK_LOG}"; then
@@ -210,6 +228,14 @@ if [[ -n "${stdout_b64}" ]]; then
     fail "ack stdout payload did not include executed command output"
   fi
 fi
+
+if rg -q --fixed-strings -- '> >(tee "' "${EXPECT_LOG}" \
+  || rg -q --fixed-strings -- '( { echo pty-contract; }' "${EXPECT_LOG}"; then
+  cat "${EXPECT_LOG}" >&2 || true
+  fail "approved command leaked internal capture wrapper into the terminal transcript"
+fi
+
+wait_for_log_pattern "event:observe_command" 8 || fail "manual command was not observed without crashing the PTY"
 
 if ! rg -q 'event:start_task:[^:]+:/p' "${MOCK_LOG}"; then
   fail "expected start_task in session mode (/p)"

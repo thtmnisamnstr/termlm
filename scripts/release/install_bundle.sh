@@ -573,16 +573,16 @@ wait_for_runtime_ready() {
   start_core_instance() {
     local cfg_path="${1:-}"
     if [[ -n "$cfg_path" ]]; then
-      nohup "$termlm_core_bin" --config "$cfg_path" >>"$daemon_log_path" 2>&1 < /dev/null &
+      "$termlm_core_bin" --detach --config "$cfg_path" >>"$daemon_log_path" 2>&1 < /dev/null || {
+        fail_with_logs "failed to start termlm-core for readiness bootstrap"
+      }
     else
-      nohup "$termlm_core_bin" >>"$daemon_log_path" 2>&1 < /dev/null &
+      "$termlm_core_bin" --detach >>"$daemon_log_path" 2>&1 < /dev/null || {
+        fail_with_logs "failed to start termlm-core for readiness bootstrap"
+      }
     fi
-    core_pid=$!
-    disown "$core_pid" 2>/dev/null || true
+    core_pid=""
     sleep 1
-    if [[ -z "$core_pid" ]] || ! kill -0 "$core_pid" >/dev/null 2>&1; then
-      fail_with_logs "failed to start termlm-core for readiness bootstrap"
-    fi
   }
 
   status_with_timeout() {
@@ -797,7 +797,11 @@ PY
         && -s "$index_dir/postings.bin" ]]; then
         persisted_index_ready=1
       fi
-      if [[ "$persisted_index_ready" -eq 1 ]]; then
+      local runtime_index_loaded=0
+      if [[ "$chunk_count" =~ ^[0-9]+$ && "$chunk_count" -gt 0 ]]; then
+        runtime_index_loaded=1
+      fi
+      if [[ "$persisted_index_ready" -eq 1 && "$runtime_index_loaded" -eq 1 ]]; then
         index_ready=1
       fi
       if [[ "$phase_complete" -eq 1 && "$percent_complete" -eq 1 && "$manifest_chunk_count" == "0" ]]; then

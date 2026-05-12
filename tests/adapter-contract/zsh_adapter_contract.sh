@@ -75,6 +75,10 @@ require_pattern "$PLUGIN_MAIN" 'add-zsh-hook precmd termlm-precmd' "precmd captu
 if rg -q --fixed-strings -- 'export _TERMLM_PLUGIN_LOADED=1' "$PLUGIN_MAIN"; then
   fail "plugin load guard must not be exported into child zsh sessions"
 fi
+if rg -q --fixed-strings -- 'termlm-register-shell' "$PLUGIN_MAIN" \
+  || rg -q --fixed-strings -- 'termlm-send-shell-context' "$PLUGIN_MAIN"; then
+  fail "plugin source must not start termlm helper or daemon before first termlm use"
+fi
 
 echo "checking prompt entry/exit behavior..."
 # shellcheck disable=SC2016
@@ -95,7 +99,7 @@ if rg -q --fixed-strings -- 'vared -p' "$LIB_IPC"; then
 fi
 
 echo "checking approval contract..."
-require_pattern "$WIDGET_APPROVAL" '\[y\]es.*\[n\]o\(default\).*\[e\]dit.*\[a\]ll-in-this-task' "approval UI must expose y/n/e/a controls"
+require_pattern "$WIDGET_APPROVAL" 'y accept.*n/Enter reject.*e edit.*a accept all.*Esc cancel' "approval UI must expose y/n/e/a/Esc controls"
 require_pattern "$WIDGET_SELF_INSERT" 'termlm-handle-approval-key' "approval keys must be handled by zle key widgets"
 require_pattern "$WIDGET_ACCEPT_LINE" 'termlm-finish-edited-approval' "edited approvals must be completed through accept-line"
 require_pattern "$LIB_IPC" 'termlm-reject-pending-approval' "Return/default must reject pending approval"
@@ -104,10 +108,12 @@ if rg -q --fixed-strings -- 'read -k' "$WIDGET_APPROVAL" "$LIB_IPC"; then
 fi
 
 echo "checking execution/capture contract..."
-require_literal "$LIB_CAPTURE" "echo \"( { \$cmd; } > >(tee \\\"\$out\\\") 2> >(tee \\\"\$err\\\" >&2) )\"" "capture wrapper must use subshell tee process substitution"
 # shellcheck disable=SC2016
-require_pattern "$LIB_IPC" 'BUFFER="\$wrapped"' "approved command must be written into BUFFER"
+require_pattern "$LIB_IPC" 'BUFFER="\$approved_cmd"' "approved command must be written into BUFFER without internal capture wrappers"
 require_pattern "$LIB_IPC" 'zle \.accept-line' "approved command must execute via zle .accept-line"
+# shellcheck disable=SC2016
+require_pattern "$LIB_OBSERVER" 'termlm-observer-start-capture-files "\$_TERMLM_PENDING_STDOUT_FILE" "\$_TERMLM_PENDING_STDERR_FILE"' "pending command output capture must start from preexec"
+require_pattern "$LIB_OBSERVER" '_TERMLM_OBS_CAPTURE_OUTPUT != 1' "manual command output capture must be separately opt-in"
 require_pattern "$LIB_OBSERVER" '\\\"op\\\":\\\"ack\\\"' "adapter must send Ack messages"
 require_pattern "$LIB_OBSERVER" '\\\"op\\\":\\\"observe_command\\\"' "adapter must send observed interactive command events"
 require_pattern "$LIB_OBSERVER" 'started_at_ms' "adapter must forward absolute command start timestamps"
@@ -128,8 +134,7 @@ require_literal "$WIDGET_SAFETY" "'^[[:space:]]*:\\(\\)[[:space:]]*\\{[[:space:]
 
 echo "checking runtime helper behavior..."
 run_zsh_check "source \"$WIDGET_SAFETY\"; termlm-safety-floor-match 'rm -rf /' >/dev/null"
-run_zsh_check "source \"$LIB_CAPTURE\"; _TERMLM_RUN_DIR='/tmp/termlm-contract'; wrapped=\$(termlm-wrap-command-for-capture 'echo ok' 1); [[ \"\$wrapped\" == *'> >(tee \"'* ]]"
-run_zsh_check "source \"$LIB_CAPTURE\"; _TERMLM_CAPTURE_ENABLED=0; wrapped=\$(termlm-wrap-command-for-capture 'echo ok' 1); [[ \"\$wrapped\" == 'echo ok' ]]"
+run_zsh_check "source \"$LIB_CAPTURE\"; tmp=\$(mktemp -d); termlm-start-output-capture \"\$tmp/out\" \"\$tmp/err\"; print -r -- ok; termlm-stop-output-capture; rg -q '^ok$' \"\$tmp/out\"; rm -rf \"\$tmp\""
 run_zsh_check "source \"$LIB_OBSERVER\"; [[ \"\$(termlm-epoch-to-ms 1.234)\" == '1234' ]]"
 run_zsh_check "source \"$LIB_OBSERVER\"; _TERMLM_OBS_CAPTURE_ALL=0; _TERMLM_SHELL_ID='shell'; _TERMLM_PENDING_TASK_ID=''; _TERMLM_RUN_DIR='/tmp/termlm-contract'; mkdir -p \"\$_TERMLM_RUN_DIR\"; termlm-preexec 'll /tmp' 'ls -l /tmp'; [[ \"\$_TERMLM_LAST_PREEXEC_CMD\" == 'll /tmp' && \"\$_TERMLM_LAST_PREEXEC_EXPANDED\" == 'ls -l /tmp' ]]"
 

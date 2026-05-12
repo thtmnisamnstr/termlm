@@ -12,7 +12,7 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 - `widgets/approval.zsh`: `y/n/e/a` command approval UX
 - `widgets/safety-floor.zsh`: duplicate immutable adapter-side safety floor
 - `lib/ipc.zsh`: persistent helper process (`termlm bridge`) and event stream handling
-- `lib/capture.zsh`: command capture wrapper and truncation logic
+- `lib/capture.zsh`: stdout/stderr capture and truncation helpers
 - `lib/terminal-observer.zsh`: all-interactive command observation via `preexec`/`precmd`
 - `lib/shell-context.zsh`: alias/function/builtin inventory upload
 
@@ -23,14 +23,18 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 - `Esc` cancels prompt mode, in-flight model output, clarification, approval, or session mode.
 - `\?` is treated as a literal character (no mode switch).
 - `Ctrl-D` exits session mode when buffer is empty.
-- While waiting on model output, typing a plausible shell command and pressing Enter triggers task abort and returns command control to the shell.
+- While waiting on model output, typing a plausible shell command and pressing Enter aborts the task and immediately submits that command through normal zsh `accept-line`.
 - Proposed commands requiring approval use single-key decisions:
   - `y`: approve
   - `n` or Enter: reject
   - `e`: edit inline in the prompt before execution
   - `a`: approve all for current task only
+  - `Esc`: cancel the current task
 - Clarification replies are typed back into prompt/session mode rather than collected through a blocking nested editor.
 - Approved commands execute in real interactive zsh via `BUFFER` + `zle .accept-line`.
+- termlm-issued commands use transparent preexec/precmd capture for the task ack; the visible zsh command remains the approved command.
+- Before the first termlm interaction, normal zsh commands do not start the daemon/helper or send terminal context.
+- After termlm has been used in a shell, manually typed commands are observed for terminal context by default. Capturing stdout/stderr for every manually typed command is opt-in with `[terminal_context] capture_command_output = true`.
 
 ## Prompt Indicators
 
@@ -53,7 +57,7 @@ Config source: `[prompt]` in `~/.config/termlm/config.toml`, with env overrides:
 
 ## Hooks Registered
 
-- `preexec`: begins command observation/capture
+- `preexec`: records command metadata and starts transparent capture when needed
 - `precmd`: emits ack for termlm-issued command completion and emits observed command context
 - `zshexit`: aborts active task, unregisters shell, stops helper, restores shell state
 
@@ -97,7 +101,7 @@ antidote bundle zsh-users/zsh-syntax-highlighting
 
 - `[prompt] indicator`, `session_indicator`, `use_color`
 - `[capture] enabled`, `max_bytes`
-- `[terminal_context] capture_all_interactive_commands`, `max_output_bytes_per_command`, `exclude_tui_commands`, `exclude_command_patterns`
+- `[terminal_context] capture_all_interactive_commands`, `capture_command_output`, `max_output_bytes_per_command`, `exclude_tui_commands`, `exclude_command_patterns`
 
 Environment overrides:
 

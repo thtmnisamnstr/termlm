@@ -262,6 +262,52 @@ patched = patched.replace(
     'trigger_reindex_with_timeout "$reindex_mode"',
     'trigger_reindex_with_timeout "delta"',
 )
+patched = patched.replace(
+    '''      if [[ "$persisted_index_ready" -eq 1 ]]; then
+        index_ready=1
+      fi
+''',
+    '''      local runtime_index_loaded=0
+      if [[ "$chunk_count" =~ ^[0-9]+$ && "$chunk_count" -gt 0 ]]; then
+        runtime_index_loaded=1
+      fi
+      if [[ "$persisted_index_ready" -eq 1 && "$runtime_index_loaded" -eq 1 ]]; then
+        index_ready=1
+      fi
+''',
+)
+patched = patched.replace(
+    '''  start_core_instance() {
+    local cfg_path="${1:-}"
+    if [[ -n "$cfg_path" ]]; then
+      nohup "$termlm_core_bin" --config "$cfg_path" >>"$daemon_log_path" 2>&1 < /dev/null &
+    else
+      nohup "$termlm_core_bin" >>"$daemon_log_path" 2>&1 < /dev/null &
+    fi
+    core_pid=$!
+    disown "$core_pid" 2>/dev/null || true
+    sleep 1
+    if [[ -z "$core_pid" ]] || ! kill -0 "$core_pid" >/dev/null 2>&1; then
+      fail_with_logs "failed to start termlm-core for readiness bootstrap"
+    fi
+  }
+''',
+    '''  start_core_instance() {
+    local cfg_path="${1:-}"
+    if [[ -n "$cfg_path" ]]; then
+      "$termlm_core_bin" --detach --config "$cfg_path" >>"$daemon_log_path" 2>&1 < /dev/null || {
+        fail_with_logs "failed to start termlm-core for readiness bootstrap"
+      }
+    else
+      "$termlm_core_bin" --detach >>"$daemon_log_path" 2>&1 < /dev/null || {
+        fail_with_logs "failed to start termlm-core for readiness bootstrap"
+      }
+    fi
+    core_pid=""
+    sleep 1
+  }
+''',
+)
 
 if patched != original:
     path.write_text(patched, encoding="utf-8")

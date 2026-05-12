@@ -6,6 +6,8 @@ Command-line work has a lot of context: local tools, shell state, project conven
 
 Type `?`, describe the task, review the proposed command, and approve or edit it. Approved commands run through your real zsh execution path, so aliases, functions, working directory, history, hooks, and normal terminal behavior still apply.
 
+If the request is too vague to turn into a command safely, `termlm` asks a focused follow-up instead of guessing.
+
 It is built for developers who want AI assistance inside the terminal workflow they already use, with local command docs, explicit approval, and safety checks in the loop.
 
 ## What It Feels Like
@@ -17,10 +19,10 @@ It is built for developers who want AI assistance inside the terminal workflow t
 proposed command
   mkdir -p archive
 
-[y]es  [n]o  [e]dit  [a]ll-in-this-task
+y accept   n/Enter reject   e edit   a accept all   Esc cancel
 ```
 
-Approve with `y`, reject with `n`, edit with `e`, or approve the rest of the current task with `a`.
+Approve with `y`, reject with `n` or Enter, edit with `e`, approve the rest of the current task with `a`, or cancel with `Esc`.
 
 Good first prompts:
 
@@ -113,6 +115,23 @@ termlm stop
 
 Use `termlm reindex --mode delta` for normal PATH/tooling changes. `full` is a heavier repair option for incompatible or corrupt index state; `compact` rewrites index files to remove tombstones.
 
+Builder/debugging tools:
+
+```bash
+termlm retrieve --prompt "find large files in this directory" --top-k 8 --json
+```
+
+To inspect what hybrid retrieval found during real prompts, enable opt-in trace files in `~/.config/termlm/config.toml`:
+
+```toml
+[debug]
+retrieval_trace_enabled = true
+retrieval_trace_dir = "~/.local/state/termlm/retrieval-traces"
+retrieval_trace_max_files = 25
+```
+
+Then run `termlm reload-config`. New prompt traces will be written as JSON under `~/.local/state/termlm/retrieval-traces/`. Keep this off unless you are actively debugging retrieval; trace files include the raw prompt and retrieved snippets.
+
 ## How It Works
 
 `termlm` has two pieces:
@@ -120,7 +139,7 @@ Use `termlm reindex --mode delta` for normal PATH/tooling changes. `full` is a h
 - a small zsh adapter in `plugins/zsh/`
 - a Rust daemon, `termlm-core`, that handles indexing, retrieval, planning, validation, model calls, and safety checks
 
-For command prompts, the daemon gathers local shell context, retrieves relevant command docs, asks the model for a structured command proposal, validates the result, and then sends the proposed command back to the zsh adapter. If the local model fails to produce a structured command for a known simple request, `termlm` can fall back to a conservative built-in command draft.
+For command prompts, the daemon gathers local shell context, retrieves relevant command docs, asks the model for a structured command proposal, validates the result, and then sends the proposed command back to the zsh adapter. If local command docs are missing or not enough, the daemon can use the default web search/read tools for fallback grounding before proposing a command. If the local model fails to produce a structured command for a known simple request, `termlm` can fall back to a conservative built-in command draft; if there still is not enough signal, it asks a clarification question.
 
 ## Inference And Privacy
 

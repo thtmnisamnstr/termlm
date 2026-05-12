@@ -20,6 +20,7 @@ use provider_bootstrap::*;
 use provider_bootstrap::{
     ensure_required_model_assets, is_loopback_endpoint, resolve_models_dir, validate_provider_boot,
 };
+use serde::Serialize;
 use sha2::Digest;
 use shell_registry::{ShellRegistry, ShellSession};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -203,6 +204,23 @@ struct ProviderUsageSnapshot {
     prompt_tokens: u64,
     completion_tokens: u64,
     reported: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RetrievalTrace {
+    trace_type: String,
+    task_id: Option<Uuid>,
+    prompt: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    index_revision: u64,
+    index_chunk_count: usize,
+    top_k: usize,
+    min_score: f32,
+    hybrid_enabled: bool,
+    lexical_enabled: bool,
+    lexical_top_k: usize,
+    command_aware: bool,
+    chunks: Vec<RetrievedChunk>,
 }
 
 enum ProviderRuntime {
@@ -1239,6 +1257,41 @@ async fn process_start_task(
         classify_started.elapsed().as_millis() as u64,
     );
 
+    if state.config_snapshot().behavior.allow_clarifications
+        && let Some(question) = tasks::clarification_question_for_ambiguous_prompt(&payload.prompt)
+    {
+        let shell_override = approval_override_for_shell(state, payload.shell_id).await;
+        state.tasks.lock().await.insert(
+            payload.task_id,
+            InFlightTask {
+                task_id: payload.task_id,
+                shell_id: payload.shell_id,
+                mode: payload.mode.clone(),
+                original_prompt: payload.prompt.clone(),
+                proposed_command: String::new(),
+                classification: classification.classification.clone(),
+                classification_confidence: classification.confidence,
+                approval_override: shell_override,
+                awaiting_clarification: true,
+                provider_continuation: false,
+                tool_round: 0,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        transport
+            .send(ServerMessage::NeedsClarification {
+                task_id: payload.task_id,
+                question,
+            })
+            .await?;
+        stage_timings.insert(
+            "task_total_ms".to_string(),
+            task_started.elapsed().as_millis() as u64,
+        );
+        *state.last_stage_timings_ms.lock().await = stage_timings;
+        return Ok(());
+    }
+
     let context_started = std::time::Instant::now();
     let context_assembly = assemble_task_prompt(state, &payload, &classification).await;
     stage_timings.insert(
@@ -1314,11 +1367,56 @@ async fn process_start_task(
             drafting_prompt.push_str(&format_retrieved_docs_block(&retrieved_chunks));
             append_source_refs(state, retrieved_chunk_source_refs(&retrieved_chunks)).await;
         }
+        maybe_write_retrieval_trace(
+            state,
+            Some(payload.task_id),
+            &payload.prompt,
+            Some(state.config_snapshot().indexer.rag_top_k as u32),
+            &retrieved_chunks,
+        )
+        .await;
     }
     stage_timings.insert(
         "prompt_retrieval_ms".to_string(),
         retrieval_started.elapsed().as_millis() as u64,
     );
+
+    if payload.mode == "?"
+        && matches!(
+            classification.classification,
+            tasks::TaskClassification::WebCurrentInfoQuestion
+        )
+        && state.config_snapshot().web.enabled
+        && state.config_snapshot().web.expose_tools
+    {
+        let web_started = std::time::Instant::now();
+        let web_cfg = state.config_snapshot();
+        let call = termlm_inference::ToolCall {
+            name: "web_search".to_string(),
+            arguments: serde_json::json!({
+                "query": payload.prompt.clone(),
+                "freshness": infer_search_freshness(&payload.prompt, &web_cfg.web.freshness_required_terms),
+                "max_results": web_cfg.web.max_results.min(4),
+            }),
+        };
+        if let Some((tool_name, tool_output)) =
+            handle_readonly_tool_call(state, &payload, &session, &call).await?
+        {
+            let budgeted_output = context::trim_to_tokens(
+                &tool_output,
+                tool_output_budget_tokens(web_cfg.as_ref(), &tool_name).max(256),
+            );
+            drafting_prompt.push_str("\n\n## Automatic web_search results\n");
+            drafting_prompt.push_str(&budgeted_output);
+            drafting_prompt.push_str(
+                "\n\nUse the web_search results above only if they are relevant. Emit one execute_shell_command tool call when they are enough to ground the command.",
+            );
+        }
+        stage_timings.insert(
+            "automatic_web_search_ms".to_string(),
+            web_started.elapsed().as_millis() as u64,
+        );
+    }
 
     let progress_started = std::time::Instant::now();
     let progress = state.index_progress.lock().await.clone();
@@ -1661,13 +1759,10 @@ async fn process_user_response(
             }
         }
         UserDecision::Rejected => {
-            if task.provider_continuation {
-                let rejection_reason = payload.text.unwrap_or_default();
+            let rejection_reason = payload.text.unwrap_or_default();
+            if task.provider_continuation && !rejection_reason.trim().is_empty() {
                 let mut rejection_tool_response = "User declined to run this command.".to_string();
-                if !rejection_reason.trim().is_empty() {
-                    rejection_tool_response
-                        .push_str(&format!(" Reason: {}", rejection_reason.trim()));
-                }
+                rejection_tool_response.push_str(&format!(" Reason: {}", rejection_reason.trim()));
                 let mut conversations = state.task_conversations.lock().await;
                 let history = conversations
                     .entry(payload.task_id)
@@ -1858,31 +1953,101 @@ async fn process_user_response(
                 return Ok(());
             }
 
-            // Prompt mode keeps deterministic command fallback behavior.
-            let fallback = tasks::validation_incomplete_fallback(&refined_prompt);
-            let fallback_plan = CommandPlan {
-                cmd: fallback.cmd.trim().to_string(),
-                rationale: fallback.rationale,
-                intent: fallback.intent,
-                expected_effect: fallback.expected_effect,
-                commands_used: fallback.commands_used,
-            };
-            propose_command_for_execution(
+            let clarified_classification =
+                classify_prompt_for_task(state.config_snapshot().as_ref(), &refined_prompt);
+            if let Some(question) = tasks::clarification_question_for_ambiguous_prompt(&detail) {
+                if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
+                    active.awaiting_clarification = true;
+                    active.provider_continuation = true;
+                    active.original_prompt = refined_prompt;
+                    active.classification = clarified_classification.classification.clone();
+                    active.classification_confidence = clarified_classification.confidence;
+                    active.created_at = std::time::Instant::now();
+                }
+                transport
+                    .send(ServerMessage::NeedsClarification {
+                        task_id: payload.task_id,
+                        question,
+                    })
+                    .await?;
+                return Ok(());
+            }
+
+            if let Some(draft) = tasks::high_confidence_shortcut_for_prompt(&detail)
+                .or_else(|| tasks::draft_command_for_prompt(&detail))
+                .or_else(|| tasks::draft_command_for_prompt(&refined_prompt))
+            {
+                propose_command_for_execution(
+                    state,
+                    transport,
+                    &synth,
+                    &session,
+                    true,
+                    &clarified_classification,
+                    CommandPlan {
+                        cmd: draft.cmd.trim().to_string(),
+                        rationale: draft.rationale,
+                        intent: draft.intent,
+                        expected_effect: draft.expected_effect,
+                        commands_used: draft.commands_used,
+                    },
+                )
+                .await?;
+                if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
+                    active.awaiting_clarification = false;
+                    active.provider_continuation = true;
+                    active.original_prompt = refined_prompt;
+                    active.classification = clarified_classification.classification;
+                    active.classification_confidence = clarified_classification.confidence;
+                    active.created_at = std::time::Instant::now();
+                }
+                return Ok(());
+            }
+
+            let handled = match try_provider_orchestration(
                 state,
                 transport,
                 &synth,
                 &session,
+                &clarified_classification,
+                &refined_prompt,
                 true,
-                &classification,
-                fallback_plan,
             )
-            .await?;
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    cancel_and_clear_task(state, payload.task_id).await;
+                    return Err(e);
+                }
+            };
+
+            if handled {
+                if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
+                    active.awaiting_clarification = false;
+                    active.provider_continuation = true;
+                    active.original_prompt = refined_prompt;
+                    active.classification = clarified_classification.classification;
+                    active.classification_confidence = clarified_classification.confidence;
+                    active.created_at = std::time::Instant::now();
+                }
+                return Ok(());
+            }
+
             if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                active.awaiting_clarification = false;
+                active.awaiting_clarification = true;
                 active.provider_continuation = true;
                 active.original_prompt = refined_prompt;
+                active.classification = clarified_classification.classification;
+                active.classification_confidence = clarified_classification.confidence;
                 active.created_at = std::time::Instant::now();
             }
+            transport
+                .send(ServerMessage::NeedsClarification {
+                    task_id: payload.task_id,
+                    question: "I still need a more specific request. Include the exact command outcome and target path or tool.".to_string(),
+                })
+                .await?;
             return Ok(());
         }
     }
@@ -2397,10 +2562,10 @@ async fn send_provider_health(
 }
 
 fn indexing_progress_banner(progress: &IndexProgress, usable_index_loaded: bool) -> Option<String> {
-    if progress.phase == "complete" || progress.phase == "idle" {
+    if usable_index_loaded {
         return None;
     }
-    if usable_index_loaded && progress.percent >= 99.9 {
+    if progress.phase == "complete" || progress.phase == "idle" {
         return None;
     }
     let display_percent = if progress.phase == "embed" && progress.percent >= 99.9 {
@@ -5706,6 +5871,12 @@ async fn try_provider_orchestration(
     {
         tool_calls.push(parsed);
     }
+    if tool_calls.is_empty()
+        && payload.mode == "?"
+        && let Some(plain_call) = extract_execute_shell_command_from_plain_text(&text_buffer)
+    {
+        tool_calls.push(plain_call);
+    }
 
     if !text_buffer.trim().is_empty() || !tool_calls.is_empty() {
         let mut conversations = state.task_conversations.lock().await;
@@ -5717,6 +5888,44 @@ async fn try_provider_orchestration(
     }
 
     if tool_calls.is_empty() {
+        if payload.mode == "?"
+            && cfg.behavior.allow_clarifications
+            && !text_buffer.trim().is_empty()
+        {
+            let shell_override = approval_override_for_shell(state, payload.shell_id).await;
+            state.tasks.lock().await.insert(
+                payload.task_id,
+                InFlightTask {
+                    task_id: payload.task_id,
+                    shell_id: payload.shell_id,
+                    mode: payload.mode.clone(),
+                    original_prompt: payload.prompt.clone(),
+                    proposed_command: String::new(),
+                    classification: classification.classification.clone(),
+                    classification_confidence: classification.confidence,
+                    approval_override: shell_override,
+                    awaiting_clarification: true,
+                    provider_continuation,
+                    tool_round: 0,
+                    created_at: std::time::Instant::now(),
+                },
+            );
+            let model_text = text_buffer.trim().trim_end_matches('\n');
+            let question = if model_text.ends_with('?') {
+                model_text.to_string()
+            } else {
+                "I could not turn that into a safe command yet. What exact command behavior should run?"
+                    .to_string()
+            };
+            transport
+                .send(ServerMessage::NeedsClarification {
+                    task_id: payload.task_id,
+                    question,
+                })
+                .await?;
+            return Ok(true);
+        }
+
         if cfg.behavior.allow_clarifications && text_buffer.trim_end().ends_with('?') {
             let shell_override = approval_override_for_shell(state, payload.shell_id).await;
             state.tasks.lock().await.insert(
@@ -7075,6 +7284,11 @@ async fn provider_redraft_from_validation(
     {
         tool_calls.push(parsed);
     }
+    if tool_calls.is_empty()
+        && let Some(plain_call) = extract_execute_shell_command_from_plain_text(&text_buffer)
+    {
+        tool_calls.push(plain_call);
+    }
 
     if !text_buffer.trim().is_empty() || !tool_calls.is_empty() {
         let mut conversations = state.task_conversations.lock().await;
@@ -8013,6 +8227,7 @@ async fn process_retrieve_request(
     payload: termlm_protocol::RetrieveRequest,
 ) -> Result<()> {
     let chunks = retrieve_chunks_for_prompt(state, &payload.prompt, payload.top_k).await;
+    maybe_write_retrieval_trace(state, None, &payload.prompt, payload.top_k, &chunks).await;
     transport
         .send(ServerMessage::RetrievalResult { chunks })
         .await?;
@@ -8059,7 +8274,12 @@ async fn retrieve_chunks_for_prompt(
         if let Some(chunk) = runtime.chunks.iter().find(|c| c.command_name == hint)
             && seen_commands.insert(chunk.command_name.clone())
         {
-            out.push(render_retrieval_chunk(chunk));
+            out.push(render_retrieval_chunk_with_meta(
+                chunk,
+                None,
+                None,
+                Some("command_hint".to_string()),
+            ));
             continue;
         }
         if seen_commands.insert(hint.clone())
@@ -8069,21 +8289,31 @@ async fn retrieve_chunks_for_prompt(
         }
     }
 
-    for hit in runtime.retriever.search_with_embedding(
-        &query,
-        if use_external_embeddings {
-            query_embedding.as_deref()
-        } else {
-            None
-        },
-    ) {
+    for (search_rank, hit) in runtime
+        .retriever
+        .search_with_embedding(
+            &query,
+            if use_external_embeddings {
+                query_embedding.as_deref()
+            } else {
+                None
+            },
+        )
+        .into_iter()
+        .enumerate()
+    {
         if out.len() >= top_k {
             break;
         }
         if !seen_commands.insert(hit.chunk.command_name.clone()) {
             continue;
         }
-        out.push(render_retrieval_chunk(&hit.chunk));
+        out.push(render_retrieval_chunk_with_meta(
+            &hit.chunk,
+            Some(hit.score),
+            Some(search_rank + 1),
+            Some("hybrid_search".to_string()),
+        ));
     }
 
     let mut remaining_tokens = cfg.indexer.rag_max_tokens.max(1);
@@ -8107,11 +8337,19 @@ async fn retrieve_chunks_for_prompt(
     budgeted
 }
 
-fn render_retrieval_chunk(chunk: &Chunk) -> RetrievedChunk {
+fn render_retrieval_chunk_with_meta(
+    chunk: &Chunk,
+    retrieval_score: Option<f32>,
+    retrieval_rank: Option<usize>,
+    retrieval_source: Option<String>,
+) -> RetrievedChunk {
     RetrievedChunk {
         command_name: chunk.command_name.clone(),
         section_name: chunk.section_name.clone(),
         path: chunk.path.clone(),
+        retrieval_rank,
+        retrieval_score,
+        retrieval_source,
         extraction_method: chunk.extraction_method.clone(),
         chunk_index: chunk.chunk_index,
         total_chunks: chunk.total_chunks,
@@ -8162,6 +8400,86 @@ fn retrieved_chunk_source_refs(chunks: &[RetrievedChunk]) -> Vec<source_ledger::
             index_version: Some(current_index_version()),
         })
         .collect()
+}
+
+async fn maybe_write_retrieval_trace(
+    state: &Arc<DaemonState>,
+    task_id: Option<Uuid>,
+    prompt: &str,
+    top_k_override: Option<u32>,
+    chunks: &[RetrievedChunk],
+) {
+    let cfg = state.config_snapshot();
+    if !cfg.debug.retrieval_trace_enabled {
+        return;
+    }
+
+    let (index_revision, index_chunk_count) = {
+        let runtime = state.index_runtime.lock().await;
+        (runtime.revision, runtime.chunks.len())
+    };
+    let trace = RetrievalTrace {
+        trace_type: "prompt_hybrid_retrieval".to_string(),
+        task_id,
+        prompt: prompt.to_string(),
+        created_at: chrono::Utc::now(),
+        index_revision,
+        index_chunk_count,
+        top_k: top_k_override.unwrap_or(cfg.indexer.rag_top_k as u32) as usize,
+        min_score: cfg.indexer.rag_min_similarity,
+        hybrid_enabled: cfg.indexer.hybrid_retrieval_enabled,
+        lexical_enabled: cfg.indexer.lexical_index_enabled,
+        lexical_top_k: cfg.indexer.lexical_top_k,
+        command_aware: cfg.indexer.command_aware_retrieval,
+        chunks: chunks.to_vec(),
+    };
+
+    if let Err(e) = write_retrieval_trace_file(cfg.as_ref(), &trace) {
+        warn!("failed to write retrieval trace: {e:#}");
+    }
+}
+
+fn write_retrieval_trace_file(cfg: &AppConfig, trace: &RetrievalTrace) -> Result<()> {
+    let dir = resolve_state_path(&cfg.debug.retrieval_trace_dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let task_part = trace
+        .task_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| format!("manual-{}", Uuid::now_v7()));
+    let file_name = format!("{}-{task_part}.json", trace.created_at.timestamp_millis());
+    let path = dir.join(file_name);
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(trace)?;
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    prune_retrieval_traces(&dir, cfg.debug.retrieval_trace_max_files);
+    Ok(())
+}
+
+fn prune_retrieval_traces(dir: &Path, max_files: usize) {
+    if max_files == 0 {
+        return;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = read_dir
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(modified, _)| *modified);
+    let remove_count = entries.len().saturating_sub(max_files);
+    for (_, path) in entries.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn build_retriever_for_chunks(
@@ -8481,6 +8799,9 @@ fn render_retrieval_hint_fallback(command: &str) -> Option<RetrievedChunk> {
         command_name: command.to_string(),
         section_name: "heuristic".to_string(),
         path: format!("heuristic://command-hint/{command}"),
+        retrieval_rank: None,
+        retrieval_score: None,
+        retrieval_source: Some("heuristic_fallback".to_string()),
         extraction_method: "heuristic".to_string(),
         chunk_index: 0,
         total_chunks: 1,
@@ -10033,6 +10354,180 @@ fn extract_execute_shell_command_from_partial_tagged_call(
     None
 }
 
+fn extract_execute_shell_command_from_plain_text(text: &str) -> Option<termlm_inference::ToolCall> {
+    if text.trim_end().ends_with('?') {
+        return None;
+    }
+    let candidate = single_fenced_command(text)
+        .or_else(|| single_prompt_prefixed_command(text))
+        .or_else(|| inline_backtick_command(text))
+        .or_else(|| labeled_plain_command(text))?;
+    let cmd = normalize_plain_command_candidate(&candidate)?;
+    Some(termlm_inference::ToolCall {
+        name: "execute_shell_command".to_string(),
+        arguments: serde_json::json!({ "cmd": cmd }),
+    })
+}
+
+fn single_fenced_command(text: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(relative_start) = text[search_from..].find("```") {
+        let start = search_from + relative_start;
+        let after_open = start + 3;
+        let remaining = &text[after_open..];
+        let newline = remaining.find('\n')?;
+        let language = remaining[..newline].trim().to_ascii_lowercase();
+        let command_lang = language.is_empty()
+            || matches!(
+                language.as_str(),
+                "sh" | "bash" | "zsh" | "shell" | "console" | "terminal"
+            );
+        let body_start = after_open + newline + 1;
+        let Some(relative_end) = text[body_start..].find("```") else {
+            return None;
+        };
+        let body_end = body_start + relative_end;
+        if command_lang
+            && let Some(command) = single_non_comment_command_line(&text[body_start..body_end])
+        {
+            return Some(command);
+        }
+        search_from = body_end + 3;
+    }
+    None
+}
+
+fn single_prompt_prefixed_command(text: &str) -> Option<String> {
+    let mut candidate = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("$ ") else {
+            continue;
+        };
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(rest.trim().to_string());
+    }
+    candidate
+}
+
+fn inline_backtick_command(text: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(relative_start) = text[search_from..].find('`') {
+        let start = search_from + relative_start;
+        if text[start..].starts_with("```") {
+            search_from = start + 3;
+            continue;
+        }
+        let after_open = start + 1;
+        let Some(relative_end) = text[after_open..].find('`') else {
+            return None;
+        };
+        let end = after_open + relative_end;
+        let before = text[..start].to_ascii_lowercase();
+        let cue = before.rsplit(['.', '\n']).next().unwrap_or_default().trim();
+        if cue.contains("command")
+            || cue.contains("run")
+            || cue.contains("use")
+            || cue.contains("execute")
+        {
+            return Some(text[after_open..end].trim().to_string());
+        }
+        search_from = end + 1;
+    }
+    None
+}
+
+fn labeled_plain_command(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        for prefix in [
+            "command:",
+            "proposed command:",
+            "run:",
+            "execute:",
+            "use this command:",
+        ] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                let offset = trimmed.len() - rest.len();
+                return Some(trimmed[offset..].trim().trim_matches('`').to_string());
+            }
+        }
+    }
+    None
+}
+
+fn single_non_comment_command_line(block: &str) -> Option<String> {
+    let mut candidate = None;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let command = trimmed.strip_prefix("$ ").unwrap_or(trimmed).trim();
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(command.to_string());
+    }
+    candidate
+}
+
+fn normalize_plain_command_candidate(candidate: &str) -> Option<String> {
+    let mut cmd = candidate.trim().trim_matches('`').trim().to_string();
+    if let Some(stripped) = cmd.strip_prefix("$ ") {
+        cmd = stripped.trim().to_string();
+    }
+    if cmd.is_empty()
+        || cmd.contains('\n')
+        || cmd.contains('\r')
+        || cmd.contains('?')
+        || cmd.starts_with('#')
+        || cmd.starts_with('!')
+    {
+        return None;
+    }
+    let first = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c| matches!(c, '(' | '{' | '['));
+    if !is_plain_command_token(first) {
+        return None;
+    }
+    Some(cmd)
+}
+
+fn is_plain_command_token(token: &str) -> bool {
+    if token.starts_with("./") || token.starts_with("../") || token.starts_with('/') {
+        return token.len() > 1;
+    }
+    if token.is_empty()
+        || matches!(
+            token,
+            "a" | "an"
+                | "and"
+                | "command"
+                | "here"
+                | "it"
+                | "run"
+                | "the"
+                | "this"
+                | "to"
+                | "you"
+                | "your"
+        )
+    {
+        return false;
+    }
+    token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 fn resolve_index_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/termlm/index")
@@ -10384,6 +10879,10 @@ fn init_logging(cfg: &AppConfig) {
 }
 
 fn resolve_log_path(raw: &str) -> PathBuf {
+    resolve_state_path(raw)
+}
+
+fn resolve_state_path(raw: &str) -> PathBuf {
     let mut path = raw.to_string();
     if path.contains("$XDG_STATE_HOME") {
         let xdg_state = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
@@ -10404,30 +10903,43 @@ fn maybe_detach(detach: bool) -> Result<()> {
     if !detach {
         return Ok(());
     }
+    if std::env::var_os("TERMLM_DETACHED").is_some() {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
-        // SAFETY: standard double-fork daemonization pattern.
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().context("resolve current executable for detach")?;
+        let args = std::env::args_os()
+            .skip(1)
+            .filter(|arg| arg != "--detach")
+            .collect::<Vec<_>>();
+
+        let mut command = std::process::Command::new(exe);
+        command
+            .args(args)
+            .env("TERMLM_DETACHED", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+
         unsafe {
-            let pid = libc::fork();
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error()).context("first fork failed");
-            }
-            if pid > 0 {
-                libc::_exit(0);
-            }
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error()).context("setsid failed");
-            }
-            let pid2 = libc::fork();
-            if pid2 < 0 {
-                return Err(std::io::Error::last_os_error()).context("second fork failed");
-            }
-            if pid2 > 0 {
-                libc::_exit(0);
-            }
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
+
+        command.spawn().context("spawn detached termlm-core")?;
+        std::process::exit(0)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 fn resolve_socket_path(config_path: &str) -> PathBuf {
@@ -10717,6 +11229,30 @@ mod tests {
             .expect("extract partial execute_shell_command without cmd closer");
         assert_eq!(parsed.name, "execute_shell_command");
         assert_eq!(parsed.arguments["cmd"], "ls -1 | head -n 5");
+    }
+
+    #[test]
+    fn plain_text_execute_shell_command_is_extractable_from_single_fence() {
+        let raw = "Use:\n```bash\nbrew install jq\n```";
+        let parsed = extract_execute_shell_command_from_plain_text(raw)
+            .expect("extract fenced execute_shell_command");
+        assert_eq!(parsed.name, "execute_shell_command");
+        assert_eq!(parsed.arguments["cmd"], "brew install jq");
+    }
+
+    #[test]
+    fn plain_text_execute_shell_command_is_extractable_from_inline_command_cue() {
+        let raw = "The command is `find . -name README.md`.";
+        let parsed = extract_execute_shell_command_from_plain_text(raw)
+            .expect("extract inline execute_shell_command");
+        assert_eq!(parsed.name, "execute_shell_command");
+        assert_eq!(parsed.arguments["cmd"], "find . -name README.md");
+    }
+
+    #[test]
+    fn plain_text_execute_shell_command_rejects_questions_and_multiple_lines() {
+        assert!(extract_execute_shell_command_from_plain_text("Should I run `pwd`?").is_none());
+        assert!(extract_execute_shell_command_from_plain_text("```bash\npwd\nls\n```").is_none());
     }
 
     #[test]
@@ -11212,7 +11748,15 @@ mod tests {
     }
 
     #[test]
-    fn indexing_progress_banner_suppresses_completed_refresh_when_index_loaded() {
+    fn indexing_progress_banner_suppresses_background_refresh_when_index_loaded() {
+        let scan_progress = IndexProgress {
+            scanned: 0,
+            total: 100,
+            percent: 0.0,
+            phase: "scan".to_string(),
+        };
+        assert!(indexing_progress_banner(&scan_progress, true).is_none());
+
         let progress = IndexProgress {
             scanned: 100,
             total: 100,
@@ -11715,6 +12259,9 @@ mod tests {
             command_name: "find".to_string(),
             section_name: "OPTIONS".to_string(),
             path: "/usr/share/man/man1/find.1".to_string(),
+            retrieval_rank: Some(1),
+            retrieval_score: Some(0.91),
+            retrieval_source: Some("hybrid_search".to_string()),
             extraction_method: "man".to_string(),
             chunk_index: 0,
             total_chunks: 1,

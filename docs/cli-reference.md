@@ -82,7 +82,7 @@ Task/protocol helpers:
 - `termlm run-task --prompt <text> [--mode ?|/p] [--cwd <path>] [--shell-id <uuid>]`
 - `termlm respond-task --task-id <uuid> --decision <approved|rejected|edited|approve-all|abort|clarification> [--edited-command <cmd>] [--text <message>]`
 - `termlm ack-task --task-id <uuid> --command <cmd> --cwd-before <path> --cwd-after <path> --exit-status <code> [--command-seq <n>] ...`
-- `termlm retrieve --prompt <text> [--top-k <n>]`
+- `termlm retrieve --prompt <text> [--top-k <n>] [--json]`
 
 Bridge/adapter internals:
 

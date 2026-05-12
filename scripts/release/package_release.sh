@@ -120,6 +120,7 @@ fi
 chmod 0755 "$BUNDLE_ROOT/bin/termlm" "$BUNDLE_ROOT/bin/termlm-core" "$BUNDLE_ROOT/bin/termlm-client"
 
 cp -R "$ROOT_DIR/plugins/zsh" "$BUNDLE_ROOT/plugins/zsh"
+find "$BUNDLE_ROOT/plugins/zsh" -name .DS_Store -type f -delete
 cp "$ROOT_DIR/scripts/release/install_bundle.sh" "$BUNDLE_ROOT/install.sh"
 chmod 0755 "$BUNDLE_ROOT/install.sh"
 cp "$ROOT_DIR/README.md" "$BUNDLE_ROOT/README.md"

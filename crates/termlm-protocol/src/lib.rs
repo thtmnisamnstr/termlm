@@ -230,6 +230,12 @@ pub struct RetrievedChunk {
     pub command_name: String,
     pub section_name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_source: Option<String>,
     #[serde(default)]
     pub extraction_method: String,
     pub chunk_index: usize,

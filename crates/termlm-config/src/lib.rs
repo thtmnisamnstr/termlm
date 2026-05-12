@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub context_budget: ContextBudgetConfig,
     pub cache: CacheConfig,
     pub source_ledger: SourceLedgerConfig,
+    pub debug: DebugConfig,
     pub prompt: PromptConfig,
     pub session: SessionConfig,
 }
@@ -226,6 +227,7 @@ pub struct CaptureConfig {
 pub struct TerminalContextConfig {
     pub enabled: bool,
     pub capture_all_interactive_commands: bool,
+    pub capture_command_output: bool,
     pub max_entries: usize,
     pub max_output_bytes_per_command: usize,
     pub recent_context_max_tokens: usize,
@@ -333,6 +335,14 @@ pub struct SourceLedgerConfig {
     pub expose_on_status: bool,
     pub include_in_debug_logs: bool,
     pub max_refs_on_status: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    pub retrieval_trace_enabled: bool,
+    pub retrieval_trace_dir: String,
+    pub retrieval_trace_max_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -587,6 +597,7 @@ impl Default for TerminalContextConfig {
         Self {
             enabled: true,
             capture_all_interactive_commands: true,
+            capture_command_output: false,
             max_entries: 50,
             max_output_bytes_per_command: 32_768,
             recent_context_max_tokens: 6_000,
@@ -720,6 +731,16 @@ impl Default for SourceLedgerConfig {
             expose_on_status: true,
             include_in_debug_logs: true,
             max_refs_on_status: 32,
+        }
+    }
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            retrieval_trace_enabled: false,
+            retrieval_trace_dir: "~/.local/state/termlm/retrieval-traces".to_string(),
+            retrieval_trace_max_files: 25,
         }
     }
 }
@@ -1047,6 +1068,14 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
         .into());
     }
 
+    if cfg.debug.retrieval_trace_enabled && cfg.debug.retrieval_trace_dir.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "debug.retrieval_trace_dir",
+            reason: "must be set when retrieval tracing is enabled".to_string(),
+        }
+        .into());
+    }
+
     Ok(())
 }
 
@@ -1201,6 +1230,7 @@ query_embedding_timeout_secs = 4
 [terminal_context]
 recent_context_max_tokens = 6000
 older_context_max_tokens = 4000
+capture_command_output = false
 
 [tool_routing]
 expose_terminal_context_only_when_needed = true
@@ -1215,6 +1245,10 @@ web_result_tokens = 3000
 
 [source_ledger]
 include_in_debug_logs = true
+
+[debug]
+retrieval_trace_enabled = false
+retrieval_trace_max_files = 25
 
 [prompt]
 use_color = true

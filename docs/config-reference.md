@@ -27,6 +27,7 @@ For behavior guidance, see [`configuration.md`](configuration.md).
 - `[context_budget]`
 - `[cache]`
 - `[source_ledger]`
+- `[debug]`
 - `[prompt]`
 - `[session]`
 
@@ -192,6 +193,7 @@ For behavior guidance, see [`configuration.md`](configuration.md).
 
 - `enabled`
 - `capture_all_interactive_commands`
+- `capture_command_output`
 - `max_entries`
 - `max_output_bytes_per_command`
 - `recent_context_max_tokens`
@@ -282,6 +284,14 @@ For behavior guidance, see [`configuration.md`](configuration.md).
 - `expose_on_status`
 - `include_in_debug_logs`
 - `max_refs_on_status`
+
+### `[debug]`
+
+- `retrieval_trace_enabled` - opt-in JSON traces for hybrid retrieval during real prompt runs. Default: `false`.
+- `retrieval_trace_dir` - where prompt retrieval traces are written. Default: `~/.local/state/termlm/retrieval-traces`.
+- `retrieval_trace_max_files` - maximum trace files to keep before pruning older traces. Default: `25`.
+
+Trace files are a builder/debugging aid. They include raw prompt text and retrieved command-doc snippets, so enable them only while inspecting retrieval behavior.
 
 ### `[prompt]`
 

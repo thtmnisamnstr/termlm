@@ -76,12 +76,70 @@ Keep the web runtime configured but hide `web_search` and `web_read` from the mo
 expose_tools = false
 ```
 
+### Inspect retrieval as a builder
+
+The normal UI stays quiet, but there are two manual ways to inspect hybrid retrieval.
+
+Run a one-off retrieval check:
+
+```bash
+termlm retrieve --prompt "find large files in this directory" --top-k 8
+```
+
+Use JSON when you want exact rank, score, source, path, and text fields:
+
+```bash
+termlm retrieve --prompt "find large files in this directory" --top-k 8 --json
+```
+
+To capture what real prompt runs retrieved, opt in to trace files:
+
+```toml
+[debug]
+retrieval_trace_enabled = true
+retrieval_trace_dir = "~/.local/state/termlm/retrieval-traces"
+retrieval_trace_max_files = 25
+```
+
+Then reload config:
+
+```bash
+termlm reload-config
+```
+
+New prompt runs will write JSON files to:
+
+```text
+~/.local/state/termlm/retrieval-traces/
+```
+
+List the newest traces:
+
+```bash
+ls -lt ~/.local/state/termlm/retrieval-traces | head
+```
+
+Open the newest trace with `jq`:
+
+```bash
+jq . "$(ls -t ~/.local/state/termlm/retrieval-traces/*.json | head -1)"
+```
+
+Each trace includes the prompt, top-K setting, retrieval trace type, and the retrieved command-doc chunks with ranks, scores, command names, section names, source paths, and snippets. Trace files include raw prompt text and retrieved doc snippets, so keep this off unless you are actively debugging retrieval.
+
 ### Reduce context capture footprint
 
 ```toml
 [terminal_context]
 capture_all_interactive_commands = true
 max_entries = 30
+```
+
+After termlm has been used in a shell, it observes command names, working directories, exit status, and timing by default so later prompts can refer to recent terminal activity. Commands run before the first termlm interaction stay outside termlm's runtime context. Capturing stdout/stderr for every manually typed command is off by default because it is more invasive and can interfere with some terminal setups. To opt in:
+
+```toml
+[terminal_context]
+capture_command_output = true
 max_output_bytes_per_command = 16384
 ```
 

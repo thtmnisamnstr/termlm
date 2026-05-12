@@ -10,5 +10,7 @@ termlm-approval-prompt() {
 
   print -r -- "┌─ proposed command ─────────────────────────────────────────────"
   print -r -- "│ $shown"
-  print -r -- "└─ [y]es  [n]o(default)  [e]dit  [a]ll-in-this-task ─────────────"
+  print -r -- "├─ keys ─────────────────────────────────────────────────────────"
+  print -r -- "│ y accept   n/Enter reject   e edit   a accept all   Esc cancel"
+  print -r -- "└────────────────────────────────────────────────────────────────"
 }

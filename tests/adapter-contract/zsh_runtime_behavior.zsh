@@ -78,6 +78,12 @@ reset_state() {
   _TERMLM_PENDING_STDOUT_FILE=""
   _TERMLM_PENDING_STDERR_FILE=""
   _TERMLM_PENDING_SEQ=0
+  _TERMLM_CAPTURE_ACTIVE=0
+  _TERMLM_CAPTURE_SAVE_STDOUT_FD=-1
+  _TERMLM_CAPTURE_SAVE_STDERR_FD=-1
+  _TERMLM_OBS_CAPTURE_ACTIVE=0
+  _TERMLM_OBS_SAVE_STDOUT_FD=-1
+  _TERMLM_OBS_SAVE_STDERR_FD=-1
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
 }
@@ -107,12 +113,6 @@ termlm-send-decision() {
 
 termlm-capture-enabled() {
   return 1
-}
-
-termlm-wrap-command-for-capture() {
-  local cmd="$1"
-  local seq="$2"
-  print -r -- "wrapped:${cmd}:${seq}"
 }
 
 reset_state
@@ -280,6 +280,7 @@ assert_eq "$_ABANDON_COUNT" "1" "typed command while waiting should abandon acti
 assert_eq "$_ABANDON_LAST_ARG" "0" "non-session implicit abort should not preserve session"
 assert_eq "$BUFFER" "ls -la" "typed command should remain in BUFFER after implicit abort"
 assert_eq "$CURSOR" "${#BUFFER}" "cursor should move to end after implicit abort preservation"
+assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "typed command should execute immediately after implicit abort"
 
 reset_state
 _TERMLM_MODE="session"
@@ -291,6 +292,7 @@ _ABANDON_LAST_ARG=""
 termlm-accept-line
 assert_eq "$_ABANDON_COUNT" "1" "session implicit command should abandon active task"
 assert_eq "$_ABANDON_LAST_ARG" "1" "session implicit abort should preserve session"
+assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "session implicit command should execute immediately after implicit abort"
 
 reset_state
 _TERMLM_MODE="prompt"
@@ -300,7 +302,7 @@ assert_eq "$_TERMLM_APPROVAL_TASK_ID" "task-approved" "proposed command should e
 termlm-handle-approval-key "y"
 assert_eq "$_TERMLM_PENDING_TASK_ID" "task-approved" "approved command should set pending task id"
 assert_eq "$_TERMLM_PENDING_CMD" "echo hi" "approved command should set pending command"
-assert_eq "$BUFFER" "wrapped:echo hi:1" "approved command should execute wrapped command via BUFFER"
+assert_eq "$BUFFER" "echo hi" "approved command should execute the visible command via BUFFER"
 assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "approved command should execute with zle .accept-line"
 
 reset_state
@@ -309,8 +311,9 @@ _TEST_APPROVAL_DECISION="rejected"
 termlm-handle-proposed-event "task-rejected" "echo hi" "true"
 assert_eq "$_TERMLM_APPROVAL_TASK_ID" "task-rejected" "rejected command should start in approval state"
 termlm-handle-approval-key "n"
-assert_eq "$_TERMLM_WAITING_MODEL" "1" "rejected command should continue waiting for model"
-assert_eq "$_TERMLM_MODE" "prompt" "rejected command should remain in prompt mode"
+assert_eq "$_TERMLM_WAITING_MODEL" "0" "rejected command should stop waiting for model"
+assert_eq "$_TERMLM_APPROVAL_TASK_ID" "" "rejected command should clear approval state"
+assert_eq "$_TERMLM_MODE" "normal" "rejected command should leave prompt mode"
 
 reset_state
 _TERMLM_MODE="prompt"
