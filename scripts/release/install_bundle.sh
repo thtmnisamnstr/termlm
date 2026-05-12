@@ -472,6 +472,11 @@ lines = [
     f"allow_plain_http_remote = {'true' if ollama_allow_plain_http_remote else 'false'}",
     "healthcheck_on_start = false",
     "",
+    "[web]",
+    "enabled = true",
+    "expose_tools = true",
+    'provider = "duckduckgo_html"',
+    "",
     "[indexer]",
     "enabled = true",
     'embedding_provider = "local"',
@@ -542,6 +547,12 @@ wait_for_runtime_ready() {
     if [[ -f "$daemon_log_path" ]]; then
       echo "recent daemon log tail:" >&2
       tail -n 80 "$daemon_log_path" >&2 || true
+    fi
+    if [[ -n "${core_pid:-}" ]] && declare -F stop_core_instance >/dev/null 2>&1; then
+      stop_core_instance "$core_pid" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${bootstrap_config:-}" ]]; then
+      rm -f "$bootstrap_config" >/dev/null 2>&1 || true
     fi
     exit 1
   }
@@ -669,17 +680,13 @@ PY
   fi
 
   local index_manifest_path="$HOME/.local/share/termlm/index/manifest.json"
-  local reindex_mode="delta"
   local reindex_requested=0
-  if [[ ! -f "$index_manifest_path" ]]; then
-    reindex_mode="full"
-  fi
 
   request_initial_reindex() {
     local attempts="${1:-10}"
     local i=0
     while (( i < attempts )); do
-      if trigger_reindex_with_timeout "$reindex_mode" >/dev/null 2>&1; then
+      if trigger_reindex_with_timeout "delta" >/dev/null 2>&1; then
         reindex_requested=1
         return 0
       fi

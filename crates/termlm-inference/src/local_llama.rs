@@ -463,7 +463,9 @@ impl LocalLlamaProvider {
         }
 
         let model_ctx = embedding_runtime.model.n_ctx_train();
-        let requested_ctx = embedding_runtime.context_tokens.max(128);
+        // BGE command-doc chunks are capped near 512 tokens. Reusing the chat
+        // context size here makes every embedding allocate an oversized batch.
+        let requested_ctx = embedding_runtime.context_tokens.clamp(128, 512);
         let n_ctx = if model_ctx > 0 {
             requested_ctx.min(model_ctx).max(128)
         } else {

@@ -75,9 +75,9 @@ For behavior guidance, see [`configuration.md`](configuration.md).
 
 ### `[web]`
 
-- `enabled`
-- `expose_tools`
-- `provider`
+- `enabled` (default: `true`; set `false` to disable daemon-owned web requests)
+- `expose_tools` (default: `true`; set `false` to keep config but hide `web_search`/`web_read`)
+- `provider` (default: `duckduckgo_html`, no API key)
 - `search_endpoint`
 - `search_api_key_env`
 - `user_agent`

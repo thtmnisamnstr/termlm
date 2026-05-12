@@ -226,6 +226,14 @@ termlm-stop-helper() {
   if [[ -n "$pid" ]]; then
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" >/dev/null 2>&1 || true
+      local waited=0
+      while kill -0 "$pid" 2>/dev/null && (( waited < 10 )); do
+        sleep 0.05
+        (( waited += 1 ))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
       wait "$pid" >/dev/null 2>&1 || true
     fi
   fi
@@ -510,13 +518,34 @@ termlm-report-daemon-died() {
   fi
 }
 
+termlm-reset-after-connection-lost() {
+  _TERMLM_WAITING_MODEL=0
+  termlm-mark-task-closed
+  if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+    termlm-exit-prompt-mode
+  else
+    zle reset-prompt
+  fi
+}
+
 termlm-mark-task-closed() {
+  local closed_task_id="${_TERMLM_TASK_ID:-${_TERMLM_APPROVAL_TASK_ID:-${_TERMLM_CLARIFICATION_TASK_ID:-}}}"
+  if [[ -n "$closed_task_id" ]]; then
+    _TERMLM_CLOSED_TASK_ID="$closed_task_id"
+  fi
   _TERMLM_WAITING_MODEL=0
   _TERMLM_TASK_ID=""
   _TERMLM_CLARIFICATION_TASK_ID=""
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  _TERMLM_OUTPUT_STARTED=0
+  _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+}
+
+termlm-is-closed-task-event() {
+  local task_id="$1"
+  [[ -n "$task_id" && "$task_id" == "${_TERMLM_CLOSED_TASK_ID:-}" && "${_TERMLM_TASK_ID:-}" != "$task_id" ]]
 }
 
 termlm-abandon-active-task() {
@@ -573,7 +602,36 @@ termlm-start-task() {
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  _TERMLM_CLOSED_TASK_ID=""
+  _TERMLM_OUTPUT_STARTED=0
+  _TERMLM_OUTPUT_NEEDS_NEWLINE=0
   zle reset-prompt
+}
+
+termlm-begin-async-output() {
+  zle -I 2>/dev/null || true
+  if [[ "${_TERMLM_OUTPUT_STARTED:-0}" -eq 0 ]]; then
+    print -r -- ""
+    _TERMLM_OUTPUT_STARTED=1
+    _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  fi
+}
+
+termlm-note-output-chunk() {
+  local chunk="$1"
+  if [[ "$chunk" == *$'\n' ]]; then
+    _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  elif [[ -n "$chunk" ]]; then
+    _TERMLM_OUTPUT_NEEDS_NEWLINE=1
+  fi
+}
+
+termlm-finish-async-output-line() {
+  termlm-begin-async-output
+  if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
+    print -r -- ""
+    _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  fi
 }
 
 termlm-handle-run-task-stream() {
@@ -582,12 +640,22 @@ termlm-handle-run-task-stream() {
 
   if ! IFS= read -r line <&$fd; then
     local was_waiting="${_TERMLM_WAITING_MODEL:-0}"
+    local was_session="${_TERMLM_SESSION_MODE:-0}"
     termlm-stop-helper
     if [[ "$was_waiting" == "1" ]]; then
       _TERMLM_WAITING_MODEL=0
       if [[ -n "${_TERMLM_TASK_ID:-}" ]]; then
+        if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
+          print -r -- ""
+          _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+        fi
         termlm-report-daemon-died
-        termlm-abandon-active-task $(( _TERMLM_SESSION_MODE == 1 ? 1 : 0 ))
+        termlm-mark-task-closed
+        if [[ "$was_session" == "1" ]]; then
+          zle reset-prompt
+        else
+          termlm-exit-prompt-mode
+        fi
       fi
     fi
     return
@@ -613,10 +681,15 @@ termlm-handle-run-task-line() {
       task_id="$(termlm-json-field "$line" "task_id")"
       chunk_b64="$(termlm-json-field "$line" "chunk_b64")"
       chunk="$(termlm-base64-decode "$chunk_b64")"
+      if termlm-is-closed-task-event "$task_id"; then
+        return
+      fi
       if [[ -z "$_TERMLM_TASK_ID" ]]; then
         _TERMLM_TASK_ID="$task_id"
       fi
+      termlm-begin-async-output
       print -rn -u 2 -- "$chunk"
+      termlm-note-output-chunk "$chunk"
       ;;
     needs_clarification)
       _TERMLM_WAITING_MODEL=0
@@ -624,8 +697,12 @@ termlm-handle-run-task-line() {
       task_id="$(termlm-json-field "$line" "task_id")"
       question_b64="$(termlm-json-field "$line" "question_b64")"
       question="$(termlm-base64-decode "$question_b64")"
+      if termlm-is-closed-task-event "$task_id"; then
+        return
+      fi
       _TERMLM_TASK_ID="$task_id"
       _TERMLM_CLARIFICATION_TASK_ID="$task_id"
+      termlm-finish-async-output-line
       print -r -- "❓ ${question}"
       if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
         termlm-enter-prompt-mode
@@ -640,11 +717,23 @@ termlm-handle-run-task-line() {
       cmd_b64="$(termlm-json-field "$line" "cmd_b64")"
       cmd="$(termlm-base64-decode "$cmd_b64")"
       requires="$(termlm-json-bool-field "$line" "requires_approval")"
+      if termlm-is-closed-task-event "$task_id"; then
+        return
+      fi
+      termlm-finish-async-output-line
       termlm-handle-proposed-event "$task_id" "$cmd" "$requires"
       ;;
     index_progress|provider_status|status_report|pong|index_update|retrieval_chunk|daemon_event)
       ;;
     task_complete)
+      local task_id
+      task_id="$(termlm-json-field "$line" "task_id")"
+      if termlm-is-closed-task-event "$task_id"; then
+        return
+      fi
+      if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
+        print -r -- ""
+      fi
       termlm-mark-task-closed
       if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
         termlm-exit-prompt-mode
@@ -658,17 +747,32 @@ termlm-handle-run-task-line() {
       err_kind="$(termlm-json-field "$line" "kind")"
       msg_b64="$(termlm-json-field "$line" "message_b64")"
       msg="$(termlm-base64-decode "$msg_b64")"
+      if termlm-is-closed-task-event "$task_id"; then
+        return
+      fi
       if [[ -z "$_TERMLM_TASK_ID" && -n "$task_id" ]]; then
         _TERMLM_TASK_ID="$task_id"
       fi
+      termlm-finish-async-output-line
       print -r -- "termlm: ${msg}"
-      if [[ "$err_kind" == "bad_protocol" || "$err_kind" == "inference_provider_unavailable" || "$err_kind" == "BadProtocol" || "$err_kind" == "InferenceProviderUnavailable" ]]; then
+      if [[ "$err_kind" == "bad_protocol" || "$err_kind" == "BadProtocol" ]]; then
         termlm-mark-task-closed
+        if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+          termlm-exit-prompt-mode
+        else
+          zle reset-prompt
+        fi
       fi
       ;;
     timeout)
+      termlm-finish-async-output-line
       termlm-mark-task-closed
       print -r -- "termlm: request timed out"
+      if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+        termlm-exit-prompt-mode
+      else
+        zle reset-prompt
+      fi
       ;;
     *)
       ;;
@@ -738,7 +842,9 @@ termlm-run-approved-command() {
 
 termlm-reject-pending-approval() {
   local task_id="${_TERMLM_APPROVAL_TASK_ID:-}"
-  [[ -n "$task_id" ]] && termlm-send-decision "$task_id" --decision rejected >/dev/null 2>&1 || true
+  if [[ -n "$task_id" ]] && ! termlm-send-decision "$task_id" --decision rejected >/dev/null 2>&1; then
+    return 0
+  fi
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
@@ -876,5 +982,6 @@ termlm-send-decision() {
   fi
 
   zle -M "termlm: connection lost" 2>/dev/null || print -r -- "termlm: connection lost"
+  termlm-reset-after-connection-lost
   return 1
 }

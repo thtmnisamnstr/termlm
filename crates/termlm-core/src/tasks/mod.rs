@@ -5,7 +5,18 @@ use std::collections::BTreeMap;
 const DEFAULT_WEB_FRESHNESS_TERMS: &[&str] = &[
     "latest", "current", "today", "recent", "release", "version", "new", "now",
 ];
-const EXPLICIT_WEB_HINT_TERMS: &[&str] = &["lookup", "search web", "online", "upstream"];
+const EXPLICIT_WEB_HINT_TERMS: &[&str] = &[
+    "lookup",
+    "look up",
+    "search web",
+    "search the web",
+    "web search",
+    "web lookup",
+    "browse",
+    "online",
+    "internet",
+    "upstream",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskClassification {
@@ -77,7 +88,9 @@ pub fn classify_prompt_with_freshness_terms(
             .map(|s| s.trim().to_ascii_lowercase())
             .any(|k| !k.is_empty() && p.contains(&k))
     };
-    let explicit_web_hit = EXPLICIT_WEB_HINT_TERMS.iter().any(|k| p.contains(k));
+    let explicit_web_hit = EXPLICIT_WEB_HINT_TERMS.iter().any(|k| p.contains(k))
+        || p.contains("https://")
+        || p.contains("http://");
     if freshness_hit || explicit_web_hit {
         *scores.get_mut("web").expect("web score") += 1.8;
     }
@@ -352,9 +365,11 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
         });
     }
 
-    if p.contains("list")
-        && p.contains("file")
-        && (p.contains("modified") || p.contains("modification") || p.contains("mtime"))
+    if p.contains("file")
+        && ((p.contains("list")
+            && (p.contains("modified") || p.contains("modification") || p.contains("mtime")))
+            || ((p.contains("show") || p.contains("list"))
+                && (p.contains("newest first") || p.contains("sorted newest"))))
     {
         return Some(DraftCommand {
             cmd: "ls -lt".to_string(),
@@ -362,6 +377,112 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
             intent: "List files sorted by modification time descending.".to_string(),
             expected_effect: "Read-only directory listing.".to_string(),
             commands_used: vec!["ls".to_string()],
+        });
+    }
+
+    if (p.contains("list") || p.contains("show"))
+        && (p.contains("files") || p.contains("directory contents"))
+        && (p.contains("one per line") || p.contains("one-per-line"))
+    {
+        return Some(DraftCommand {
+            cmd: "ls -1".to_string(),
+            rationale: "List directory entries with one name per output line.".to_string(),
+            intent: "Show files in a compact one-per-line listing.".to_string(),
+            expected_effect: "Read-only directory listing.".to_string(),
+            commands_used: vec!["ls".to_string()],
+        });
+    }
+
+    if p.contains("hidden")
+        && (p.contains("file") || p.contains("directory") || p.contains("folder"))
+    {
+        return Some(DraftCommand {
+            cmd: "ls -la".to_string(),
+            rationale: "Use an all-files long listing so dotfiles are visible.".to_string(),
+            intent: "Show hidden files in the current directory.".to_string(),
+            expected_effect: "Read-only directory listing including dotfiles.".to_string(),
+            commands_used: vec!["ls".to_string()],
+        });
+    }
+
+    if (p.contains("find") || p.contains("show") || p.contains("list"))
+        && p.contains("file")
+        && (p.contains(" named ") || p.contains(" called "))
+        && let Some(name) = path_after_any_marker(prompt, &p, &[" named ", " called "])
+    {
+        return Some(DraftCommand {
+            cmd: format!("find . -name {}", shell_quote(&name)),
+            rationale: "Find files by exact name under the current directory.".to_string(),
+            intent: "Locate matching filenames recursively.".to_string(),
+            expected_effect: "Read-only file discovery.".to_string(),
+            commands_used: vec!["find".to_string()],
+        });
+    }
+
+    if p.contains("disk usage")
+        && (p.contains("this directory")
+            || p.contains("current directory")
+            || p.contains("human readable")
+            || p.contains("human-readable"))
+    {
+        return Some(DraftCommand {
+            cmd: "du -sh .".to_string(),
+            rationale: "Summarize the current directory size in human-readable units.".to_string(),
+            intent: "Inspect total disk usage for the current directory.".to_string(),
+            expected_effect: "Read-only storage summary.".to_string(),
+            commands_used: vec!["du".to_string()],
+        });
+    }
+
+    if p.contains("last")
+        && p.contains("lines")
+        && let Some(file) = path_after_any_marker(prompt, &p, &[" of ", " from "])
+    {
+        let n = number_after_marker(&p, "last ")
+            .unwrap_or(20)
+            .clamp(1, 10_000);
+        return Some(DraftCommand {
+            cmd: format!("tail -n {n} {}", shell_quote(&file)),
+            rationale: "Use tail to print the requested trailing lines from the file.".to_string(),
+            intent: "Inspect the end of a file.".to_string(),
+            expected_effect: "Read-only file output.".to_string(),
+            commands_used: vec!["tail".to_string()],
+        });
+    }
+
+    if (p.contains("count lines") || p.contains("line count") || p.contains("number of lines"))
+        && let Some(file) = path_after_any_marker(prompt, &p, &[" in ", " of "])
+    {
+        return Some(DraftCommand {
+            cmd: format!("wc -l {}", shell_quote(&file)),
+            rationale: "Use wc to count file lines.".to_string(),
+            intent: "Count lines in a file.".to_string(),
+            expected_effect: "Read-only line count.".to_string(),
+            commands_used: vec!["wc".to_string()],
+        });
+    }
+
+    if (p.contains("current date") || p.contains("today")) && p.contains("iso") {
+        return Some(DraftCommand {
+            cmd: "date +%F".to_string(),
+            rationale: "Print the date in portable ISO-8601 calendar format.".to_string(),
+            intent: "Show today's date as YYYY-MM-DD.".to_string(),
+            expected_effect: "Read-only date output.".to_string(),
+            commands_used: vec!["date".to_string()],
+        });
+    }
+
+    if (p.contains("create") || p.contains("make"))
+        && (p.contains("directory") || p.contains("folder"))
+        && let Some(name) = path_after_any_marker(prompt, &p, &[" named ", " called "])
+    {
+        return Some(DraftCommand {
+            cmd: format!("mkdir -p {}", shell_quote(&name)),
+            rationale: "Use mkdir -p so the request succeeds when the directory already exists."
+                .to_string(),
+            intent: "Ensure the requested directory exists.".to_string(),
+            expected_effect: "Creates a directory if needed.".to_string(),
+            commands_used: vec!["mkdir".to_string()],
         });
     }
 
@@ -393,7 +514,14 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
         });
     }
 
-    if p.contains("current directory") || p.contains("where am i") || p.trim() == "pwd" {
+    if p.contains("current directory")
+        || p.contains("where am i")
+        || p.contains("which directory")
+        || p.contains("what directory")
+        || p.contains("which folder")
+        || p.contains("what folder")
+        || p.trim() == "pwd"
+    {
         return Some(DraftCommand {
             cmd: "pwd".to_string(),
             rationale: "Print current working directory.".to_string(),
@@ -669,8 +797,15 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     }
 
     if p.contains("tar.gz") && (p.contains("archive") || p.contains("compress")) {
+        let output = path_after_any_marker(prompt, &p, &[" at ", " to "])
+            .unwrap_or_else(|| "archive.tar.gz".to_string());
+        let source = if p.contains("docs directory") || p.contains("docs folder") {
+            "docs".to_string()
+        } else {
+            ".".to_string()
+        };
         return Some(DraftCommand {
-            cmd: "tar -czf archive.tar.gz .".to_string(),
+            cmd: format!("tar -czf {} {}", shell_quote(&output), shell_quote(&source)),
             rationale: "Create gzipped tar archive.".to_string(),
             intent: "Compress directory into tar.gz.".to_string(),
             expected_effect: "Creates archive file.".to_string(),
@@ -694,6 +829,18 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
             rationale: "Find and delete empty directories.".to_string(),
             intent: "Clean empty folder clutter.".to_string(),
             expected_effect: "Removes empty directories.".to_string(),
+            commands_used: vec!["find".to_string()],
+        });
+    }
+
+    if p.contains("empty director")
+        && (p.contains("find") || p.contains("show") || p.contains("list"))
+    {
+        return Some(DraftCommand {
+            cmd: "find . -type d -empty".to_string(),
+            rationale: "Find empty directories recursively without deleting them.".to_string(),
+            intent: "Identify empty directories.".to_string(),
+            expected_effect: "Read-only directory discovery.".to_string(),
             commands_used: vec!["find".to_string()],
         });
     }
@@ -1285,6 +1432,43 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     None
 }
 
+pub fn high_confidence_shortcut_for_prompt(prompt: &str) -> Option<DraftCommand> {
+    let p = prompt.to_ascii_lowercase();
+    let pwd_request = p.contains("current directory")
+        || p.contains("where am i")
+        || p.contains("which directory")
+        || p.contains("what directory")
+        || p.contains("which folder")
+        || p.contains("what folder")
+        || p.trim() == "pwd";
+    let archive_dir_request = p.contains("folder named archive")
+        || p.contains("create a folder named archive")
+        || p.contains("directory called archive")
+        || p.contains("create a directory called archive");
+    let common_filesystem_request = (p.contains("list") && p.contains("files"))
+        || p.contains("hidden files")
+        || p.contains("disk usage")
+        || (p.contains("find") && p.contains("files") && p.contains("named"))
+        || (p.contains("last") && p.contains("lines"))
+        || p.contains("count lines")
+        || p.contains("count files")
+        || p.contains("search recursively")
+        || (p.contains("empty director") && p.contains("find"))
+        || (p.contains("file") && (p.contains("newest first") || p.contains("sorted newest")))
+        || (p.contains("git") && p.contains("status"))
+        || (p.contains("tar.gz") && p.contains("archive"))
+        || ((p.contains("current date") || p.contains("today")) && p.contains("iso"))
+        || ((p.contains("create") || p.contains("make"))
+            && (p.contains("directory") || p.contains("folder"))
+            && (p.contains(" named ") || p.contains(" called ")));
+
+    if pwd_request || archive_dir_request || common_filesystem_request {
+        return draft_command_for_prompt(prompt);
+    }
+
+    None
+}
+
 pub fn validation_incomplete_fallback(prompt: &str) -> DraftCommand {
     let p = prompt.to_ascii_lowercase();
     if p.contains("git") || p.contains("branch") || p.contains("commit") {
@@ -1342,6 +1526,53 @@ fn first_word(cmd: &str) -> Option<String> {
     cmd.split_whitespace().next().map(ToString::to_string)
 }
 
+fn number_after_marker(prompt_lower: &str, marker: &str) -> Option<u32> {
+    let rest = prompt_lower.split(marker).nth(1)?;
+    let token = rest.split_whitespace().next()?;
+    token.parse::<u32>().ok()
+}
+
+fn path_after_any_marker(prompt: &str, prompt_lower: &str, markers: &[&str]) -> Option<String> {
+    for marker in markers {
+        if let Some(idx) = prompt_lower.find(marker) {
+            let start = idx.saturating_add(marker.len());
+            if let Some(token) = prompt.get(start..)?.split_whitespace().next()
+                && let Some(path) = sanitize_path_token(token)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_path_token(token: &str) -> Option<String> {
+    let cleaned = token
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '?'
+                )
+        })
+        .to_string();
+    if cleaned.is_empty() || cleaned.contains('\0') || cleaned.contains('\n') {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn sanitize_command_token(token: &str) -> Option<String> {
     let cleaned = token
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.')
@@ -1397,6 +1628,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_prompt_with_explicit_web_language_hits_web() {
+        for prompt in [
+            "search the web for the latest zsh release notes",
+            "look up the upstream docs for ripgrep",
+            "browse online docs for the current cargo behavior",
+            "read https://example.com/project/changelog",
+        ] {
+            let result = classify_prompt(prompt);
+            assert!(
+                matches!(
+                    result.classification,
+                    TaskClassification::WebCurrentInfoQuestion
+                ),
+                "prompt should classify as web: {prompt}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_prompt_without_custom_freshness_terms_stays_non_web() {
         let result = classify_prompt("what are the stable-channel notes about breaking changes?");
         assert!(!matches!(
@@ -1422,5 +1672,63 @@ mod tests {
     fn validation_incomplete_fallback_defaults_to_pwd() {
         let fallback = validation_incomplete_fallback("do something unclear");
         assert_eq!(fallback.cmd, "pwd");
+    }
+
+    #[test]
+    fn draft_command_recognizes_directory_wording() {
+        let draft = draft_command_for_prompt("which directory am I in?").expect("draft");
+        assert_eq!(draft.cmd, "pwd");
+    }
+
+    #[test]
+    fn draft_command_handles_common_smoke_prompts() {
+        let cases = [
+            ("list the files in this directory one per line", "ls -1"),
+            (
+                "find files named README.md under this directory",
+                "find . -name README.md",
+            ),
+            (
+                "show disk usage for this directory in human readable form",
+                "du -sh .",
+            ),
+            (
+                "show the last 20 lines of README.md",
+                "tail -n 20 README.md",
+            ),
+            ("count lines in README.md", "wc -l README.md"),
+            ("print the current date in ISO format", "date +%F"),
+            ("show hidden files in the current directory", "ls -la"),
+            (
+                "create a directory named smoke-output if it does not exist",
+                "mkdir -p smoke-output",
+            ),
+            ("show today as an ISO date", "date +%F"),
+            ("show files sorted newest first", "ls -lt"),
+            ("find empty directories under here", "find . -type d -empty"),
+            (
+                "make a tar.gz archive of the docs directory at /tmp/termlm-docs-test.tar.gz",
+                "tar -czf /tmp/termlm-docs-test.tar.gz docs",
+            ),
+        ];
+
+        for (prompt, expected) in cases {
+            let draft = draft_command_for_prompt(prompt).expect(prompt);
+            assert_eq!(draft.cmd, expected, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn high_confidence_shortcut_is_limited_to_known_simple_requests() {
+        let pwd = high_confidence_shortcut_for_prompt("which directory am I in?").expect("pwd");
+        assert_eq!(pwd.cmd, "pwd");
+        let archive = high_confidence_shortcut_for_prompt("create a directory called archive")
+            .expect("mkdir");
+        assert_eq!(archive.cmd, "mkdir -p archive");
+        assert!(high_confidence_shortcut_for_prompt("find Python files containing TODO").is_none());
+        let hidden =
+            high_confidence_shortcut_for_prompt("show hidden files in the current directory")
+                .expect("hidden files");
+        assert_eq!(hidden.cmd, "ls -la");
     }
 }

@@ -66,9 +66,12 @@ case "$cmd" in
       if [[ "$line" == *'"op":"start_task"'* ]]; then
         task_id="$(json_field "$line" "task_id")"
         mode="$(json_field "$line" "mode")"
+        prompt="$(json_field "$line" "prompt")"
         print -r -- "event:start_task:${task_id}:${mode}" >> "${log_file}"
         print -r -- "{\"event\":\"task_started\",\"task_id\":\"${task_id}\"}"
-        if [[ "$mode" == "/p" ]]; then
+        if [[ "$prompt" == "cancel me" ]]; then
+          pending_task="${task_id}"
+        elif [[ "$mode" == "/p" ]]; then
           chunk_b64="$(encode_b64 "session-mode-ok")"
           print -r -- "{\"event\":\"model_text\",\"task_id\":\"${task_id}\",\"chunk_b64\":\"${chunk_b64}\"}"
           print -r -- "{\"event\":\"task_complete\",\"task_id\":\"${task_id}\"}"
@@ -156,6 +159,16 @@ spawn env TERM=$term ZDOTDIR=$zdotdir zsh -i
 expect -re {TERMLM_NORMAL> }
 send -s -- "?"
 expect -re {TERMLM_PROMPT> }
+send -- "\033"
+expect -re {TERMLM_NORMAL> }
+send -s -- "?"
+expect -re {TERMLM_PROMPT> }
+send -s -- "cancel me\r"
+expect -re {TERMLM_PROMPT> }
+send -- "\033"
+expect -re {TERMLM_NORMAL> }
+send -s -- "?"
+expect -re {TERMLM_PROMPT> }
 send -s -- "run pty contract\r"
 expect -re {TERMLM_NORMAL> }
 # Trigger a prompt-cycle so precmd emits pending ack deterministically in PTY automation.
@@ -165,8 +178,8 @@ send -s -- "/p\r"
 expect -re {TERMLM_SESSION> }
 send -s -- "session followup\r"
 expect -re {TERMLM_SESSION> }
-# Leave session mode explicitly, then exit shell. Ctrl-D behavior can vary by TERM/keymap.
-send -s -- "/q\r"
+# Escape should leave interactive session mode, then exit shell. Ctrl-D behavior can vary by TERM/keymap.
+send -- "\033"
 expect -re {TERMLM_NORMAL> }
 send -s -- "exit\r"
 expect eof
@@ -200,6 +213,10 @@ fi
 
 if ! rg -q 'event:start_task:[^:]+:/p' "${MOCK_LOG}"; then
   fail "expected start_task in session mode (/p)"
+fi
+
+if ! rg -q 'event:user_response:[^:]+:abort' "${MOCK_LOG}"; then
+  fail "expected escape to abort a waiting prompt task"
 fi
 
 if ! wait_for_log_pattern "event:unregister_shell" 8; then

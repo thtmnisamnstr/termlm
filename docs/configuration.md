@@ -24,6 +24,7 @@ These are the defaults that most directly affect behavior:
 - `[model] auto_download = true`
 - `[approval] mode = "manual"`
 - `[web] enabled = true`
+- `[web] expose_tools = true`
 - `[web] provider = "duckduckgo_html"`
 - `[indexer] embedding_provider = "local"`
 - `[indexer] vector_storage = "f16"`
@@ -54,6 +55,25 @@ model = "gemma4:e4b"
 allow_remote = false
 allow_plain_http_remote = false
 healthcheck_on_start = true
+```
+
+### Disable web search/read
+
+Web search and page reading are on by default with the no-token DuckDuckGo HTML provider.
+The task router uses them for web/current-information prompts such as "search the web", "look up", "latest", or prompts containing an HTTP(S) URL. Command prompts still prefer local command docs first, but can use web search/read as a fallback when local retrieval is missing or insufficient.
+
+Disable all daemon-owned web requests:
+
+```toml
+[web]
+enabled = false
+```
+
+Keep the web runtime configured but hide `web_search` and `web_read` from the model:
+
+```toml
+[web]
+expose_tools = false
 ```
 
 ### Reduce context capture footprint

@@ -2,10 +2,12 @@
 
 [[ "${TERMLM_DISABLE:-0}" == "1" ]] && return 0
 
-if [[ -n "${_TERMLM_PLUGIN_LOADED:-}" ]]; then
+if [[ "${_TERMLM_PLUGIN_LOADED_FOR_PID:-}" == "$$" ]]; then
   return 0
 fi
-export _TERMLM_PLUGIN_LOADED=1
+typeset -g _TERMLM_PLUGIN_LOADED=1
+typeset -g _TERMLM_PLUGIN_LOADED_FOR_PID="$$"
+typeset +x _TERMLM_PLUGIN_LOADED _TERMLM_PLUGIN_LOADED_FOR_PID 2>/dev/null || true
 
 _TERMLM_MODE="normal"
 _TERMLM_SESSION_MODE=0
@@ -23,6 +25,9 @@ _TERMLM_CLARIFICATION_TASK_ID=""
 _TERMLM_APPROVAL_TASK_ID=""
 _TERMLM_APPROVAL_CMD=""
 _TERMLM_EDITING_APPROVAL_TASK_ID=""
+_TERMLM_CLOSED_TASK_ID=""
+_TERMLM_OUTPUT_STARTED=0
+_TERMLM_OUTPUT_NEEDS_NEWLINE=0
 _TERMLM_PENDING_TASK_ID=""
 _TERMLM_PENDING_CMD=""
 _TERMLM_PENDING_CWD_BEFORE=""
@@ -40,6 +45,7 @@ source "${0:A:h}/widgets/prompt-mode.zsh"
 source "${0:A:h}/widgets/self-insert.zsh"
 source "${0:A:h}/widgets/accept-line.zsh"
 source "${0:A:h}/widgets/delete-char-or-list.zsh"
+source "${0:A:h}/widgets/escape.zsh"
 source "${0:A:h}/widgets/approval.zsh"
 source "${0:A:h}/widgets/safety-floor.zsh"
 source "${0:A:h}/lib/ipc.zsh"
@@ -57,11 +63,13 @@ zle -N self-insert termlm-self-insert
 zle -N accept-line termlm-accept-line
 zle -N zle-line-pre-redraw termlm-line-pre-redraw
 zle -N termlm-delete-char-or-list
+zle -N termlm-cancel-prompt
 
 if ! bindkey -l | grep -qx 'termlm-prompt'; then
   bindkey -N termlm-prompt main
 fi
 bindkey -M termlm-prompt '^D' termlm-delete-char-or-list
+bindkey -M termlm-prompt $'\e' termlm-cancel-prompt
 
 add-zsh-hook preexec termlm-preexec
 add-zsh-hook precmd termlm-precmd

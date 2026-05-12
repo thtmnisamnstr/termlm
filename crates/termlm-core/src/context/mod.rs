@@ -47,14 +47,14 @@ pub fn exposure_for(classification: &TaskClassification) -> ToolExposureProfile 
             lookup_command_docs: true,
             local_file_tools: false,
             terminal_context_tool: false,
-            web_tools: false,
+            web_tools: true,
         },
         TaskClassification::DiagnosticDebugging => ToolExposureProfile {
             execute_shell_command: true,
             lookup_command_docs: true,
             local_file_tools: true,
             terminal_context_tool: true,
-            web_tools: false,
+            web_tools: true,
         },
         TaskClassification::WebCurrentInfoQuestion => ToolExposureProfile {
             execute_shell_command: false,
@@ -76,7 +76,7 @@ pub fn exposure_for(classification: &TaskClassification) -> ToolExposureProfile 
                 lookup_command_docs: true,
                 local_file_tools: true,
                 terminal_context_tool: true,
-                web_tools: false,
+                web_tools: true,
             }
         }
     }
@@ -119,6 +119,7 @@ pub fn determine_tool_exposure(
     }
     if cfg.tool_routing.expose_web_only_when_needed
         && !matches!(classification, TaskClassification::WebCurrentInfoQuestion)
+        && !profile.execute_shell_command
     {
         profile.web_tools = false;
     }
@@ -390,6 +391,26 @@ mod tests {
         assert!(profile.web_tools);
         assert!(!profile.local_file_tools);
         assert!(!profile.terminal_context_tool);
+    }
+
+    #[test]
+    fn default_routing_exposes_web_fallback_for_local_command_tasks() {
+        let cfg = AppConfig::default();
+        let profile = determine_tool_exposure(&TaskClassification::FreshCommandRequest, &cfg);
+        assert!(profile.web_tools);
+    }
+
+    #[test]
+    fn web_config_can_disable_web_tools() {
+        let mut cfg = AppConfig::default();
+        cfg.web.enabled = false;
+        let profile = determine_tool_exposure(&TaskClassification::WebCurrentInfoQuestion, &cfg);
+        assert!(!profile.web_tools);
+
+        let mut cfg = AppConfig::default();
+        cfg.web.expose_tools = false;
+        let profile = determine_tool_exposure(&TaskClassification::WebCurrentInfoQuestion, &cfg);
+        assert!(!profile.web_tools);
     }
 
     #[test]

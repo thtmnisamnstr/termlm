@@ -29,7 +29,7 @@ termlm reindex --mode compact
 Meaning:
 
 - `delta`: update only changed/new/removed command docs
-- `full`: rebuild all index artifacts
+- `full`: rebuild all index artifacts; reserve for incompatible or corrupt index state
 - `compact`: rewrite index files to remove tombstones and stale fragments
 
 Compat flags are still accepted:
@@ -75,8 +75,11 @@ Symptoms:
 Actions:
 
 1. run `termlm status`
-2. inspect log file: `~/.local/state/termlm/termlm.log`
-3. confirm whether daemon is alive before removing stale pid/socket files
+2. verify binaries are installed and on PATH: `command -v termlm` and `command -v termlm-core`
+3. inspect log file: `~/.local/state/termlm/termlm.log`
+4. try a manual daemon start: `termlm-core --detach`, then `termlm status --verbose`
+5. if the daemon still will not start, run `termlm-core` in the foreground to see the startup error directly
+6. confirm whether daemon is alive before removing stale pid/socket files
 
 ### Provider unavailable
 
@@ -100,9 +103,10 @@ Symptoms:
 
 Actions:
 
-1. `termlm reindex --mode full`
-2. if still broken, stop daemon and remove index root under `~/.local/share/termlm/index/`
-3. restart and run `termlm reindex --mode compact` after heavy churn periods
+1. for stale results after normal PATH/tooling changes, run `termlm reindex --mode delta`
+2. after heavy churn, run `termlm reindex --mode compact` to reclaim stale fragments
+3. use `termlm reindex --mode full` only for incompatible or corrupt index state
+4. if still broken, stop daemon and remove index root under `~/.local/share/termlm/index/`
 
 ### Adapter/helper stream drop
 
@@ -116,6 +120,7 @@ Actions:
 1. re-enter prompt mode (`?`) to trigger helper re-registration
 2. check run directory permissions under `${XDG_RUNTIME_DIR:-/tmp}/termlm-$UID/`
 3. inspect daemon log tail for protocol/provider failures
+4. if prompt mode remains stuck, press `Esc` to reset adapter state, then run `termlm status --verbose`
 
 ## 6) Release / CI Gate Commands
 

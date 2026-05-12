@@ -77,14 +77,28 @@ pub struct CustomJsonProvider {
     client: Client,
     endpoint: String,
     bearer_token: Option<String>,
+    allow_plain_http_results: bool,
+    allow_local_address_results: bool,
 }
 
 impl CustomJsonProvider {
     pub fn new(client: Client, endpoint: impl Into<String>, bearer_token: Option<String>) -> Self {
+        Self::new_with_result_policy(client, endpoint, bearer_token, false, false)
+    }
+
+    pub fn new_with_result_policy(
+        client: Client,
+        endpoint: impl Into<String>,
+        bearer_token: Option<String>,
+        allow_plain_http_results: bool,
+        allow_local_address_results: bool,
+    ) -> Self {
         Self {
             client,
             endpoint: endpoint.into(),
             bearer_token,
+            allow_plain_http_results,
+            allow_local_address_results,
         }
     }
 }
@@ -158,6 +172,8 @@ struct SearchResponseMeta {
     final_url: Option<String>,
     response_bytes: Option<usize>,
     extraction_method: String,
+    allow_plain_http_results: bool,
+    allow_local_address_results: bool,
 }
 
 #[async_trait]
@@ -197,7 +213,7 @@ impl SearchProvider for DuckDuckGoHtmlProvider {
             let Some(clean_url) = normalize_ddg_href(raw_url) else {
                 continue;
             };
-            let Ok(normalized) = normalize_result_url(&clean_url) else {
+            let Ok(normalized) = normalize_result_url(&clean_url, false, false) else {
                 continue;
             };
             let raw_title = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
@@ -292,6 +308,8 @@ impl SearchProvider for CustomJsonProvider {
                 final_url,
                 response_bytes: Some(response_bytes),
                 extraction_method: "json_array".to_string(),
+                allow_plain_http_results: self.allow_plain_http_results,
+                allow_local_address_results: self.allow_local_address_results,
             },
         ))
     }
@@ -344,6 +362,8 @@ impl SearchProvider for BraveProvider {
                 final_url,
                 response_bytes,
                 extraction_method: "json_array".to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
             },
         ))
     }
@@ -395,6 +415,8 @@ impl SearchProvider for KagiProvider {
                 final_url,
                 response_bytes,
                 extraction_method: "json_array".to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
             },
         ))
     }
@@ -458,6 +480,8 @@ impl SearchProvider for TavilyProvider {
                 final_url,
                 response_bytes,
                 extraction_method: "json_array".to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
             },
         ))
     }
@@ -513,6 +537,8 @@ impl SearchProvider for WhoogleProvider {
                 final_url,
                 response_bytes,
                 extraction_method: "json_array".to_string(),
+                allow_plain_http_results: false,
+                allow_local_address_results: false,
             },
         ))
     }
@@ -572,7 +598,11 @@ fn results_from_rows(
         let Some(url) = first_string_field(&row, &["url", "link", "href"]) else {
             continue;
         };
-        let Ok(normalized) = normalize_result_url(&url) else {
+        let Ok(normalized) = normalize_result_url(
+            &url,
+            meta.allow_plain_http_results,
+            meta.allow_local_address_results,
+        ) else {
             continue;
         };
         let title = first_string_field(&row, &["title", "name"]).unwrap_or_else(|| url.clone());
@@ -626,8 +656,12 @@ fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn normalize_result_url(raw: &str) -> Result<String> {
-    let parsed = validate_web_url(raw, false, false)?;
+fn normalize_result_url(
+    raw: &str,
+    allow_plain_http: bool,
+    allow_local_addresses: bool,
+) -> Result<String> {
+    let parsed = validate_web_url(raw, allow_plain_http, allow_local_addresses)?;
     let mut normalized = parsed;
     normalized.set_fragment(None);
     Ok(normalized.to_string())
@@ -698,8 +732,16 @@ mod tests {
 
     #[test]
     fn normalizes_search_result_url() {
-        let normalized =
-            normalize_result_url("https://example.com/docs#a").expect("normalize should pass");
+        let normalized = normalize_result_url("https://example.com/docs#a", false, false)
+            .expect("normalize should pass");
         assert_eq!(normalized, "https://example.com/docs");
+    }
+
+    #[test]
+    fn normalizes_local_custom_result_when_policy_allows_it() {
+        let normalized = normalize_result_url("http://127.0.0.1:8080/docs#a", true, true)
+            .expect("local result should pass when explicitly allowed");
+        assert_eq!(normalized, "http://127.0.0.1:8080/docs");
+        assert!(normalize_result_url("http://127.0.0.1:8080/docs", false, false).is_err());
     }
 }

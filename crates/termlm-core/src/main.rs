@@ -307,6 +307,8 @@ struct DaemonState {
     observed: Mutex<VecDeque<ObservedEntry>>,
     last_source_ledger: Mutex<source_ledger::SourceLedger>,
     last_stage_timings_ms: Mutex<BTreeMap<String, u64>>,
+    query_embedding_backoff_until: Mutex<Option<std::time::Instant>>,
+    last_background_delta_index_at: Mutex<Option<std::time::Instant>>,
     retrieval_cache: Mutex<cache::TimedCache<Vec<termlm_protocol::GroundingRef>>>,
     command_validation_cache: Mutex<cache::TimedCache<bool>>,
     file_read_cache: Mutex<cache::TimedCache<CachedToolResult>>,
@@ -495,6 +497,8 @@ async fn main() -> Result<()> {
         observed: Mutex::new(VecDeque::new()),
         last_source_ledger: Mutex::new(source_ledger::SourceLedger::default()),
         last_stage_timings_ms: Mutex::new(BTreeMap::new()),
+        query_embedding_backoff_until: Mutex::new(None),
+        last_background_delta_index_at: Mutex::new(None),
         retrieval_cache: Mutex::new(cache::TimedCache::new(std::time::Duration::from_secs(
             retrieval_cache_ttl_secs,
         ))),
@@ -587,12 +591,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    }
-
-    if state.config_snapshot().indexer.enabled
-        && let Err(e) = compact_index(&state).await
-    {
-        warn!("shutdown compaction failed: {e:#}");
     }
 
     {
@@ -851,9 +849,12 @@ async fn handle_connection(
                 }
                 let state_for_index = Arc::clone(&state);
                 tokio::spawn(async move {
-                    if let Err(e) = run_delta_indexing(&state_for_index, false).await {
-                        warn!("delta indexing refresh after shell register failed: {e:#}");
-                    }
+                    maybe_run_background_delta_indexing(
+                        state_for_index,
+                        "shell register",
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await;
                 });
                 bound_shell_id = Some(shell_id);
 
@@ -1289,11 +1290,40 @@ async fn process_start_task(
         "source_ledger_ms".to_string(),
         source_ledger_started.elapsed().as_millis() as u64,
     );
-    let drafting_prompt = context_assembly.prompt.clone();
+    let mut drafting_prompt = context_assembly.prompt.clone();
+    let retrieval_started = std::time::Instant::now();
+    if matches!(
+        classification.classification,
+        tasks::TaskClassification::FreshCommandRequest
+            | tasks::TaskClassification::DiagnosticDebugging
+            | tasks::TaskClassification::ReferentialFollowup
+            | tasks::TaskClassification::ExploratoryShellQuestion
+    ) {
+        let retrieved_chunks = retrieve_chunks_for_prompt(
+            state,
+            &payload.prompt,
+            Some(state.config_snapshot().indexer.rag_top_k as u32),
+        )
+        .await;
+        if retrieved_chunks.is_empty() {
+            drafting_prompt.push_str(
+                "\n\n## Relevant local command docs\nNo local command-doc retrieval hits matched this prompt. Use lookup_command_docs for likely commands; if local docs are missing or insufficient and web tools are available, use web_search/web_read before proposing a command. Ask one focused clarification question only if no grounded command is possible.",
+            );
+        } else {
+            drafting_prompt.push_str("\n\n");
+            drafting_prompt.push_str(&format_retrieved_docs_block(&retrieved_chunks));
+            append_source_refs(state, retrieved_chunk_source_refs(&retrieved_chunks)).await;
+        }
+    }
+    stage_timings.insert(
+        "prompt_retrieval_ms".to_string(),
+        retrieval_started.elapsed().as_millis() as u64,
+    );
 
     let progress_started = std::time::Instant::now();
-    let progress_guard = state.index_progress.lock().await;
-    if let Some(progress_line) = indexing_progress_banner(&progress_guard) {
+    let progress = state.index_progress.lock().await.clone();
+    let usable_index_loaded = !state.index_runtime.lock().await.chunks.is_empty();
+    if let Some(progress_line) = indexing_progress_banner(&progress, usable_index_loaded) {
         transport
             .send(ServerMessage::ModelText {
                 task_id: payload.task_id,
@@ -1301,7 +1331,6 @@ async fn process_start_task(
             })
             .await?;
     }
-    drop(progress_guard);
     stage_timings.insert(
         "progress_banner_ms".to_string(),
         progress_started.elapsed().as_millis() as u64,
@@ -1348,57 +1377,26 @@ async fn process_start_task(
         if handled_local {
             Ok(())
         } else {
-            let mut handled_by_runtime_stub = false;
-            if runtime_stub_provider_enabled() {
-                let stub_started = std::time::Instant::now();
-                if maybe_run_runtime_stub_provider(
-                    state,
-                    transport,
-                    &payload,
-                    &session,
-                    false,
-                    &classification,
-                    &payload.prompt,
-                )
-                .await?
-                {
-                    stage_timings.insert(
-                        "runtime_stub_provider_ms".to_string(),
-                        stub_started.elapsed().as_millis() as u64,
-                    );
-                    handled_by_runtime_stub = true;
-                }
-            }
-            if handled_by_runtime_stub {
+            let shortcut_started = std::time::Instant::now();
+            let handled_by_shortcut = maybe_run_high_confidence_command_shortcut(
+                state,
+                transport,
+                &payload,
+                &session,
+                &classification,
+            )
+            .await?;
+            if handled_by_shortcut {
+                stage_timings.insert(
+                    "heuristic_shortcut_ms".to_string(),
+                    shortcut_started.elapsed().as_millis() as u64,
+                );
                 Ok(())
             } else {
-                let orchestration_started = std::time::Instant::now();
-                let handled_provider = match try_provider_orchestration(
-                    state,
-                    transport,
-                    &payload,
-                    &session,
-                    &classification,
-                    &drafting_prompt,
-                    true,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        cancel_and_clear_task(state, payload.task_id).await;
-                        return Err(e);
-                    }
-                };
-                stage_timings.insert(
-                    "provider_orchestration_ms".to_string(),
-                    orchestration_started.elapsed().as_millis() as u64,
-                );
-                if handled_provider {
-                    Ok(())
-                } else {
-                    let fallback_started = std::time::Instant::now();
-                    let handled_fallback = if maybe_run_runtime_stub_provider(
+                let mut handled_by_runtime_stub = false;
+                if runtime_stub_provider_enabled() {
+                    let stub_started = std::time::Instant::now();
+                    if maybe_run_runtime_stub_provider(
                         state,
                         transport,
                         &payload,
@@ -1409,56 +1407,104 @@ async fn process_start_task(
                     )
                     .await?
                     {
-                        true
+                        stage_timings.insert(
+                            "runtime_stub_provider_ms".to_string(),
+                            stub_started.elapsed().as_millis() as u64,
+                        );
+                        handled_by_runtime_stub = true;
+                    }
+                }
+                if handled_by_runtime_stub {
+                    Ok(())
+                } else {
+                    let orchestration_started = std::time::Instant::now();
+                    let handled_provider = match try_provider_orchestration(
+                        state,
+                        transport,
+                        &payload,
+                        &session,
+                        &classification,
+                        &drafting_prompt,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            cancel_and_clear_task(state, payload.task_id).await;
+                            return Err(e);
+                        }
+                    };
+                    stage_timings.insert(
+                        "provider_orchestration_ms".to_string(),
+                        orchestration_started.elapsed().as_millis() as u64,
+                    );
+                    if handled_provider {
+                        Ok(())
                     } else {
-                        maybe_run_heuristic_command_fallback(
+                        let fallback_started = std::time::Instant::now();
+                        let handled_fallback = if maybe_run_runtime_stub_provider(
                             state,
                             transport,
                             &payload,
                             &session,
+                            false,
                             &classification,
+                            &payload.prompt,
                         )
                         .await?
-                    };
-                    if handled_fallback {
-                        stage_timings.insert(
-                            "provider_no_tool_call_ms".to_string(),
-                            fallback_started.elapsed().as_millis() as u64,
-                        );
-                        Ok(())
-                    } else {
-                        let shell_override =
-                            approval_override_for_shell(state, payload.shell_id).await;
-                        state.tasks.lock().await.insert(
-                            payload.task_id,
-                            InFlightTask {
-                                task_id: payload.task_id,
-                                shell_id: payload.shell_id,
-                                mode: payload.mode.clone(),
-                                original_prompt: payload.prompt.clone(),
-                                proposed_command: String::new(),
-                                classification: classification.classification.clone(),
-                                classification_confidence: classification.confidence,
-                                approval_override: shell_override,
-                                awaiting_clarification: true,
-                                provider_continuation: true,
-                                tool_round: 0,
-                                created_at: std::time::Instant::now(),
-                            },
-                        );
-                        transport
-                            .send(ServerMessage::NeedsClarification {
-                                task_id: payload.task_id,
-                                question:
-                                    "I couldn't produce a structured command tool call yet. What exact command behavior should run?"
-                                        .to_string(),
-                            })
-                            .await?;
-                        stage_timings.insert(
-                            "provider_no_tool_call_ms".to_string(),
-                            fallback_started.elapsed().as_millis() as u64,
-                        );
-                        Ok(())
+                        {
+                            true
+                        } else {
+                            maybe_run_heuristic_command_fallback(
+                                state,
+                                transport,
+                                &payload,
+                                &session,
+                                &classification,
+                            )
+                            .await?
+                        };
+                        if handled_fallback {
+                            stage_timings.insert(
+                                "provider_no_tool_call_ms".to_string(),
+                                fallback_started.elapsed().as_millis() as u64,
+                            );
+                            Ok(())
+                        } else {
+                            let shell_override =
+                                approval_override_for_shell(state, payload.shell_id).await;
+                            state.tasks.lock().await.insert(
+                                payload.task_id,
+                                InFlightTask {
+                                    task_id: payload.task_id,
+                                    shell_id: payload.shell_id,
+                                    mode: payload.mode.clone(),
+                                    original_prompt: payload.prompt.clone(),
+                                    proposed_command: String::new(),
+                                    classification: classification.classification.clone(),
+                                    classification_confidence: classification.confidence,
+                                    approval_override: shell_override,
+                                    awaiting_clarification: true,
+                                    provider_continuation: true,
+                                    tool_round: 0,
+                                    created_at: std::time::Instant::now(),
+                                },
+                            );
+                            transport
+                                .send(ServerMessage::NeedsClarification {
+                                    task_id: payload.task_id,
+                                    question:
+                                        "I couldn't produce a structured command tool call yet. What exact command behavior should run?"
+                                            .to_string(),
+                                })
+                                .await?;
+                            stage_timings.insert(
+                                "provider_no_tool_call_ms".to_string(),
+                                fallback_started.elapsed().as_millis() as u64,
+                            );
+                            Ok(())
+                        }
                     }
                 }
             }
@@ -2152,9 +2198,16 @@ async fn send_status(state: &Arc<DaemonState>, transport: &mut ipc::ServerTransp
         (active_shells, unique_pids, non_empty_ttys)
     };
     let active_tasks = state.tasks.lock().await.len();
-    let progress = state.index_progress.lock().await.clone();
+    let mut progress = state.index_progress.lock().await.clone();
     let stage_timings_ms = state.last_stage_timings_ms.lock().await.clone();
     let chunk_count = state.index_runtime.lock().await.chunks.len() as u64;
+    if chunk_count > 0
+        && progress.phase != "complete"
+        && (progress.phase == "idle" || progress.percent >= 99.9)
+    {
+        progress.phase = "complete".to_string();
+        progress.percent = 100.0;
+    }
     let provider_health = state.provider.lock().await.health().await.ok();
     let provider_remote = if cfg.inference.provider == "ollama" {
         !is_loopback_endpoint(&cfg.ollama.endpoint)
@@ -2255,6 +2308,7 @@ async fn send_status(state: &Arc<DaemonState>, transport: &mut ipc::ServerTransp
             last_task_source_refs,
             last_task_source_ledger,
             stage_timings_ms,
+            index_chunk_count: chunk_count,
             index_progress: progress,
             web: WebStatus {
                 enabled: cfg.web.enabled,
@@ -2342,13 +2396,21 @@ async fn send_provider_health(
     Ok(())
 }
 
-fn indexing_progress_banner(progress: &IndexProgress) -> Option<String> {
+fn indexing_progress_banner(progress: &IndexProgress, usable_index_loaded: bool) -> Option<String> {
     if progress.phase == "complete" || progress.phase == "idle" {
         return None;
     }
+    if usable_index_loaded && progress.percent >= 99.9 {
+        return None;
+    }
+    let display_percent = if progress.phase == "embed" && progress.percent >= 99.9 {
+        99.0
+    } else {
+        progress.percent
+    };
     Some(format!(
-        "Note: documentation indexing is in progress ({:.1}% complete; {} commands available so far). If a command you need is missing from the cheat sheet, try lookup_command_docs(name) — the index may still have it.",
-        progress.percent, progress.scanned
+        "Note: documentation indexing is in progress ({:.1}% complete; {} commands available so far).\nIf a command you need is missing from the cheat sheet, try lookup_command_docs(name) — the index may still have it.\n",
+        display_percent, progress.scanned
     ))
 }
 
@@ -3008,6 +3070,8 @@ async fn embed_texts_with_provider(
     }
     match cfg.indexer.embedding_provider.as_str() {
         "local" => {
+            let started = std::time::Instant::now();
+            let text_count = texts.len();
             let result = match embed_texts_with_local_runtime(state, cfg, texts).await {
                 Ok(v) => Ok(Some(v)),
                 Err(e) => {
@@ -3015,6 +3079,13 @@ async fn embed_texts_with_provider(
                     Ok(None)
                 }
             };
+            if result.as_ref().is_ok_and(|v| v.is_some()) {
+                info!(
+                    text_count,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "local embedding request complete"
+                );
+            }
             if !cfg.performance.keep_embedding_warm {
                 shutdown_embedding_runtime(state).await;
             }
@@ -3202,11 +3273,36 @@ async fn embed_query_vector(
     cfg: &AppConfig,
     prompt: &str,
 ) -> Option<Vec<f32>> {
+    let now = std::time::Instant::now();
+    if let Some(until) = *state.query_embedding_backoff_until.lock().await
+        && until > now
+    {
+        return None;
+    }
+
     let text = format!("{}{}", cfg.indexer.embed_query_prefix, prompt);
     let input = vec![text];
-    match embed_texts_with_provider(state, cfg, &input).await {
-        Ok(Some(mut rows)) => rows.pop(),
-        _ => None,
+    let timeout_secs = cfg.indexer.query_embedding_timeout_secs.max(1);
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, embed_texts_with_provider(state, cfg, &input)).await {
+        Ok(Ok(Some(mut rows))) => {
+            *state.query_embedding_backoff_until.lock().await = None;
+            rows.pop()
+        }
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            warn!("query embedding failed, falling back to lexical retrieval: {e:#}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "query embedding timed out after {timeout_secs}s, falling back to lexical retrieval"
+            );
+            let cooldown_secs = timeout_secs.saturating_mul(12).clamp(30, 120);
+            *state.query_embedding_backoff_until.lock().await =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(cooldown_secs));
+            None
+        }
     }
 }
 
@@ -3220,6 +3316,25 @@ async fn shutdown_embedding_runtime(state: &Arc<DaemonState>) {
         && let Err(e) = provider.shutdown().await
     {
         warn!("embedding runtime shutdown failed: {e:#}");
+    }
+}
+
+async fn prewarm_query_embedding_runtime(state: &Arc<DaemonState>, cfg: &AppConfig) {
+    if !cfg.performance.keep_embedding_warm || cfg.indexer.embedding_provider != "local" {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let input = vec![format!(
+        "{}{}",
+        cfg.indexer.embed_query_prefix, "list files in this directory"
+    )];
+    match embed_texts_with_provider(state, cfg, &input).await {
+        Ok(Some(_)) => info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "query embedding runtime prewarmed"
+        ),
+        Ok(None) => warn!("query embedding runtime prewarm skipped: embeddings unavailable"),
+        Err(e) => warn!("query embedding runtime prewarm failed: {e:#}"),
     }
 }
 
@@ -3392,10 +3507,12 @@ fn build_web_search_provider(
             if cfg.search_endpoint.trim().is_empty() {
                 bail!("web.provider=custom_json requires [web].search_endpoint");
             }
-            Ok(Box::new(CustomJsonProvider::new(
+            Ok(Box::new(CustomJsonProvider::new_with_result_policy(
                 client,
                 cfg.search_endpoint.clone(),
                 resolve_search_bearer_token(cfg),
+                cfg.allow_plain_http,
+                cfg.allow_local_addresses,
             )))
         }
         "brave" => {
@@ -5320,7 +5437,8 @@ async fn try_provider_orchestration(
     );
     let progress_note = {
         let progress = state.index_progress.lock().await;
-        indexing_progress_banner(&progress)
+        let usable_index_loaded = !state.index_runtime.lock().await.chunks.is_empty();
+        indexing_progress_banner(&progress, usable_index_loaded)
     };
     if let Some(note) = progress_note {
         system.push('\n');
@@ -5330,6 +5448,14 @@ async fn try_provider_orchestration(
         system.push_str(
             "\nWhen using web sources, include explicit URL citations in your final answer. \
              If no reliable source is available, say so instead of claiming unsupported facts.",
+        );
+    }
+    if profile.web_tools && cfg.web.enabled && cfg.web.expose_tools {
+        system.push_str(
+            "\nFor command requests, use local command docs/retrieval first. If local docs are \
+             missing or insufficient for the requested action, use web_search/web_read as a \
+             fallback, then emit one execute_shell_command tool call. Ask one focused \
+             clarification question only when neither local nor web context is enough.",
         );
     }
     let alias_defs = session
@@ -5856,11 +5982,57 @@ async fn try_provider_orchestration(
     }
 
     if sent_docs || sent_readonly {
+        let readonly_rounds = readonly_tool_round_count(state, payload.task_id).await;
+        let max_rounds = cfg.behavior.max_tool_rounds.max(1);
+        if readonly_rounds < max_rounds {
+            let continuation_prompt = readonly_tool_continuation_prompt(
+                profile.web_tools && cfg.web.enabled && cfg.web.expose_tools,
+            );
+            return Box::pin(try_provider_orchestration(
+                state,
+                transport,
+                payload,
+                session,
+                classification,
+                continuation_prompt,
+                true,
+            ))
+            .await;
+        }
+
+        if cfg.behavior.allow_clarifications {
+            let shell_override = approval_override_for_shell(state, payload.shell_id).await;
+            state.tasks.lock().await.insert(
+                payload.task_id,
+                InFlightTask {
+                    task_id: payload.task_id,
+                    shell_id: payload.shell_id,
+                    mode: payload.mode.clone(),
+                    original_prompt: payload.prompt.clone(),
+                    proposed_command: String::new(),
+                    classification: classification.classification.clone(),
+                    classification_confidence: classification.confidence,
+                    approval_override: shell_override,
+                    awaiting_clarification: true,
+                    provider_continuation: true,
+                    tool_round: readonly_rounds,
+                    created_at: std::time::Instant::now(),
+                },
+            );
+            transport
+                .send(ServerMessage::NeedsClarification {
+                    task_id: payload.task_id,
+                    question: "I used the available retrieval tools but still could not form a safe command. What exact behavior should run?".to_string(),
+                })
+                .await?;
+            return Ok(true);
+        }
+
         transport
             .send(ServerMessage::TaskComplete {
                 task_id: payload.task_id,
-                reason: TaskCompleteReason::ModelDone,
-                summary: "read-only tool calls completed.".to_string(),
+                reason: TaskCompleteReason::ToolRoundLimit,
+                summary: format!("Stopped after {max_rounds} read-only tool rounds."),
             })
             .await?;
         append_session_turn_if_session_mode(
@@ -5868,7 +6040,7 @@ async fn try_provider_orchestration(
             &payload.mode,
             payload.shell_id,
             payload.prompt.clone(),
-            "Read-only tools completed.".to_string(),
+            format!("Stopped after {max_rounds} read-only tool rounds."),
         )
         .await;
         state
@@ -5885,6 +6057,51 @@ async fn try_provider_orchestration(
         .await
         .remove(&payload.task_id);
     Ok(false)
+}
+
+async fn readonly_tool_round_count(state: &Arc<DaemonState>, task_id: Uuid) -> u32 {
+    let conversations = state.task_conversations.lock().await;
+    conversations
+        .get(&task_id)
+        .map(|history| {
+            history
+                .iter()
+                .filter(|message| {
+                    message.role == "tool"
+                        && !matches!(
+                            message.tool_name.as_deref(),
+                            Some("execute_shell_command") | None
+                        )
+                })
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+async fn validation_web_fallback_attempt_count(state: &Arc<DaemonState>, task_id: Uuid) -> u32 {
+    let conversations = state.task_conversations.lock().await;
+    conversations
+        .get(&task_id)
+        .map(|history| {
+            history
+                .iter()
+                .filter(|message| {
+                    message.role == "user"
+                        && message.content.starts_with(
+                            "Local validation found missing or insufficient command grounding.",
+                        )
+                })
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+fn readonly_tool_continuation_prompt(web_available: bool) -> &'static str {
+    if web_available {
+        "Use the read-only tool results above. If they are sufficient, emit exactly one execute_shell_command tool call for the user to approve. If local command docs are missing or insufficient, use web_search/web_read once before drafting. Ask one focused clarification question only if no grounded command is possible."
+    } else {
+        "Use the read-only tool results above. If they are sufficient, emit exactly one execute_shell_command tool call for the user to approve. Ask one focused clarification question only if no grounded command is possible."
+    }
 }
 
 async fn maybe_run_runtime_stub_provider(
@@ -5911,6 +6128,36 @@ async fn maybe_run_runtime_stub_provider(
         payload,
         session,
         provider_continuation,
+        classification,
+        CommandPlan {
+            cmd: draft.cmd,
+            rationale: draft.rationale,
+            intent: draft.intent,
+            expected_effect: draft.expected_effect,
+            commands_used: draft.commands_used,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn maybe_run_high_confidence_command_shortcut(
+    state: &Arc<DaemonState>,
+    transport: &mut ipc::ServerTransport,
+    payload: &termlm_protocol::StartTask,
+    session: &ShellSession,
+    classification: &tasks::ClassificationResult,
+) -> Result<bool> {
+    let Some(draft) = tasks::high_confidence_shortcut_for_prompt(&payload.prompt) else {
+        return Ok(false);
+    };
+
+    propose_command_for_execution(
+        state,
+        transport,
+        payload,
+        session,
+        false,
         classification,
         CommandPlan {
             cmd: draft.cmd,
@@ -6341,6 +6588,36 @@ async fn propose_command_for_execution(
                     matched_pattern: None,
                 })
                 .await?;
+        }
+
+        let profile = context::determine_tool_exposure(
+            &classification.classification,
+            state.config_snapshot().as_ref(),
+        );
+        let web_available = profile.web_tools
+            && state.config_snapshot().web.enabled
+            && state.config_snapshot().web.expose_tools;
+        if web_available
+            && validation_findings_need_web_fallback(&findings)
+            && readonly_tool_round_count(state, payload.task_id).await
+                < state.config_snapshot().behavior.max_tool_rounds.max(1)
+            && validation_web_fallback_attempt_count(state, payload.task_id).await
+                < state.config_snapshot().behavior.max_planning_rounds.max(1)
+        {
+            let continuation_prompt = "Local validation found missing or insufficient command grounding. Use local lookup results if they are enough; otherwise use web_search/web_read to find reliable command documentation, then emit one corrected execute_shell_command tool call. Ask one focused clarification question only if no grounded command is possible.";
+            if Box::pin(try_provider_orchestration(
+                state,
+                transport,
+                payload,
+                session,
+                classification,
+                continuation_prompt,
+                true,
+            ))
+            .await?
+            {
+                return Ok(());
+            }
         }
 
         if let Some(redraft_cmd) =
@@ -6835,6 +7112,19 @@ fn summarize_validation_findings(findings: &[planning::ValidationFinding]) -> St
         .join("; ")
 }
 
+fn validation_findings_need_web_fallback(findings: &[planning::ValidationFinding]) -> bool {
+    findings.iter().any(|finding| {
+        matches!(
+            finding.kind.as_str(),
+            "missing_grounding"
+                | "insufficient_draft"
+                | "insufficient_for_prompt"
+                | "unknown_command"
+                | "unsupported_flag"
+        )
+    })
+}
+
 fn validation_findings_tool_response(
     command: &str,
     first_token: &str,
@@ -6942,6 +7232,9 @@ async fn build_grounding_refs(
         RetrievalQuery::new(query_text, retrieval_top_k, cfg.indexer.rag_min_similarity);
     query.hybrid_enabled = cfg.indexer.hybrid_retrieval_enabled;
     query.lexical_enabled = cfg.indexer.lexical_index_enabled;
+    if use_external_embeddings && query_embedding.is_none() && query.lexical_enabled {
+        query.hybrid_enabled = false;
+    }
     query.lexical_top_k = cfg.indexer.lexical_top_k;
     query.exact_command_boost = cfg.indexer.exact_command_boost;
     query.exact_flag_boost = cfg.indexer.exact_flag_boost;
@@ -7719,11 +8012,25 @@ async fn process_retrieve_request(
     transport: &mut ipc::ServerTransport,
     payload: termlm_protocol::RetrieveRequest,
 ) -> Result<()> {
+    let chunks = retrieve_chunks_for_prompt(state, &payload.prompt, payload.top_k).await;
+    transport
+        .send(ServerMessage::RetrievalResult { chunks })
+        .await?;
+    Ok(())
+}
+
+async fn retrieve_chunks_for_prompt(
+    state: &Arc<DaemonState>,
+    prompt: &str,
+    top_k_override: Option<u32>,
+) -> Vec<RetrievedChunk> {
     let cfg = state.config_snapshot();
-    let prompt = payload.prompt;
-    let top_k = payload.top_k.unwrap_or(cfg.indexer.rag_top_k as u32) as usize;
-    let mut query =
-        RetrievalQuery::new(prompt.clone(), top_k.max(1), cfg.indexer.rag_min_similarity);
+    let top_k = top_k_override.unwrap_or(cfg.indexer.rag_top_k as u32) as usize;
+    let mut query = RetrievalQuery::new(
+        prompt.to_string(),
+        top_k.max(1),
+        cfg.indexer.rag_min_similarity,
+    );
     query.hybrid_enabled = cfg.indexer.hybrid_retrieval_enabled;
     query.lexical_enabled = cfg.indexer.lexical_index_enabled;
     query.lexical_top_k = cfg.indexer.lexical_top_k;
@@ -7733,73 +8040,71 @@ async fn process_retrieve_request(
     query.command_aware = cfg.indexer.command_aware_retrieval;
     let use_external_embeddings = { state.index_runtime.lock().await.uses_external_embeddings };
     let query_embedding = if use_external_embeddings {
-        embed_query_vector(state, cfg.as_ref(), &prompt).await
+        embed_query_vector(state, cfg.as_ref(), prompt).await
     } else {
         None
     };
-    let hints = command_hints_from_prompt(&prompt);
-    let chunks = {
-        let runtime = state.index_runtime.lock().await;
-        let mut out = Vec::<RetrievedChunk>::new();
-        let mut seen_commands = BTreeSet::<String>::new();
+    if use_external_embeddings && query_embedding.is_none() && query.lexical_enabled {
+        query.hybrid_enabled = false;
+    }
+    let hints = command_hints_from_prompt(prompt);
+    let runtime = state.index_runtime.lock().await;
+    let mut out = Vec::<RetrievedChunk>::new();
+    let mut seen_commands = BTreeSet::<String>::new();
 
-        for hint in hints {
-            if out.len() >= top_k {
-                break;
-            }
-            if let Some(chunk) = runtime.chunks.iter().find(|c| c.command_name == hint)
-                && seen_commands.insert(chunk.command_name.clone())
-            {
-                out.push(render_retrieval_chunk(chunk));
-                continue;
-            }
-            if seen_commands.insert(hint.clone())
-                && let Some(rendered) = render_retrieval_hint_fallback(&hint)
-            {
-                out.push(rendered);
-            }
+    for hint in hints {
+        if out.len() >= top_k {
+            break;
         }
+        if let Some(chunk) = runtime.chunks.iter().find(|c| c.command_name == hint)
+            && seen_commands.insert(chunk.command_name.clone())
+        {
+            out.push(render_retrieval_chunk(chunk));
+            continue;
+        }
+        if seen_commands.insert(hint.clone())
+            && let Some(rendered) = render_retrieval_hint_fallback(&hint)
+        {
+            out.push(rendered);
+        }
+    }
 
-        for hit in runtime.retriever.search_with_embedding(
-            &query,
-            if use_external_embeddings {
-                query_embedding.as_deref()
-            } else {
-                None
-            },
-        ) {
-            if out.len() >= top_k {
-                break;
-            }
-            if !seen_commands.insert(hit.chunk.command_name.clone()) {
-                continue;
-            }
-            out.push(render_retrieval_chunk(&hit.chunk));
+    for hit in runtime.retriever.search_with_embedding(
+        &query,
+        if use_external_embeddings {
+            query_embedding.as_deref()
+        } else {
+            None
+        },
+    ) {
+        if out.len() >= top_k {
+            break;
         }
-        let mut remaining_tokens = cfg.indexer.rag_max_tokens.max(1);
-        let mut budgeted = Vec::<RetrievedChunk>::new();
-        for mut chunk in out {
-            if remaining_tokens == 0 {
+        if !seen_commands.insert(hit.chunk.command_name.clone()) {
+            continue;
+        }
+        out.push(render_retrieval_chunk(&hit.chunk));
+    }
+
+    let mut remaining_tokens = cfg.indexer.rag_max_tokens.max(1);
+    let mut budgeted = Vec::<RetrievedChunk>::new();
+    for mut chunk in out {
+        if remaining_tokens == 0 {
+            break;
+        }
+        let est = context::estimate_tokens(&chunk.text);
+        if est > remaining_tokens {
+            chunk.text = context::trim_to_tokens(&chunk.text, remaining_tokens);
+            if chunk.text.trim().is_empty() {
                 break;
             }
-            let est = context::estimate_tokens(&chunk.text);
-            if est > remaining_tokens {
-                chunk.text = context::trim_to_tokens(&chunk.text, remaining_tokens);
-                if chunk.text.trim().is_empty() {
-                    break;
-                }
-                budgeted.push(chunk);
-                break;
-            }
-            remaining_tokens = remaining_tokens.saturating_sub(est);
             budgeted.push(chunk);
+            break;
         }
-        budgeted
-    };
-    transport
-        .send(ServerMessage::RetrievalResult { chunks })
-        .await?;
-    Ok(())
+        remaining_tokens = remaining_tokens.saturating_sub(est);
+        budgeted.push(chunk);
+    }
+    budgeted
 }
 
 fn render_retrieval_chunk(chunk: &Chunk) -> RetrievedChunk {
@@ -7814,6 +8119,49 @@ fn render_retrieval_chunk(chunk: &Chunk) -> RetrievedChunk {
         extracted_at: chunk.extracted_at,
         text: truncate_string(&chunk.text, 800),
     }
+}
+
+fn format_retrieved_docs_block(chunks: &[RetrievedChunk]) -> String {
+    let mut out = String::from("## Relevant local command docs\n");
+    for chunk in chunks {
+        out.push_str("\n### ");
+        out.push_str(&chunk.command_name);
+        if !chunk.section_name.trim().is_empty() {
+            out.push_str(" / ");
+            out.push_str(&chunk.section_name);
+        }
+        out.push('\n');
+        out.push_str("source: ");
+        out.push_str(&chunk.path);
+        out.push('\n');
+        out.push_str(chunk.text.trim());
+        out.push('\n');
+    }
+    out
+}
+
+fn retrieved_chunk_source_refs(chunks: &[RetrievedChunk]) -> Vec<source_ledger::SourceRef> {
+    chunks
+        .iter()
+        .map(|chunk| source_ledger::SourceRef {
+            source_type: "docs_chunk".to_string(),
+            source_id: format!(
+                "{}::{}::{}",
+                chunk.path, chunk.command_name, chunk.chunk_index
+            ),
+            hash: chunk.doc_hash.clone(),
+            redacted: false,
+            truncated: chunk.text.chars().count() >= 800,
+            observed_at: chrono::Utc::now(),
+            detail: Some(format!("prompt retrieval for {}", chunk.command_name)),
+            section: Some(chunk.section_name.clone()),
+            offset_start: None,
+            offset_end: None,
+            extraction_method: Some(chunk.extraction_method.clone()),
+            extracted_at: Some(chunk.extracted_at),
+            index_version: Some(current_index_version()),
+        })
+        .collect()
 }
 
 fn build_retriever_for_chunks(
@@ -7882,6 +8230,26 @@ fn command_hints_from_prompt(prompt: &str) -> Vec<String> {
     if p.contains("git") {
         push("git");
     }
+    if p.contains("current directory")
+        || p.contains("where am i")
+        || p.contains("which directory")
+        || p.contains("what directory")
+        || p.contains("pwd")
+    {
+        push("pwd");
+    }
+    if p.contains("todo") || (p.contains("search") && p.contains("recursively")) {
+        push("rg");
+        push("grep");
+    }
+    if p.contains("find")
+        || p.contains("modified")
+        || p.contains("mtime")
+        || p.contains("last two days")
+        || p.contains("last 2 days")
+    {
+        push("find");
+    }
     if p.contains("commit")
         || p.contains("branch")
         || p.contains("rebase")
@@ -7914,12 +8282,7 @@ fn command_hints_from_prompt(prompt: &str) -> Vec<String> {
     {
         push("df");
     }
-    if p.contains("find")
-        || p.contains("search")
-        || p.contains("under")
-        || p.contains("modified")
-        || p.contains("mtime")
-    {
+    if p.contains("find") || p.contains("search") || p.contains("under") {
         push("find");
     }
     if p.contains("grep")
@@ -8067,6 +8430,7 @@ fn command_hints_from_prompt(prompt: &str) -> Vec<String> {
 fn render_retrieval_hint_fallback(command: &str) -> Option<RetrievedChunk> {
     let summary = match command {
         "ls" => "List directory contents (supports long/all/time sorting variants).",
+        "pwd" => "Print the current working directory.",
         "find" => "Search files and directories by predicates like name, size, and mtime.",
         "grep" => "Search file content with regular expressions.",
         "rg" => "Fast recursive grep with smart defaults and globs.",
@@ -8230,17 +8594,23 @@ async fn bootstrap_index_runtime(state: Arc<DaemonState>) -> Result<()> {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut runtime = state.index_runtime.lock().await;
-        runtime.retriever = build_retriever_for_chunks(
-            &state.index_store,
-            cfg.as_ref(),
-            loaded_chunks.clone(),
-            &loaded_embedding_mode,
-        );
-        runtime.binaries = binaries;
-        runtime.chunks = loaded_chunks;
-        runtime.uses_external_embeddings = loaded_embedding_mode == "provider";
-        runtime.revision = runtime.revision.saturating_add(1);
+        {
+            let mut runtime = state.index_runtime.lock().await;
+            runtime.retriever = build_retriever_for_chunks(
+                &state.index_store,
+                cfg.as_ref(),
+                loaded_chunks.clone(),
+                &loaded_embedding_mode,
+            );
+            runtime.binaries = binaries;
+            runtime.chunks = loaded_chunks;
+            runtime.uses_external_embeddings = loaded_embedding_mode == "provider";
+            runtime.revision = runtime.revision.saturating_add(1);
+        }
+        if loaded_embedding_mode == "provider" {
+            prewarm_query_embedding_runtime(&state, cfg.as_ref()).await;
+        }
+        let runtime = state.index_runtime.lock().await;
         let mut progress = state.index_progress.lock().await;
         progress.phase = "complete".to_string();
         progress.total = runtime.binaries.len() as u64;
@@ -8424,14 +8794,46 @@ async fn run_index_watch_loop(state: Arc<DaemonState>) -> Result<()> {
                         warn!("index watcher config channel closed");
                         break;
                     }
-                }
-                if let Err(e) = run_delta_indexing(&state, false).await {
-                    warn!("periodic delta indexing failed: {e:#}");
+                    maybe_run_background_delta_indexing(
+                        Arc::clone(&state),
+                        "watch path set update",
+                        std::time::Duration::ZERO,
+                    )
+                    .await;
                 }
             }
         }
     }
     Ok(())
+}
+
+async fn maybe_run_background_delta_indexing(
+    state: Arc<DaemonState>,
+    reason: &'static str,
+    min_interval: std::time::Duration,
+) {
+    if !state.config_snapshot().indexer.enabled {
+        return;
+    }
+    let now = std::time::Instant::now();
+    {
+        let mut last = state.last_background_delta_index_at.lock().await;
+        if min_interval > std::time::Duration::ZERO
+            && let Some(prev) = *last
+            && now.duration_since(prev) < min_interval
+        {
+            info!("skipping background delta indexing for {reason}: throttled");
+            return;
+        }
+        *last = Some(now);
+    }
+    let Ok(_index_write_guard) = state.index_write_lock.try_lock() else {
+        info!("skipping background delta indexing for {reason}: indexer busy");
+        return;
+    };
+    if let Err(e) = run_delta_indexing_inner(&state, false).await {
+        warn!("background delta indexing failed for {reason}: {e:#}");
+    }
 }
 
 async fn prioritize_index_targets(
@@ -8548,7 +8950,10 @@ async fn run_delta_indexing(state: &Arc<DaemonState>, force_full: bool) -> Resul
         return Ok(());
     }
     let _index_write_guard = state.index_write_lock.lock().await;
+    run_delta_indexing_inner(state, force_full).await
+}
 
+async fn run_delta_indexing_inner(state: &Arc<DaemonState>, force_full: bool) -> Result<()> {
     let cfg = state.config_snapshot();
     let path_dirs = collect_index_path_dirs(state).await;
     let path_union = path_dirs
@@ -8666,6 +9071,63 @@ async fn run_delta_indexing(state: &Arc<DaemonState>, force_full: bool) -> Resul
         .collect::<Vec<_>>();
     let tombstoned_count = tombstoned_chunks.len();
 
+    let reused_path_count = reused_chunks_by_path.len();
+    if !force_full && extract_targets.is_empty() && removed_count == 0 {
+        let runtime_empty = state.index_runtime.lock().await.chunks.is_empty();
+        if runtime_empty {
+            let embedding_mode = state
+                .index_store
+                .load_manifest()?
+                .map(|manifest| manifest.embedding_mode)
+                .unwrap_or_else(|| "disabled".to_string());
+            let mut chunks = Vec::new();
+            for bin in &binaries {
+                let path = bin.path.to_string_lossy().to_string();
+                if let Some(command_chunks) = reused_chunks_by_path.remove(&path) {
+                    chunks.extend(command_chunks);
+                }
+            }
+            if !chunks.is_empty() {
+                let indexed = binaries
+                    .iter()
+                    .map(|bin| IndexedBinary {
+                        name: bin.name.clone(),
+                        path: bin.path.to_string_lossy().to_string(),
+                        mtime_secs: bin.mtime_secs,
+                        size: bin.size,
+                        inode: bin.inode,
+                    })
+                    .collect::<Vec<_>>();
+                let mut runtime = state.index_runtime.lock().await;
+                runtime.retriever = build_retriever_for_chunks(
+                    &state.index_store,
+                    cfg.as_ref(),
+                    chunks.clone(),
+                    &embedding_mode,
+                );
+                runtime.chunks = chunks;
+                runtime.binaries = indexed;
+                runtime.uses_external_embeddings = embedding_mode == "provider";
+                runtime.revision = runtime.revision.saturating_add(1);
+            }
+            if embedding_mode == "provider" {
+                prewarm_query_embedding_runtime(state, cfg.as_ref()).await;
+            }
+        }
+        {
+            let mut progress = state.index_progress.lock().await;
+            progress.phase = "complete".to_string();
+            progress.scanned = progress.total;
+            progress.percent = 100.0;
+        }
+        *state.last_index_update.lock().await = IndexUpdateSummary::default();
+        info!(
+            "delta indexing skipped: no command-doc changes detected; reused={}",
+            reused_path_count
+        );
+        return Ok(());
+    }
+
     {
         let mut progress = state.index_progress.lock().await;
         progress.phase = "extract".to_string();
@@ -8710,6 +9172,9 @@ async fn run_delta_indexing(state: &Arc<DaemonState>, force_full: bool) -> Resul
     {
         let mut progress = state.index_progress.lock().await;
         progress.phase = "embed".to_string();
+        if progress.percent >= 99.9 {
+            progress.percent = 99.0;
+        }
     }
 
     let mut chunks = Vec::new();
@@ -10741,9 +11206,34 @@ mod tests {
             percent: 12.0,
             phase: "scan".to_string(),
         };
-        let msg = indexing_progress_banner(&progress).expect("banner");
+        let msg = indexing_progress_banner(&progress, false).expect("banner");
         assert!(msg.contains("lookup_command_docs(name)"));
         assert!(msg.contains("12 commands available so far"));
+    }
+
+    #[test]
+    fn indexing_progress_banner_suppresses_completed_refresh_when_index_loaded() {
+        let progress = IndexProgress {
+            scanned: 100,
+            total: 100,
+            percent: 100.0,
+            phase: "embed".to_string(),
+        };
+        assert!(indexing_progress_banner(&progress, true).is_none());
+        assert!(indexing_progress_banner(&progress, false).is_some());
+    }
+
+    #[test]
+    fn indexing_progress_banner_does_not_claim_embed_phase_is_complete() {
+        let progress = IndexProgress {
+            scanned: 100,
+            total: 100,
+            percent: 100.0,
+            phase: "embed".to_string(),
+        };
+        let msg = indexing_progress_banner(&progress, false).expect("banner");
+        assert!(msg.contains("99.0% complete"));
+        assert!(!msg.contains("100.0% complete"));
     }
 
     #[test]
@@ -11191,6 +11681,52 @@ mod tests {
         let summary = summarize_validation_findings(&findings);
         assert!(summary.contains("unknown_command: foo not found"));
         assert!(summary.contains("unsupported_flag: --bad not in docs"));
+    }
+
+    #[test]
+    fn validation_findings_trigger_web_fallback_for_insufficient_grounding() {
+        let findings = vec![planning::ValidationFinding {
+            kind: "missing_grounding".to_string(),
+            detail: "proposal has no local grounding evidence".to_string(),
+        }];
+        assert!(validation_findings_need_web_fallback(&findings));
+
+        let findings = vec![planning::ValidationFinding {
+            kind: "parse_ambiguous".to_string(),
+            detail: "ambiguous shell parse".to_string(),
+        }];
+        assert!(!validation_findings_need_web_fallback(&findings));
+    }
+
+    #[test]
+    fn readonly_tool_continuation_prompt_guides_web_fallback() {
+        let prompt = readonly_tool_continuation_prompt(true);
+        assert!(prompt.contains("web_search/web_read"));
+        assert!(prompt.contains("execute_shell_command"));
+
+        let local_only = readonly_tool_continuation_prompt(false);
+        assert!(!local_only.contains("web_search/web_read"));
+        assert!(local_only.contains("execute_shell_command"));
+    }
+
+    #[test]
+    fn retrieved_docs_block_includes_command_text_and_source() {
+        let chunk = RetrievedChunk {
+            command_name: "find".to_string(),
+            section_name: "OPTIONS".to_string(),
+            path: "/usr/share/man/man1/find.1".to_string(),
+            extraction_method: "man".to_string(),
+            chunk_index: 0,
+            total_chunks: 1,
+            doc_hash: "abc123".to_string(),
+            extracted_at: chrono::Utc::now(),
+            text: "Use -name to match filenames.".to_string(),
+        };
+        let block = format_retrieved_docs_block(&[chunk]);
+        assert!(block.contains("## Relevant local command docs"));
+        assert!(block.contains("### find / OPTIONS"));
+        assert!(block.contains("source: /usr/share/man/man1/find.1"));
+        assert!(block.contains("Use -name"));
     }
 
     #[test]

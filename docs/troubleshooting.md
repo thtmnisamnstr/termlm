@@ -122,9 +122,11 @@ Symptoms:
 Actions:
 
 ```bash
-termlm reindex --mode full
+termlm reindex --mode delta
 termlm reindex --mode compact
 ```
+
+Use `termlm reindex --mode full` only when the index is incompatible or corrupt and delta/compact do not repair it.
 
 ## Ollama endpoint issues
 

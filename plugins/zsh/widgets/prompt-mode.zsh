@@ -122,6 +122,8 @@ termlm-exit-session-mode() {
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  _TERMLM_OUTPUT_STARTED=0
+  _TERMLM_OUTPUT_NEEDS_NEWLINE=0
   termlm-exit-prompt-mode
 }
 

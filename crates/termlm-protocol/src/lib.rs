@@ -386,6 +386,8 @@ pub enum ServerMessage {
         last_task_source_ledger: Vec<StatusSourceRef>,
         #[serde(default)]
         stage_timings_ms: BTreeMap<String, u64>,
+        #[serde(default)]
+        index_chunk_count: u64,
         index_progress: IndexProgress,
         web: WebStatus,
     },

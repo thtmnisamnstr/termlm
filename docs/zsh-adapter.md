@@ -7,6 +7,7 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 - `termlm.plugin.zsh`: bootstrap, state init, widget registration, hooks, shell registration
 - `widgets/self-insert.zsh`: `?` sigil entry handling
 - `widgets/accept-line.zsh`: `/p`, `/q`, prompt submit, implicit abort flow
+- `widgets/escape.zsh`: prompt/session cancellation with `Esc`
 - `widgets/prompt-mode.zsh`: indicator rendering, prompt/session mode transitions
 - `widgets/approval.zsh`: `y/n/e/a` command approval UX
 - `widgets/safety-floor.zsh`: duplicate immutable adapter-side safety floor
@@ -19,6 +20,7 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 
 - Typing `?` at an empty prompt enters prompt mode.
 - `/p` enters session mode; `/q` exits session mode.
+- `Esc` cancels prompt mode, in-flight model output, clarification, approval, or session mode.
 - `\?` is treated as a literal character (no mode switch).
 - `Ctrl-D` exits session mode when buffer is empty.
 - While waiting on model output, typing a plausible shell command and pressing Enter triggers task abort and returns command control to the shell.

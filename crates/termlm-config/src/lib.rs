@@ -195,6 +195,7 @@ pub struct IndexerConfig {
     pub command_aware_top_k: usize,
     pub validate_command_flags: bool,
     pub embedding_provider: String,
+    pub query_embedding_timeout_secs: u64,
     pub embed_filename: String,
     pub embed_dim: usize,
     pub embed_query_prefix: String,
@@ -546,6 +547,7 @@ impl Default for IndexerConfig {
             command_aware_top_k: 8,
             validate_command_flags: true,
             embedding_provider: "local".to_string(),
+            query_embedding_timeout_secs: 4,
             embed_filename: "bge-small-en-v1.5.Q4_K_M.gguf".to_string(),
             embed_dim: 384,
             embed_query_prefix: "Represent this sentence for searching relevant passages: "
@@ -999,6 +1001,14 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
         .into());
     }
 
+    if cfg.indexer.query_embedding_timeout_secs == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "indexer.query_embedding_timeout_secs",
+            reason: "must be >= 1".to_string(),
+        }
+        .into());
+    }
+
     if !matches!(cfg.indexer.lexical_index_impl.as_str(), "embedded") {
         return Err(ConfigError::InvalidEnum {
             field: "indexer.lexical_index_impl",
@@ -1092,6 +1102,28 @@ mod tests {
     }
 
     #[test]
+    fn defaults_enable_web_tools_without_user_config() {
+        let cfg = AppConfig::default();
+        assert!(cfg.web.enabled);
+        assert!(cfg.web.expose_tools);
+        assert_eq!(cfg.web.provider, "duckduckgo_html");
+        validate(&cfg).expect("default web config is valid");
+    }
+
+    #[test]
+    fn missing_web_section_still_defaults_to_enabled() {
+        let raw = r#"
+[approval]
+mode = "manual"
+"#;
+        let cfg: AppConfig = toml::from_str(raw).expect("parse partial config");
+        assert!(cfg.web.enabled);
+        assert!(cfg.web.expose_tools);
+        assert_eq!(cfg.web.provider, "duckduckgo_html");
+        validate(&cfg).expect("partial config with default web is valid");
+    }
+
+    #[test]
     fn restart_required_key_classification() {
         assert!(matches!(
             reload_class_for_key("inference.provider"),
@@ -1164,6 +1196,7 @@ section_boost_options = 0.25
 command_aware_retrieval = true
 command_aware_top_k = 8
 validate_command_flags = true
+query_embedding_timeout_secs = 4
 
 [terminal_context]
 recent_context_max_tokens = 6000

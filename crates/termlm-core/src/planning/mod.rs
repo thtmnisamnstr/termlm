@@ -106,7 +106,7 @@ pub fn validate_round(
     let c = cmd.to_ascii_lowercase();
     if (p.contains("modified") || p.contains("mtime") || p.contains("sorted"))
         && c.starts_with("ls ")
-        && !(c.contains("-t") || c.contains("--sort"))
+        && !command_has_flag(cmd, 't', "--sort")
     {
         findings.push(ValidationFinding {
             kind: "insufficient_for_prompt".to_string(),
@@ -143,6 +143,13 @@ fn extract_flags(command: &str) -> Vec<String> {
     flags
 }
 
+fn command_has_flag(command: &str, short: char, long: &str) -> bool {
+    let short = format!("-{short}");
+    extract_flags(command)
+        .iter()
+        .any(|flag| flag == &short || flag == long)
+}
+
 pub fn revise_command(
     command: &str,
     prompt: &str,
@@ -168,11 +175,11 @@ pub fn revise_command(
                 let p = prompt.to_ascii_lowercase();
                 if revised.starts_with("ls ") {
                     if (p.contains("modified") || p.contains("mtime") || p.contains("sorted"))
-                        && !revised.contains("-t")
+                        && !command_has_flag(&revised, 't', "--sort")
                     {
                         revised = ensure_compound_short_flag(&revised, 't');
                     }
-                    if p.contains("all") && !revised.contains("-a") {
+                    if p.contains("all") && !command_has_flag(&revised, 'a', "--all") {
                         revised = ensure_compound_short_flag(&revised, 'a');
                     }
                 }
@@ -305,6 +312,39 @@ mod tests {
         );
         assert!(findings.iter().any(|f| f.kind == "parse_ambiguous"));
         assert!(findings.iter().any(|f| f.kind == "parse_ambiguous_risky"));
+    }
+
+    #[test]
+    fn validate_sort_request_accepts_compound_ls_time_flag() {
+        let proposal = GroundedProposal {
+            command: "ls -lt".to_string(),
+            intent: "list newest files".to_string(),
+            expected_effect: "show files by modification time".to_string(),
+            commands_used: vec!["ls".to_string()],
+            risk_level: "read_only".to_string(),
+            destructive: false,
+            requires_approval: true,
+            grounding: vec!["docs#ls".to_string()],
+            validation: Vec::new(),
+        };
+        let findings = validate_round(
+            &proposal,
+            &ValidationContext {
+                prompt: "show files sorted newest first".to_string(),
+                command_exists: true,
+                docs_excerpt: "ls -l -t --sort".to_string(),
+                validate_command_flags: true,
+                parse_ambiguous: false,
+                parse_warnings: Vec::new(),
+                parse_risky_constructs: false,
+            },
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.kind == "insufficient_for_prompt"),
+            "{findings:?}"
+        );
     }
 
     #[test]

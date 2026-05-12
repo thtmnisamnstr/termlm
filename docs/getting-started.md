@@ -28,6 +28,7 @@ Install notes:
 - readiness and model-chunk download phases emit periodic progress lines
 - first install can take several minutes depending on model/index state
 - a clean install downloads local model assets and builds both vector and lexical command-doc indexes
+- web search/read is available by default through DuckDuckGo HTML search and does not need an API key
 
 Manual install is documented in [release-upgrades.md](release-upgrades.md).
 
@@ -59,6 +60,7 @@ At an empty prompt:
 - `?` enters one-shot prompt mode
 - `/p` enters session mode
 - `/q` exits session mode
+- `Esc` cancels a prompt, response, clarification, approval, or session and returns to normal zsh
 - clarification questions are answered at the `? ` prompt; `/p` stays in session until `/q`
 
 Approval keys for proposed commands:

@@ -8,6 +8,7 @@ WIDGET_SELF_INSERT="${ROOT_DIR}/plugins/zsh/widgets/self-insert.zsh"
 WIDGET_ACCEPT_LINE="${ROOT_DIR}/plugins/zsh/widgets/accept-line.zsh"
 WIDGET_APPROVAL="${ROOT_DIR}/plugins/zsh/widgets/approval.zsh"
 WIDGET_SAFETY="${ROOT_DIR}/plugins/zsh/widgets/safety-floor.zsh"
+WIDGET_ESCAPE="${ROOT_DIR}/plugins/zsh/widgets/escape.zsh"
 LIB_CAPTURE="${ROOT_DIR}/plugins/zsh/lib/capture.zsh"
 LIB_IPC="${ROOT_DIR}/plugins/zsh/lib/ipc.zsh"
 LIB_OBSERVER="${ROOT_DIR}/plugins/zsh/lib/terminal-observer.zsh"
@@ -55,6 +56,7 @@ require_file "$WIDGET_SELF_INSERT"
 require_file "$WIDGET_ACCEPT_LINE"
 require_file "$WIDGET_APPROVAL"
 require_file "$WIDGET_SAFETY"
+require_file "$WIDGET_ESCAPE"
 require_file "$LIB_CAPTURE"
 require_file "$LIB_IPC"
 require_file "$LIB_OBSERVER"
@@ -65,9 +67,14 @@ echo "checking widget registration contract..."
 require_pattern "$PLUGIN_MAIN" 'zle -N self-insert termlm-self-insert' "self-insert wrapper must be installed"
 require_pattern "$PLUGIN_MAIN" 'zle -N accept-line termlm-accept-line' "accept-line wrapper must be installed"
 require_pattern "$PLUGIN_MAIN" 'zle -N zle-line-pre-redraw termlm-line-pre-redraw' "prompt redraw hook must be installed"
+require_pattern "$PLUGIN_MAIN" 'zle -N termlm-cancel-prompt' "escape cancellation widget must be installed"
+require_pattern "$PLUGIN_MAIN" '_TERMLM_PLUGIN_LOADED_FOR_PID' "plugin load guard must be scoped to the current shell process"
 require_pattern "$PLUGIN_MAIN" 'autoload -Uz add-zsh-hook' "plugin must autoload add-zsh-hook for clean zsh environments"
 require_pattern "$PLUGIN_MAIN" 'add-zsh-hook preexec termlm-preexec' "preexec observer hook must be installed"
 require_pattern "$PLUGIN_MAIN" 'add-zsh-hook precmd termlm-precmd' "precmd capture/ack hook must be installed"
+if rg -q --fixed-strings -- 'export _TERMLM_PLUGIN_LOADED=1' "$PLUGIN_MAIN"; then
+  fail "plugin load guard must not be exported into child zsh sessions"
+fi
 
 echo "checking prompt entry/exit behavior..."
 # shellcheck disable=SC2016
@@ -79,6 +86,10 @@ require_literal "$WIDGET_ACCEPT_LINE" "\"\$BUFFER\" =~ '^/p[[:space:]]*$'" "acce
 require_literal "$WIDGET_ACCEPT_LINE" "\"\$BUFFER\" =~ '^/q[[:space:]]*$'" "accept-line must intercept /q"
 require_pattern "$WIDGET_ACCEPT_LINE" 'termlm-abandon-active-task' "accept-line must abort pending task on implicit command"
 require_pattern "$WIDGET_ACCEPT_LINE" '_TERMLM_CLARIFICATION_TASK_ID' "accept-line must route clarification replies through the prompt"
+require_literal "$PLUGIN_MAIN" "bindkey -M termlm-prompt $'\\e' termlm-cancel-prompt" "escape must leave prompt/session keymap"
+# shellcheck disable=SC2016
+require_pattern "$WIDGET_ESCAPE" 'termlm-send-decision "\$task_id" --decision abort' "escape must abort an active task"
+require_pattern "$LIB_IPC" 'termlm-is-closed-task-event' "adapter must ignore late events for cancelled tasks"
 if rg -q --fixed-strings -- 'vared -p' "$LIB_IPC"; then
   fail "adapter must not invoke vared from async ZLE event handlers"
 fi

@@ -248,6 +248,20 @@ patched = patched.replace(
     'if [[ "$phase_complete" -eq 1 && "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 ]]; then',
     'if [[ "$manifest_chunk_count" =~ ^[0-9]+$ && "$manifest_chunk_count" -gt 0 && -s "$(dirname "$index_manifest_path")/vectors.f16" && -s "$(dirname "$index_manifest_path")/lexicon.bin" && -s "$(dirname "$index_manifest_path")/postings.bin" ]]; then',
 )
+patched = patched.replace(
+    '''  local reindex_mode="delta"
+  local reindex_requested=0
+  if [[ ! -f "$index_manifest_path" ]]; then
+    reindex_mode="full"
+  fi
+''',
+    '''  local reindex_requested=0
+''',
+)
+patched = patched.replace(
+    'trigger_reindex_with_timeout "$reindex_mode"',
+    'trigger_reindex_with_timeout "delta"',
+)
 
 if patched != original:
     path.write_text(patched, encoding="utf-8")

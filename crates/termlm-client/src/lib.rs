@@ -458,6 +458,7 @@ pub async fn run() -> Result<()> {
                         last_task_source_refs,
                         last_task_source_ledger,
                         stage_timings_ms,
+                        index_chunk_count,
                         active_shells,
                         active_tasks,
                         index_progress,
@@ -503,6 +504,7 @@ pub async fn run() -> Result<()> {
                             "index_progress: phase={} percent={:.1}",
                             index_progress.phase, index_progress.percent
                         );
+                        println!("index_chunk_count: {index_chunk_count}");
                         println!("web: enabled={} provider={}", web.enabled, web.provider);
                         if verbose && !last_task_source_ledger.is_empty() {
                             println!("last_task_source_ledger:");

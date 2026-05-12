@@ -33,6 +33,7 @@ Good first prompts:
 ```
 
 For a longer back-and-forth, enter session mode with `/p` and leave it with `/q`.
+`Esc` cancels the current prompt or response and returns you to the normal zsh prompt.
 
 ## Why Use It
 
@@ -89,6 +90,7 @@ At an empty zsh prompt:
 | `?` | One-shot prompt mode |
 | `/p` | Session mode for follow-up prompts |
 | `/q` | Exit session mode |
+| `Esc` | Cancel the current prompt/response or leave session mode |
 
 Approval controls:
 
@@ -109,7 +111,7 @@ termlm reload-config
 termlm stop
 ```
 
-Use `termlm reindex --mode full` after major PATH/tooling changes, or `termlm reindex --mode compact` to rebuild and compact index files.
+Use `termlm reindex --mode delta` for normal PATH/tooling changes. `full` is a heavier repair option for incompatible or corrupt index state; `compact` rewrites index files to remove tombstones.
 
 ## How It Works
 
@@ -127,7 +129,7 @@ Default behavior is local-first:
 - local generation model: bundled Gemma GGUF asset
 - local embedding model: bundled BGE-small GGUF asset
 - no telemetry
-- web tools are controlled by config and used only for web/current-information tasks
+- web search/read are enabled out of the box with the no-token DuckDuckGo HTML provider, used for current information and as a fallback when local command docs are missing or insufficient
 
 Optional Ollama generation is available by setting:
 

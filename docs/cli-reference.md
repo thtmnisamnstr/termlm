@@ -41,8 +41,8 @@ Connectivity smoke check to daemon socket.
 
 Indexer maintenance command.
 
-- `delta`: incremental update
-- `full`: full rebuild
+- `delta`: incremental update; use this for normal PATH/tooling changes
+- `full`: full rebuild; reserve for incompatible or corrupt index state
 - `compact`: tombstone/stale-fragment compaction
 
 Compat flags are accepted:

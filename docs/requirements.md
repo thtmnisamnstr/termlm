@@ -20,7 +20,7 @@ The zsh adapter captures the request and sends it to `termlm-core` over a Unix d
 
 The product ships with a bundled local LLM path by default: Google Gemma 4 E4B in GGUF format, downloaded by default on first install/first run unless already present, running through `llama.cpp` via Rust bindings on Apple Silicon Metal. Gemma 4 E2B is available as an optional lower-resource model but is not downloaded by default. Users MAY instead point `termlm` at an Ollama-compatible endpoint. The generative provider is exclusive: when `[inference] provider = "ollama"`, the bundled Gemma generative model MUST NOT load. The Ollama path is an inference-provider swap only: `termlm-core` still owns the live index, hybrid retrieval, hallucination blocking, planning/validation loops, safety floor, approval prompts, terminal context, command output capture, and shell execution path.
 
-`termlm` also supports an HTTP-first web layer for current public information. Web tools are enabled by default because users expect an LLM assistant to be able to search and read the web, but the orchestrator MUST use them only when task routing says web is needed. The default no-token search provider is DuckDuckGo non-JavaScript HTML/Lite result parsing (`duckduckgo_html`), with a pluggable provider interface for custom or token-based providers. Dynamic page rendering, JavaScript execution, crawling, autonomous page automation, and headless browsers are not part of v5. The web layer is lower-trust and lower-priority than terminal context, local files, Git/project metadata, and installed-command docs for local shell tasks.
+`termlm` also supports an HTTP-first web layer for current public information and command grounding when local sources are insufficient. Web tools are enabled by default because users expect an LLM assistant to be able to search and read the web, but the orchestrator MUST prefer local context first and invoke web only for explicit current/external-information needs, online docs/releases/packages/APIs/errors, URLs, or local command-doc/retrieval gaps. The default no-token search provider is DuckDuckGo non-JavaScript HTML/Lite result parsing (`duckduckgo_html`), with a pluggable provider interface for custom or token-based providers. Dynamic page rendering, JavaScript execution, crawling, autonomous page automation, and headless browsers are not part of v5. The web layer is lower-trust and lower-priority than terminal context, local files, Git/project metadata, and installed-command docs for local shell tasks.
 
 The default runtime posture is **performance-first**: components needed for common interactive tasks are loaded, memory-mapped, or warmed at daemon startup/background time rather than deferred onto the user's first prompt. Lower-footprint `balanced` and `eco` profiles may reduce memory and concurrency, but the default MUST prioritize responsiveness.
 
@@ -218,7 +218,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   healthcheck_on_start     = true
 
   [web]
-  enabled                  = true           # web tools are available by default, but used only when task routing requires them
+  enabled                  = true           # web tools are available by default; local context is preferred before web fallback
   expose_tools             = true           # expose web_search/web_read to the model when enabled
   provider                 = "duckduckgo_html" # "duckduckgo_html" | "custom_json" | "brave" | "kagi" | "tavily" | "whoogle" | "none"
   search_endpoint          = ""             # optional provider-specific/custom endpoint; empty uses provider default
@@ -554,7 +554,7 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   1. For every created or modified path: re-run extraction → re-chunk → re-embed → update index entries; emit one `IndexUpdate{added:[…], updated:[…], removed:[…]}` log line at `INFO`.
   2. For every removed path: drop the entry, mark its chunk rows as tombstoned in `chunks.bin` (don't compact in place).
   3. Persist updated index to disk with a coalesced write (max one disk write per 30 s; in-memory state is always current).
-  4. Tombstoned rows are physically reclaimed during a clean shutdown compaction or on `termlm reindex --compact`.
+  4. Tombstoned rows are physically reclaimed on `termlm reindex --compact`.
 - **FR‑65 — Manual reindex command.** `termlm reindex` MUST trigger a delta scan (FR‑54). `termlm reindex --full` wipes the on-disk index first. `termlm reindex --compact` rebuilds the vector store and `chunks.bin` to remove tombstones without re-extraction.
 - **FR‑66 — Stale-entry pruning at boot.** If the indexer's delta scan detects that an indexed binary's path no longer exists on disk, that binary MUST be removed from the index before any task is served.
 - **FR‑67 — Indexing progress, priority, and partial availability.** The indexer MUST NOT block daemon startup. In the default `performance` profile, the indexer MUST use a priority queue so high-value docs become useful first: zsh built-ins/reserved words, aliases/functions, commands in the static cheat sheet, recently observed commands, commands named in the current prompt, earlier `$PATH` entries, Homebrew/common developer tools, then the rest of `$PATH`. The daemon accepts and serves tasks while the initial scan is in progress, with these rules:
@@ -721,7 +721,7 @@ These tools are enabled by default because they are core to making `termlm` grou
 ### 2.18 Dynamic Tool Routing, Context Budgets, Caching, Source Ledger, and Performance Posture
 
 - **FR‑149 — Enabled by default vs exposed to the model:** All core tools are enabled by default, but the daemon MUST dynamically expose only the tools relevant to the current task classification. "Enabled" means the router may use the tool; it does not mean every tool schema is injected into every model request. Dynamic exposure reduces prompt size, tool confusion, and provider latency without disabling functionality.
-- **FR‑150 — Tool exposure profiles by task type:** The context classifier MUST map each task to a tool-exposure set. Fresh command requests usually expose `execute_shell_command` and `lookup_command_docs` and MAY expose local metadata tools; diagnostic/debugging tasks expose terminal context, file search/read, Git/project metadata, docs lookup, and command execution; current/external-information tasks expose web tools; documentation questions expose local docs first and web only when the user asks for latest/external docs or installed docs are insufficient.
+- **FR‑150 — Tool exposure profiles by task type:** The context classifier MUST map each task to a tool-exposure set. Fresh command requests expose `execute_shell_command`, `lookup_command_docs`, and bounded web fallback while still preferring local command docs/retrieval; diagnostic/debugging tasks expose terminal context, file search/read, Git/project metadata, docs lookup, command execution, and web fallback when local sources are insufficient; current/external-information tasks expose web tools; documentation questions expose local docs first and web only when the user asks for latest/external docs or installed docs are insufficient.
 - **FR‑151 — Context budget manager:** Prompt assembly MUST use a deterministic context budget manager. It MUST always include the current user question, reserve response tokens, and then allocate budget by task type. When trimming is necessary, it MUST trim lower-priority and older context before high-priority evidence. It MUST never drop the most recent relevant failed command/output pair for diagnostic tasks unless even a redacted/truncated excerpt would exceed hard provider limits.
 - **FR‑152 — Local-first trust order invariant:** For local shell tasks, termlm MUST prefer evidence in this order: current user question; recent terminal context when relevant; local files/workspace/project metadata/Git context; installed command docs from the local index; web sources; general model knowledge. For explicitly current/external questions, web may move above local docs, but web MUST NOT override concrete local terminal output, local file contents, Git state, or installed-tool docs for local behavior unless the user asks to compare against upstream/latest information.
 - **FR‑153 — Terminal output compression:** Terminal context injection MUST prefer compact, high-signal excerpts over raw logs. For each observed command, store command, cwd, timestamp, exit code, duration, stdout/stderr head, stdout/stderr tail, detected error lines, detected paths, detected URLs, detected command names, redaction status, truncation status, output capture status, and a full-output reference if retained. Prompt injection SHOULD order diagnostic excerpts as detected error lines first, then stderr tail, then stdout tail, then a short head only when useful.
@@ -1208,7 +1208,7 @@ Model-facing tools available to every provider, subject to config gating:
   },
   {
     "name": "web_search",
-    "description": "Search public web sources for current information when task routing says web is needed. Default provider is keyless DuckDuckGo HTML/Lite parsing; results are source-tracked metadata, not full pages.",
+    "description": "Search public web sources for current information or command/documentation grounding when local sources are insufficient. Default provider is keyless DuckDuckGo HTML/Lite parsing; results are source-tracked metadata, not full pages.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1234,7 +1234,7 @@ Model-facing tools available to every provider, subject to config gating:
 ]
 ```
 
-Read-only local grounding tools are exposed by default when `[local_tools].enabled = true`. `web_search` and `web_read` are exposed by default when `[web].enabled = true` and `[web].expose_tools = true`, but the orchestrator MUST use them only when task routing says web is needed. If web is disabled, web tools MUST be omitted from the provider tool list.
+Read-only local grounding tools are exposed by default when `[local_tools].enabled = true`. `web_search` and `web_read` are exposed by default when `[web].enabled = true` and `[web].expose_tools = true`, but the orchestrator MUST prefer local context first and use web for explicit current/external-information needs, URLs, online docs/releases/packages/APIs/errors, or local command-doc/retrieval gaps. If web is disabled, web tools MUST be omitted from the provider tool list.
 
 
 ## 6. Implementation Plan
@@ -1337,7 +1337,7 @@ Read-only local grounding tools are exposed by default when `[local_tools].enabl
 - `crates/termlm-inference/src/tool_schema.rs` web-tool exposure gating
 
 **Exit criteria:**
-- With default config, web tools are exposed but only invoked when task routing says web is needed; with `[web].enabled = false`, no web tools are exposed and no web/network calls are possible through the web layer.
+- With default config, web tools are exposed but local context remains first priority; web is invoked for explicit current/external-information needs, URLs, online docs/releases/packages/APIs/errors, or local command-doc/retrieval gaps. With `[web].enabled = false`, no web tools are exposed and no web/network calls are possible through the web layer.
 - With mocked providers/local test servers, `web_search` returns source-tracked results and `web_read` returns readable extracted Markdown.
 - Extraction fixtures drop embedded images, preserve code blocks, keep small tables, strip tracking parameters, and enforce HTML/Markdown size caps.
 - SSRF tests reject local/private/metadata IPs and unsafe schemes by default.
@@ -1535,7 +1535,7 @@ Default CI MUST NOT make real public-network calls. Web tests use mocked provide
 - `local_tools/workspace.rs`: detects project/workspace roots, supports bounded ad hoc non-programming workspaces, and refuses system/global directories such as `/usr/bin` without explicit opt-in.
 - `local_tools/git_context.rs`: returns branch, changed files, conflicts, stash count, recent commits, and bounded diff summaries from temp repos.
 - `local_tools/project_metadata.rs`: detects scripts/tasks/package managers/build/test metadata from bounded fixture projects.
-- Orchestrator tests: web tools are used for current/web prompts, skipped for fresh local shell tasks, local read-only tools are preferred before shell execution where sufficient, and web context is injected as `## Web results` rather than `## Relevant documentation`.
+- Orchestrator tests: web tools are used for current/web prompts and as fallback when local command docs/retrieval are insufficient; local read-only tools are preferred before shell execution where sufficient; web context is source-labeled separately from local documentation.
 - Privacy/logging tests: raw web queries, fetched page text, extracted content, file contents, search match text, Git diffs, and terminal outputs are absent from `info` logs.
 
 ### 7.12 Indexer and Hallucination-Resistance Tests
@@ -1613,7 +1613,7 @@ Append to `tests/manual/zle-checklist.md`:
 
 - Verify `performance` is the default profile and that core warmup occurs before first interactive task where feasible.
 - Verify `balanced` and `eco` adjust budgets/concurrency/cache warmth without disabling tools.
-- Verify dynamic tool exposure: fresh command prompts do not expose all local/web tools; diagnostic prompts expose terminal/file/Git/project tools; current-information prompts expose web tools.
+- Verify dynamic tool exposure: fresh command prompts expose execution, docs lookup, and bounded web fallback without exposing all diagnostic local tools; diagnostic prompts expose terminal/file/Git/project tools; current-information prompts expose web tools.
 - Verify context budget determinism and trimming order for diagnostic, fresh-command, documentation, and web-current-info tasks.
 - Verify most recent failed command/output is preserved for diagnostic tasks under budget pressure.
 - Verify f16 vector store loads, retrieves, and passes quality thresholds relative to f32 fixture baselines.
@@ -1796,8 +1796,8 @@ Available tools for this task (dynamically selected by the daemon):
 - list_workspace_files(root?): return a compact filtered workspace tree/summary.
 - project_metadata(root?): summarize languages, package managers, scripts/tasks, build/test commands, manifests, Docker/CI/config files.
 - git_context(root?): return structured read-only Git state.
-- web_search(query, freshness?, max_results?): search configured public web sources for current information only when task routing says web is needed.
-- web_read(url, max_bytes?): fetch and extract source-tracked Markdown from an HTTP(S) URL only when task routing says web is needed.
+- web_search(query, freshness?, max_results?): search configured public web sources for current information, external docs, or fallback grounding when local sources are insufficient.
+- web_read(url, max_bytes?): fetch and extract source-tracked Markdown from an HTTP(S) URL when the user provides a URL or web search/read is needed for fallback grounding.
 
 {indexing_progress_note}
 

@@ -108,6 +108,7 @@ Readiness failure diagnostics:
 - installer prints the last observed `termlm status --verbose` payload when available
 - installer tails daemon logs on failure
 - repeated `status --verbose` timeouts fail fast with diagnostics instead of waiting silently
+- installer readiness failures stop the daemon instance started for bootstrap and remove temporary bootstrap config files
 
 For first-time installs, repository bootstrap helper:
 
