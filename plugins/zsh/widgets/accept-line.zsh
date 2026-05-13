@@ -57,6 +57,7 @@ termlm-accept-line() {
         return
       fi
       _TERMLM_WAITING_MODEL=1
+      termlm-show-task-status "termlm: thinking..."
       zle reset-prompt
       return
     fi

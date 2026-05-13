@@ -131,7 +131,9 @@ fn extract_flags(command: &str) -> Vec<String> {
             if token.chars().nth(1) == Some('-') {
                 continue;
             }
-            if token.len() > 2 && !token.contains('=') {
+            if is_single_dash_word_option(token) {
+                flags.push(token.to_string());
+            } else if token.len() > 2 && !token.contains('=') {
                 for ch in token[1..].chars() {
                     flags.push(format!("-{ch}"));
                 }
@@ -141,6 +143,33 @@ fn extract_flags(command: &str) -> Vec<String> {
         }
     }
     flags
+}
+
+fn is_single_dash_word_option(token: &str) -> bool {
+    matches!(
+        token,
+        "-maxdepth"
+            | "-mindepth"
+            | "-type"
+            | "-name"
+            | "-iname"
+            | "-regex"
+            | "-iregex"
+            | "-exec"
+            | "-path"
+            | "-prune"
+            | "-print"
+            | "-print0"
+            | "-mtime"
+            | "-mmin"
+            | "-size"
+            | "-empty"
+            | "-newer"
+            | "-perm"
+            | "-user"
+            | "-group"
+            | "-delete"
+    )
 }
 
 fn command_has_flag(command: &str, short: char, long: &str) -> bool {
@@ -343,6 +372,39 @@ mod tests {
             !findings
                 .iter()
                 .any(|finding| finding.kind == "insufficient_for_prompt"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_find_word_options_as_single_flags() {
+        let proposal = GroundedProposal {
+            command: "find $HOME/Downloads -maxdepth 1 -type f -print | wc -l".to_string(),
+            intent: "count files".to_string(),
+            expected_effect: "show count".to_string(),
+            commands_used: vec!["find".to_string(), "wc".to_string()],
+            risk_level: "read_only".to_string(),
+            destructive: false,
+            requires_approval: true,
+            grounding: vec!["docs#find".to_string()],
+            validation: Vec::new(),
+        };
+        let findings = validate_round(
+            &proposal,
+            &ValidationContext {
+                prompt: "how many files do I have in downloads".to_string(),
+                command_exists: true,
+                docs_excerpt: "find -maxdepth -type -print wc -l".to_string(),
+                validate_command_flags: true,
+                parse_ambiguous: false,
+                parse_warnings: Vec::new(),
+                parse_risky_constructs: false,
+            },
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.kind == "unsupported_flag"),
             "{findings:?}"
         );
     }

@@ -196,6 +196,15 @@ pub fn classify_prompt_with_freshness_terms(
     if [
         "what does",
         "explain",
+        "what is",
+        "what are",
+        "why is",
+        "why does",
+        "why did",
+        "should i",
+        "is it safe",
+        "best way",
+        "recommend",
         "documentation",
         "docs",
         "man page",
@@ -205,6 +214,8 @@ pub fn classify_prompt_with_freshness_terms(
         "option",
         "difference between",
         "how do i tell",
+        "what command",
+        "which command",
     ]
     .iter()
     .any(|k| p.contains(k))
@@ -234,6 +245,11 @@ pub fn classify_prompt_with_freshness_terms(
         "options",
         "which command",
         "what command",
+        "what version",
+        "where am i",
+        "what directory",
+        "how many",
+        "how much",
     ]
     .iter()
     .any(|k| p.contains(k))
@@ -275,6 +291,84 @@ pub fn classify_prompt_with_freshness_terms(
         classification,
         confidence,
     }
+}
+
+pub fn prompt_prefers_direct_answer(prompt: &str, classification: &TaskClassification) -> bool {
+    let trimmed = prompt.trim();
+    let p = trimmed.to_ascii_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    if prompt_requests_shell_action(&p) {
+        return false;
+    }
+    if matches!(
+        classification,
+        TaskClassification::DocumentationQuestion
+            | TaskClassification::WebCurrentInfoQuestion
+            | TaskClassification::DiagnosticDebugging
+    ) {
+        return true;
+    }
+    let starts_with_question = [
+        "what ", "what's ", "whats ", "why ", "how ", "where ", "which ", "should ", "can i ",
+        "is ", "are ", "does ", "do ",
+    ]
+    .iter()
+    .any(|prefix| p.starts_with(prefix));
+    starts_with_question
+        || trimmed.ends_with('?')
+        || [
+            "what command",
+            "which command",
+            "best way",
+            "recommend",
+            "what version",
+            "where am i",
+            "what directory",
+            "how many",
+            "how much",
+        ]
+        .iter()
+        .any(|needle| p.contains(needle))
+}
+
+fn prompt_requests_shell_action(p: &str) -> bool {
+    let action_verbs = [
+        "list",
+        "show",
+        "print",
+        "find",
+        "search",
+        "create",
+        "make",
+        "delete",
+        "remove",
+        "copy",
+        "move",
+        "rename",
+        "open",
+        "run",
+        "execute",
+        "install",
+        "uninstall",
+        "upgrade",
+        "compress",
+        "archive",
+        "extract",
+        "replace",
+        "change",
+        "edit",
+    ];
+    action_verbs
+        .iter()
+        .any(|verb| p == *verb || p.starts_with(&format!("{verb} ")))
+        || action_verbs.iter().any(|verb| {
+            p.starts_with(&format!("please {verb} "))
+                || p.starts_with(&format!("can you {verb} "))
+                || p.starts_with(&format!("could you {verb} "))
+                || p.starts_with(&format!("i want you to {verb} "))
+        })
 }
 
 pub fn extract_command_name_from_doc_prompt(prompt: &str) -> Option<String> {
@@ -1759,6 +1853,35 @@ mod tests {
             result.classification,
             TaskClassification::DocumentationQuestion
         ));
+    }
+
+    #[test]
+    fn direct_answer_preference_distinguishes_questions_from_actions() {
+        for prompt in [
+            "what command lists hidden files?",
+            "how do I check disk usage?",
+            "should I use rg or grep here?",
+            "what version of git do I have?",
+        ] {
+            let result = classify_prompt(prompt);
+            assert!(
+                prompt_prefers_direct_answer(prompt, &result.classification),
+                "prompt should prefer direct answer: {prompt}"
+            );
+        }
+
+        for prompt in [
+            "list hidden files in this directory",
+            "show my IP address",
+            "delete all .DS_Store files in this repo",
+            "copy images from Desktop into ~/Desktop/images",
+        ] {
+            let result = classify_prompt(prompt);
+            assert!(
+                !prompt_prefers_direct_answer(prompt, &result.classification),
+                "prompt should prefer command proposal: {prompt}"
+            );
+        }
     }
 
     #[test]

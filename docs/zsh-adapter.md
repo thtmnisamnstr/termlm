@@ -40,8 +40,10 @@ The v1 adapter is implemented in `plugins/zsh/` and is the only supported shell 
 
 Defaults:
 
-- prompt mode: `?> `
-- session mode: `?? `
+- prompt mode: blue `● ? `
+- session mode: `● /p `
+
+While a task is running, the adapter uses a transient `termlm: thinking...` ZLE status message and clears it as soon as output, clarification, approval, or completion arrives.
 
 Config source: `[prompt]` in `~/.config/termlm/config.toml`, with env overrides:
 

@@ -298,9 +298,9 @@ Trace files are a builder/debugging aid. They include raw prompt text and retrie
 
 ### `[prompt]`
 
-- `indicator`
-- `session_indicator`
-- `use_color`
+- `indicator` - prompt-mode indicator. Default: `● ? `
+- `session_indicator` - session-mode indicator. Default: `● /p `
+- `use_color` - colorize prompt indicators when the terminal supports it. Default: `true`
 
 ### `[session]`
 

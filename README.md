@@ -96,6 +96,8 @@ At an empty zsh prompt:
 | `/q` | Exit session mode |
 | `Esc` | Cancel the current prompt/response or leave session mode |
 
+Prompt mode uses a blue `● ?` indicator, and long-running responses show a short `termlm: thinking...` status so the shell does not look stuck.
+
 Approval controls:
 
 | Key | Action |
@@ -116,23 +118,6 @@ termlm stop
 ```
 
 Use `termlm reindex --mode delta` for normal PATH/tooling changes. `full` is a heavier repair option for incompatible or corrupt index state; `compact` rewrites index files to remove tombstones.
-
-Builder/debugging tools:
-
-```bash
-termlm retrieve --prompt "find large files in this directory" --top-k 8 --json
-```
-
-To inspect what hybrid retrieval found during real prompts, enable opt-in trace files in `~/.config/termlm/config.toml`:
-
-```toml
-[debug]
-retrieval_trace_enabled = true
-retrieval_trace_dir = "~/.local/state/termlm/retrieval-traces"
-retrieval_trace_max_files = 25
-```
-
-Then run `termlm reload-config`. New prompt traces will be written as JSON under `~/.local/state/termlm/retrieval-traces/`. Keep this off unless you are actively debugging retrieval; trace files include the raw prompt and retrieved snippets.
 
 ## How It Works
 

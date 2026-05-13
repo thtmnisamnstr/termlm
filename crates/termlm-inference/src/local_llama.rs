@@ -43,6 +43,8 @@ pub struct LocalLlamaProvider {
     embedding_runtime: Arc<Mutex<Option<Arc<LoadedEmbeddingRuntime>>>>,
     #[cfg(feature = "local-runtime")]
     embedding_request_lock: Arc<Mutex<()>>,
+    #[cfg(feature = "local-runtime")]
+    generation_request_lock: Arc<Mutex<()>>,
     cancel_flags: Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 
@@ -127,6 +129,8 @@ impl LocalLlamaProvider {
             embedding_runtime: Arc::new(Mutex::new(None)),
             #[cfg(feature = "local-runtime")]
             embedding_request_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "local-runtime")]
+            generation_request_lock: Arc::new(Mutex::new(())),
             cancel_flags: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -941,8 +945,15 @@ impl InferenceProvider for LocalLlamaProvider {
 
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<ProviderEvent>>(256);
             let cancel_map = self.cancel_flags.clone();
+            let generation_lock = self.generation_request_lock.clone();
 
             tokio::spawn(async move {
+                // Metal-backed llama.cpp contexts are not reliably happy with
+                // overlapping prompt decode/generation, especially when one
+                // stream has just been cancelled for early-stop. Serialize
+                // local generation so a fast prompt loop cannot corrupt the
+                // next request.
+                let _generation_guard = generation_lock.lock().await;
                 let tx_err = tx.clone();
                 let task = tokio::task::spawn_blocking(move || {
                     Self::run_generation_blocking(runtime, request, cancel_flag, tx)

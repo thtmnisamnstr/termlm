@@ -94,6 +94,7 @@ reset_state() {
   _TERMLM_OBS_SAVE_STDERR_FD=-1
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  _TERMLM_STATUS_MESSAGE_ACTIVE=0
 }
 
 typeset -g _ABANDON_COUNT=0
@@ -265,6 +266,11 @@ assert_eq "$_TERMLM_SESSION_MODE" "0" "escape should exit session mode"
 assert_eq "$_TERMLM_MODE" "normal" "escape should return to normal mode from session"
 
 reset_state
+termlm-load-prompt-settings
+assert_eq "$_TERMLM_PROMPT_INDICATOR" "● ? " "default prompt indicator should include the prompt dot"
+assert_eq "$(termlm-current-prompt-indicator)" "● ? " "non-tty tests should render prompt indicator as plain text"
+
+reset_state
 BUFFER="/p"
 termlm-accept-line
 assert_eq "$_TERMLM_SESSION_MODE" "1" "/p should enter session mode"
@@ -307,10 +313,12 @@ _TERMLM_MODE="prompt"
 _TEST_APPROVAL_DECISION="approved"
 termlm-handle-proposed-event "task-approved" "echo hi" "true"
 assert_eq "$_TERMLM_APPROVAL_TASK_ID" "task-approved" "proposed command should enter approval state"
+_ZLE_CALLS=()
 termlm-handle-approval-key "y"
 assert_eq "$_TERMLM_PENDING_TASK_ID" "task-approved" "approved command should set pending task id"
 assert_eq "$_TERMLM_PENDING_CMD" "echo hi" "approved command should set pending command"
 assert_eq "$BUFFER" "echo hi" "approved command should execute the visible command via BUFFER"
+assert_contains "${(j:|:)_ZLE_CALLS}" "reset-prompt" "approved command handoff should redraw once with the normal prompt"
 assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "approved command should execute with zle .accept-line"
 _ZLE_CALLS=()
 _TERMLM_ACKED_PENDING_TASK_ID="task-approved"
@@ -356,9 +364,11 @@ assert_eq "$_TERMLM_WAITING_MODEL" "1" "clarification reply should resume model 
 
 reset_state
 model_b64="$(encode_b64 "Note: indexing")"
+_TERMLM_STATUS_MESSAGE_ACTIVE=1
 termlm-handle-run-task-line "{\"event\":\"model_text\",\"task_id\":\"task-output\",\"chunk_b64\":\"${model_b64}\"}"
 assert_eq "$_TERMLM_OUTPUT_STARTED" "1" "model text should mark async output as started"
 assert_eq "$_TERMLM_OUTPUT_NEEDS_NEWLINE" "1" "model text without trailing newline should request newline before next event"
+assert_eq "$_TERMLM_STATUS_MESSAGE_ACTIVE" "0" "model text should clear the transient status message"
 question_b64="$(encode_b64 "Clarify this")"
 termlm-handle-run-task-line "{\"event\":\"needs_clarification\",\"task_id\":\"task-output\",\"question_b64\":\"${question_b64}\"}"
 assert_eq "$_TERMLM_OUTPUT_NEEDS_NEWLINE" "0" "clarification should finish the previous model text line"

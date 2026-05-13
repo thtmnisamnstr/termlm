@@ -554,6 +554,7 @@ termlm-report-daemon-died() {
 
 termlm-reset-after-connection-lost() {
   _TERMLM_WAITING_MODEL=0
+  termlm-clear-task-status
   termlm-mark-task-closed
   if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
     termlm-exit-prompt-mode
@@ -563,6 +564,7 @@ termlm-reset-after-connection-lost() {
 }
 
 termlm-mark-task-closed() {
+  termlm-clear-task-status
   local closed_task_id="${_TERMLM_TASK_ID:-${_TERMLM_APPROVAL_TASK_ID:-${_TERMLM_CLARIFICATION_TASK_ID:-}}}"
   if [[ -n "$closed_task_id" ]]; then
     _TERMLM_CLOSED_TASK_ID="$closed_task_id"
@@ -668,10 +670,25 @@ termlm-start-task() {
   _TERMLM_CLOSED_TASK_ID=""
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  termlm-show-task-status "termlm: thinking..."
   zle reset-prompt
 }
 
+termlm-show-task-status() {
+  local message="$1"
+  _TERMLM_STATUS_MESSAGE_ACTIVE=1
+  zle -M "$message" 2>/dev/null || true
+}
+
+termlm-clear-task-status() {
+  if [[ "${_TERMLM_STATUS_MESSAGE_ACTIVE:-0}" -eq 1 ]]; then
+    zle -M "" 2>/dev/null || true
+    _TERMLM_STATUS_MESSAGE_ACTIVE=0
+  fi
+}
+
 termlm-begin-async-output() {
+  termlm-clear-task-status
   zle -I 2>/dev/null || true
   if [[ "${_TERMLM_OUTPUT_STARTED:-0}" -eq 0 ]]; then
     print -r -- ""
@@ -905,13 +922,13 @@ termlm-run-approved-command() {
   fi
 
   if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-    termlm-exit-prompt-mode
-  else
-    zle reset-prompt
+    _TERMLM_MODE="normal"
+    PS1="${_TERMLM_SAVED_PS1:-$PS1}"
+    zle -K main
   fi
-
   BUFFER="$approved_cmd"
   CURSOR=${#BUFFER}
+  zle reset-prompt
   zle .accept-line
 }
 

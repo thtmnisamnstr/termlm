@@ -755,8 +755,8 @@ impl Default for DebugConfig {
 impl Default for PromptConfig {
     fn default() -> Self {
         Self {
-            indicator: "?> ".to_string(),
-            session_indicator: "?? ".to_string(),
+            indicator: "● ? ".to_string(),
+            session_indicator: "● /p ".to_string(),
             use_color: true,
         }
     }

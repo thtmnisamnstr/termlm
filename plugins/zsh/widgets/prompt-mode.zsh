@@ -1,5 +1,5 @@
-typeset -g _TERMLM_PROMPT_INDICATOR='?> '
-typeset -g _TERMLM_SESSION_INDICATOR='?? '
+typeset -g _TERMLM_PROMPT_INDICATOR='● ? '
+typeset -g _TERMLM_SESSION_INDICATOR='● /p '
 typeset -g _TERMLM_PROMPT_USE_COLOR=1
 
 termlm-indicator-color-active() {
@@ -22,7 +22,7 @@ termlm-render-indicator() {
 }
 
 termlm-current-prompt-indicator() {
-  termlm-render-indicator "$_TERMLM_PROMPT_INDICATOR" "cyan"
+  termlm-render-indicator "$_TERMLM_PROMPT_INDICATOR" "blue"
 }
 
 termlm-current-session-indicator() {
@@ -35,13 +35,13 @@ termlm-load-prompt-settings() {
   if [[ -n "${TERMLM_PROMPT_INDICATOR:-}" ]]; then
     _TERMLM_PROMPT_INDICATOR="${TERMLM_PROMPT_INDICATOR}"
   else
-    _TERMLM_PROMPT_INDICATOR='?> '
+    _TERMLM_PROMPT_INDICATOR='● ? '
   fi
 
   if [[ -n "${TERMLM_SESSION_INDICATOR:-}" ]]; then
     _TERMLM_SESSION_INDICATOR="${TERMLM_SESSION_INDICATOR}"
   else
-    _TERMLM_SESSION_INDICATOR='?? '
+    _TERMLM_SESSION_INDICATOR='● /p '
   fi
 
   if [[ -n "${TERMLM_PROMPT_USE_COLOR:-}" ]]; then
@@ -87,6 +87,13 @@ termlm-load-prompt-settings() {
       continue
     fi
   done < "$cfg"
+
+  if [[ -z "${TERMLM_PROMPT_INDICATOR:-}" && "$_TERMLM_PROMPT_INDICATOR" == '?> ' ]]; then
+    _TERMLM_PROMPT_INDICATOR='● ? '
+  fi
+  if [[ -z "${TERMLM_SESSION_INDICATOR:-}" && "$_TERMLM_SESSION_INDICATOR" == '?? ' ]]; then
+    _TERMLM_SESSION_INDICATOR='● /p '
+  fi
 }
 
 termlm-enter-prompt-mode() {
@@ -99,10 +106,13 @@ termlm-enter-prompt-mode() {
 }
 
 termlm-exit-prompt-mode() {
+  local redraw="${1:-1}"
   _TERMLM_MODE="normal"
   PS1="${_TERMLM_SAVED_PS1:-$PS1}"
   zle -K main
-  zle reset-prompt
+  if (( redraw != 0 )); then
+    zle reset-prompt
+  fi
 }
 
 termlm-enter-session-mode() {

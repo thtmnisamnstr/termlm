@@ -63,7 +63,7 @@ At an empty prompt:
 - `/p` enters session mode
 - `/q` exits session mode
 - `Esc` cancels a prompt, response, clarification, approval, or session and returns to normal zsh
-- clarification questions are answered at the `? ` prompt; `/p` stays in session until `/q`
+- clarification questions are answered at the `● ? ` prompt; `/p` stays in session until `/q`
 - if a request is too vague or not grounded enough to command safely, `termlm` asks one focused clarification instead of guessing
 
 Approval keys for proposed commands:
