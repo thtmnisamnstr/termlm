@@ -106,6 +106,12 @@ verify_installed_payload() {
 
 verify_installed_payload
 
+refresh_filesystem_context() {
+  "$BIN_DIR/termlm" refresh-context --cwd "$PWD" >/dev/null 2>&1 || true
+}
+
+refresh_filesystem_context
+
 resolve_release_tag() {
   if [[ -n "${TERMLM_RELEASE_TAG:-}" ]]; then
     echo "$TERMLM_RELEASE_TAG"

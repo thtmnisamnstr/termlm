@@ -62,6 +62,8 @@ curl -fsSL https://raw.githubusercontent.com/thtmnisamnstr/termlm/main/scripts/i
 
 The first install downloads model chunks, verifies them, starts the daemon, and waits for local command indexing to be ready. That can take several minutes on a clean machine.
 
+Install also writes a small filesystem context snapshot under `~/.local/share/termlm/context/`. It records your home path, standard home folders, and a bounded current-directory listing so prompts like “where is my Desktop?” have useful local context before the model has to reason. The snapshot is refreshed when the zsh plugin loads and when you run `termlm reload-config`.
+
 Enable the zsh plugin:
 
 ```bash
@@ -139,7 +141,9 @@ Then run `termlm reload-config`. New prompt traces will be written as JSON under
 - a small zsh adapter in `plugins/zsh/`
 - a Rust daemon, `termlm-core`, that handles indexing, retrieval, planning, validation, model calls, and safety checks
 
-For command prompts, the daemon gathers local shell context, retrieves relevant command docs, asks the model for a structured command proposal, validates the result, and then sends the proposed command back to the zsh adapter. If local command docs are missing or not enough, the daemon can use the default web search/read tools for fallback grounding before proposing a command. If the local model fails to produce a structured command for a known simple request, `termlm` can fall back to a conservative built-in command draft; if there still is not enough signal, it asks a clarification question.
+For command prompts, the daemon gathers local shell context, gives the model read-only tools, and lets the model decide what it needs before proposing anything. It can run hybrid command-doc retrieval, look up exact command docs, inspect bounded local files/project/git context, run tightly allowlisted read-only shell probes, and fall back to web search/read when local grounding is missing or current information matters. Those intermediate observations stay out of the terminal UI; users see the final answer, a clarification question, or a proposed command for approval.
+
+Retrieved command-doc chunks are expanded back to their source document before they are sent to the model, then deduplicated by command. While indexing, `termlm` also adds a small generated “usage intents” section to each command document from the local `man`/`--help` options, so prompts like “files only, not directories” can match `find -type f` instead of relying on raw man-page wording alone. If there still is not enough signal, `termlm` asks a clarification question instead of substituting a hard-coded answer.
 
 ## Inference And Privacy
 

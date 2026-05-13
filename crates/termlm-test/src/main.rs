@@ -66,6 +66,8 @@ struct Cli {
     results_out: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "local")]
     provider: HarnessProvider,
+    #[arg(long, default_value_t = false)]
+    skip_benchmarks: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -263,6 +265,7 @@ struct Summary {
     passed: usize,
     failed: usize,
     by_category: BTreeMap<String, CategorySummary>,
+    retrieval_scored: usize,
     retrieval_hit_rate_top1: f64,
     retrieval_hit_rate_top5: f64,
 }
@@ -450,7 +453,7 @@ async fn main() -> Result<()> {
     .await?;
     let mut transport = connect_transport(&daemon_paths.socket_path).await?;
 
-    let shell_id = register_shell(&mut transport).await?;
+    let shell_id = register_shell(&mut transport, &daemon_paths.home_dir).await?;
     send_shell_context(&mut transport, shell_id, &suite).await?;
     kick_delta_reindex_best_effort(&mut transport).await;
 
@@ -480,6 +483,7 @@ async fn main() -> Result<()> {
             shell_id,
             &test,
             &test_dir,
+            &daemon_paths.home_dir,
             &cli.mode,
             cli.top_k,
             timeout_secs,
@@ -531,14 +535,16 @@ async fn main() -> Result<()> {
         });
 
         reports.push(report);
-        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        if !cli.keep_sandbox {
+            let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        }
     }
 
     let integration_mode = matches!(
         cli.mode,
         HarnessMode::LocalIntegration | HarnessMode::OllamaIntegration
     );
-    if !integration_mode {
+    if !integration_mode && !cli.skip_benchmarks {
         let index_benchmarks =
             benchmark_index_metrics(&mut transport, &daemon_paths.index_root).await?;
         if let Some(chunks_per_sec) = index_benchmarks.embedding_chunks_per_sec {
@@ -1085,7 +1091,7 @@ async fn connect_transport(socket: &Path) -> Result<ClientTransport> {
     ))
 }
 
-async fn register_shell(transport: &mut ClientTransport) -> Result<Uuid> {
+async fn register_shell(transport: &mut ClientTransport, home_dir: &Path) -> Result<Uuid> {
     transport
         .send(ClientMessage::RegisterShell {
             payload: RegisterShell {
@@ -1096,7 +1102,7 @@ async fn register_shell(transport: &mut ClientTransport) -> Result<Uuid> {
                 shell_version: "test".to_string(),
                 adapter_version: "test".to_string(),
                 capabilities: default_capabilities(),
-                env_subset: env_subset(),
+                env_subset: env_subset(Some(home_dir)),
             },
         })
         .await?;
@@ -1300,12 +1306,13 @@ async fn run_one_test(
     shell_id: Uuid,
     test: &TestCase,
     test_dir: &Path,
+    home_dir: &Path,
     harness_mode: &HarnessMode,
     top_k: u32,
     timeout_secs: u64,
 ) -> Result<TestReport> {
     for cmd in &test.setup {
-        run_setup_command(test_dir, cmd).await?;
+        run_setup_command(test_dir, home_dir, cmd).await?;
     }
 
     let started = Instant::now();
@@ -1335,11 +1342,13 @@ async fn run_one_test(
     let mut exit_status = None;
     let mut failure = None;
 
-    if matches!(harness_mode, HarnessMode::Retrieval | HarnessMode::All) {
+    if matches!(harness_mode, HarnessMode::Retrieval | HarnessMode::All)
+        && !test.relevant_commands.is_empty()
+    {
         let retrieval_started = Instant::now();
         let score = run_retrieval_check(transport, test, top_k).await?;
         retrieval_latency_ms = Some(retrieval_started.elapsed().as_millis() as u64);
-        if !test.relevant_commands.is_empty() && !score.hit {
+        if !score.hit {
             failure = Some(format!(
                 "retrieval miss: relevant commands {:?} not found in top {}",
                 test.relevant_commands, top_k
@@ -1350,7 +1359,8 @@ async fn run_one_test(
 
     if !matches!(harness_mode, HarnessMode::Retrieval) {
         let task_started = Instant::now();
-        let output = run_task_check(transport, shell_id, test, test_dir, timeout_secs).await?;
+        let output =
+            run_task_check(transport, shell_id, test, test_dir, home_dir, timeout_secs).await?;
         task_latency_ms = Some(task_started.elapsed().as_millis() as u64);
         ttft_ms = output.ttft_ms;
         proposed_command = output.proposed_command.clone();
@@ -1454,11 +1464,12 @@ async fn run_one_test(
     })
 }
 
-async fn run_setup_command(cwd: &Path, command: &str) -> Result<()> {
+async fn run_setup_command(cwd: &Path, home_dir: &Path, command: &str) -> Result<()> {
     let out = Command::new("bash")
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .env("HOME", home_dir)
         .output()
         .await
         .with_context(|| format!("setup command failed to spawn: {command}"))?;
@@ -1966,6 +1977,7 @@ async fn run_task_check(
     shell_id: Uuid,
     test: &TestCase,
     test_dir: &Path,
+    home_dir: &Path,
     timeout_secs: u64,
 ) -> Result<TaskRunOutput> {
     let task_id = Uuid::now_v7();
@@ -1979,7 +1991,7 @@ async fn run_task_check(
                 mode: "?".to_string(),
                 prompt: test.prompt.clone(),
                 cwd: test_dir.display().to_string(),
-                env_subset: env_subset_with_pwd(test_dir),
+                env_subset: env_subset_with_pwd(test_dir, home_dir),
             },
         })
         .await?;
@@ -2088,9 +2100,13 @@ async fn run_task_check(
                             })
                             .await?;
                         let started = Instant::now();
-                        let (status, stdout, stderr) =
-                            execute_command_in_sandbox(&payload.cmd, test_dir, timeout_secs)
-                                .await?;
+                        let (status, stdout, stderr) = execute_command_in_sandbox(
+                            &payload.cmd,
+                            test_dir,
+                            home_dir,
+                            timeout_secs,
+                        )
+                        .await?;
                         output.exit_status = Some(status);
                         output.stdout = stdout.clone();
                         output.stderr = stderr.clone();
@@ -2170,12 +2186,14 @@ async fn run_task_check(
 async fn execute_command_in_sandbox(
     command: &str,
     cwd: &Path,
+    home_dir: &Path,
     timeout_secs: u64,
 ) -> Result<(i32, String, String)> {
     let child = Command::new("bash")
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .env("HOME", home_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2242,8 +2260,10 @@ fn evaluate_expected(test: &TestCase, test_dir: &Path, output: &TaskRunOutput) -
             && output.exit_status.unwrap_or(-1) != 0
         {
             bail!(
-                "expected success but exit status was {:?}",
-                output.exit_status
+                "expected success but exit status was {:?}; stdout='{}'; stderr='{}'",
+                output.exit_status,
+                output.stdout,
+                output.stderr
             );
         }
         for needle in &test.expected.stdout_contains {
@@ -2370,6 +2390,7 @@ fn summarize(reports: &[TestReport]) -> Summary {
         passed,
         failed,
         by_category,
+        retrieval_scored: retrieval_total,
         retrieval_hit_rate_top1: if retrieval_total == 0 {
             0.0
         } else {
@@ -2402,10 +2423,16 @@ fn print_human_summary(results: &HarnessResults, results_path: &Path) {
         "summary: passed={} failed={} total={}",
         results.summary.passed, results.summary.failed, results.summary.total
     );
-    println!(
-        "retrieval hit rates: top1={:.2} top5={:.2}",
-        results.summary.retrieval_hit_rate_top1, results.summary.retrieval_hit_rate_top5
-    );
+    if results.summary.retrieval_scored == 0 {
+        println!("retrieval hit rates: n/a (no retrieval-scored tests in this mode)");
+    } else {
+        println!(
+            "retrieval hit rates: top1={:.2} top5={:.2} scored={}",
+            results.summary.retrieval_hit_rate_top1,
+            results.summary.retrieval_hit_rate_top5,
+            results.summary.retrieval_scored
+        );
+    }
     println!("results_file: {}", results_path.display());
     if results.summary.failed > 0 {
         println!("failed tests:");
@@ -3082,18 +3109,21 @@ fn default_capabilities() -> ShellCapabilities {
     }
 }
 
-fn env_subset() -> BTreeMap<String, String> {
+fn env_subset(home_dir: Option<&Path>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for key in ["PATH", "PWD", "TERM", "SHELL"] {
+    for key in ["HOME", "PATH", "PWD", "TERM", "SHELL"] {
         if let Ok(v) = std::env::var(key) {
             out.insert(key.to_string(), v);
         }
     }
+    if let Some(home_dir) = home_dir {
+        out.insert("HOME".to_string(), home_dir.display().to_string());
+    }
     out
 }
 
-fn env_subset_with_pwd(cwd: &Path) -> BTreeMap<String, String> {
-    let mut env = env_subset();
+fn env_subset_with_pwd(cwd: &Path, home_dir: &Path) -> BTreeMap<String, String> {
+    let mut env = env_subset(Some(home_dir));
     env.insert("PWD".to_string(), cwd.display().to_string());
     env
 }

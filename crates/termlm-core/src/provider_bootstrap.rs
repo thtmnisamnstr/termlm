@@ -326,6 +326,43 @@ pub(crate) fn compute_file_sha256(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), total))
 }
 
+fn should_force_model_hash() -> bool {
+    std::env::var("TERMLM_VERIFY_MODEL_SHA")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "always")
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn can_trust_cached_model_asset_record(
+    manifest: &ModelAssetManifest,
+    kind: &str,
+    filename: &str,
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<bool> {
+    if should_force_model_hash() {
+        return Ok(false);
+    }
+    let Some(previous) = manifest.assets.get(&model_asset_key(kind, filename)) else {
+        return Ok(false);
+    };
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
+    let size_bytes = metadata.len();
+    if size_bytes == 0 {
+        bail!("model asset is empty: {}", path.display());
+    }
+    if previous.size_bytes != size_bytes {
+        return Ok(false);
+    }
+    if let Some(expected) = expected_sha256 {
+        return Ok(previous.sha256 == expected);
+    }
+    Ok(normalize_sha256(&previous.sha256).is_some())
+}
+
 pub(crate) async fn ensure_model_asset(
     manifest: &mut ModelAssetManifest,
     args: EnsureModelAssetArgs<'_>,
@@ -391,6 +428,10 @@ pub(crate) async fn ensure_model_asset(
             &meta.sha256,
             meta.size_bytes,
         ));
+    }
+
+    if can_trust_cached_model_asset_record(manifest, kind, filename, path, expected)? {
+        return Ok(false);
     }
 
     let (actual_sha, size_bytes) = compute_file_sha256(path)?;

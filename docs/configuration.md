@@ -60,7 +60,7 @@ healthcheck_on_start = true
 ### Disable web search/read
 
 Web search and page reading are on by default with the no-token DuckDuckGo HTML provider.
-The task router uses them for web/current-information prompts such as "search the web", "look up", "latest", or prompts containing an HTTP(S) URL. Command prompts still prefer local command docs first, but can use web search/read as a fallback when local retrieval is missing or insufficient.
+The model can use them for web/current-information prompts such as "search the web", "look up", "latest", or prompts containing an HTTP(S) URL. Command prompts still prefer local command docs and read-only local observations first, but can use web search/read as a fallback when local retrieval is missing or insufficient.
 
 Disable all daemon-owned web requests:
 
@@ -74,6 +74,33 @@ Keep the web runtime configured but hide `web_search` and `web_read` from the mo
 ```toml
 [web]
 expose_tools = false
+```
+
+### Disable opaque read-only shell probes
+
+`termlm` can let the model run tightly allowlisted, non-modifying command probes such as `pwd`, `ls`, `find`, `stat`, `git status`, and `which` while it is grounding an answer. These probes are not shown in the terminal UI and are capped by timeout/output limits. The final command still requires normal approval.
+
+```toml
+[local_tools]
+readonly_command_enabled = false
+```
+
+### Command-doc indexing behavior
+
+On install and reindex, `termlm` builds both vector and lexical search indexes from local command documentation (`man`, `--help`, `-h`, shell builtins, aliases, and functions where available). Retrieved chunks are expanded back to their source command document before they are sent to the model, then deduplicated by command.
+
+During indexing, `termlm` also generates a small `USAGE INTENTS` section for each command document. This is not an exhaustive option permutation list; it is a bounded set of task phrases, option hints, common combinations, and similar-command distinctions. It helps prompts like "files only, not directories" retrieve `find -type f`, while keeping the index small enough for normal installs and upgrades.
+
+Use delta reindexing for normal PATH/tooling changes:
+
+```bash
+termlm reindex --mode delta
+```
+
+Use a full reindex only for repair, incompatible index-version changes, or when you intentionally want to rebuild the command-doc corpus from scratch:
+
+```bash
+termlm reindex --mode full
 ```
 
 ### Inspect retrieval as a builder
@@ -126,6 +153,16 @@ jq . "$(ls -t ~/.local/state/termlm/retrieval-traces/*.json | head -1)"
 ```
 
 Each trace includes the prompt, top-K setting, retrieval trace type, and the retrieved command-doc chunks with ranks, scores, command names, section names, source paths, and snippets. Trace files include raw prompt text and retrieved doc snippets, so keep this off unless you are actively debugging retrieval.
+
+### Filesystem context snapshot
+
+`termlm` keeps a small generated context file at:
+
+```text
+~/.local/share/termlm/context/filesystem.md
+```
+
+It includes the home directory, standard home folders such as Desktop/Documents/Downloads, top-level home folders, and a bounded current-directory listing from the last refresh. The installer creates it, the zsh plugin refreshes it when a shell loads, and `termlm reload-config` refreshes it before signaling the daemon. This gives the model local filesystem grounding without scanning directories on every prompt.
 
 ### Reduce context capture footprint
 

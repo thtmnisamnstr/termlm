@@ -205,6 +205,9 @@ For behavior guidance, see [`configuration.md`](configuration.md).
 ### `[local_tools]`
 
 - `enabled`
+- `readonly_command_enabled`
+- `readonly_command_timeout_secs`
+- `readonly_command_max_output_bytes`
 - `redact_secrets`
 - `default_max_bytes`
 - `max_file_bytes`

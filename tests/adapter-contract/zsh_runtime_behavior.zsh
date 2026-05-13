@@ -31,6 +31,13 @@ assert_contains() {
   [[ "$haystack" == *"$needle"* ]] || fail "$msg (missing '$needle' in '$haystack')"
 }
 
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local msg="$3"
+  [[ "$haystack" != *"$needle"* ]] || fail "$msg (unexpected '$needle' in '$haystack')"
+}
+
 encode_b64() {
   print -rn -- "$1" | base64 | tr -d '\n'
 }
@@ -78,6 +85,7 @@ reset_state() {
   _TERMLM_PENDING_STDOUT_FILE=""
   _TERMLM_PENDING_STDERR_FILE=""
   _TERMLM_PENDING_SEQ=0
+  _TERMLM_ACKED_PENDING_TASK_ID=""
   _TERMLM_CAPTURE_ACTIVE=0
   _TERMLM_CAPTURE_SAVE_STDOUT_FD=-1
   _TERMLM_CAPTURE_SAVE_STDERR_FD=-1
@@ -304,6 +312,13 @@ assert_eq "$_TERMLM_PENDING_TASK_ID" "task-approved" "approved command should se
 assert_eq "$_TERMLM_PENDING_CMD" "echo hi" "approved command should set pending command"
 assert_eq "$BUFFER" "echo hi" "approved command should execute the visible command via BUFFER"
 assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "approved command should execute with zle .accept-line"
+_ZLE_CALLS=()
+_TERMLM_ACKED_PENDING_TASK_ID="task-approved"
+_TERMLM_PENDING_TASK_ID=""
+_TERMLM_TASK_ID="task-approved"
+termlm-handle-run-task-line '{"event":"task_complete","task_id":"task-approved"}'
+assert_not_contains "${(j:|:)_ZLE_CALLS}" "reset-prompt" "task_complete after approved command should not redraw an extra prompt"
+assert_eq "$_TERMLM_ACKED_PENDING_TASK_ID" "" "task_complete should clear acked pending task marker"
 
 reset_state
 _TERMLM_MODE="prompt"

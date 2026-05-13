@@ -44,6 +44,11 @@ enum Command {
         verbose: bool,
     },
     ReloadConfig,
+    #[command(hide = true)]
+    RefreshContext {
+        #[arg(long)]
+        cwd: Option<String>,
+    },
     Stop,
     Ping,
     Init {
@@ -385,8 +390,15 @@ pub async fn run() -> Result<()> {
 
     if matches!(cli.cmd, Command::ReloadConfig) {
         let pid_path = resolve_runtime_path(&cfg.daemon.pid_file);
+        if let Err(e) = refresh_context_snapshot(None) {
+            eprintln!("warning: filesystem context refresh failed: {e:#}");
+        }
         signal_config_reload(&pid_path)?;
         println!("reload signal sent");
+        return Ok(());
+    }
+    if let Command::RefreshContext { cwd } = &cli.cmd {
+        run_refresh_context(cwd.as_deref())?;
         return Ok(());
     }
     if let Command::Init { shell } = &cli.cmd {
@@ -425,6 +437,9 @@ pub async fn run() -> Result<()> {
     match cli.cmd {
         Command::Upgrade { .. } => unreachable!("upgrade is handled before config/socket setup"),
         Command::ReloadConfig => unreachable!("reload-config is handled before socket connect"),
+        Command::RefreshContext { .. } => {
+            unreachable!("refresh-context is handled before socket connect")
+        }
         Command::Init { .. } => unreachable!("init is handled before socket connect"),
         Command::Doctor { .. } => unreachable!("doctor is handled before socket connect"),
         Command::Uninstall { .. } => {
@@ -1556,12 +1571,33 @@ async fn register_shell(
 
 fn env_subset() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for key in ["PATH", "PWD", "TERM", "SHELL"] {
+    for key in ["HOME", "PATH", "PWD", "TERM", "SHELL"] {
         if let Ok(v) = std::env::var(key) {
             out.insert(key.to_string(), v);
         }
     }
     out
+}
+
+fn run_refresh_context(cwd: Option<&str>) -> Result<()> {
+    let path = refresh_context_snapshot(cwd)?;
+    println!("filesystem context refreshed: {}", path.display());
+    Ok(())
+}
+
+fn refresh_context_snapshot(cwd: Option<&str>) -> Result<PathBuf> {
+    let env_subset = env_subset();
+    let cwd_path = cwd
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_subset
+                .get("PWD")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| std::env::current_dir().ok());
+    termlm_config::refresh_filesystem_context_snapshot(cwd_path.as_deref(), &env_subset)
 }
 
 fn parse_shell_kind(raw: &str) -> ShellKind {

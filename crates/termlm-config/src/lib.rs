@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -241,6 +242,9 @@ pub struct TerminalContextConfig {
 #[serde(default)]
 pub struct LocalToolsConfig {
     pub enabled: bool,
+    pub readonly_command_enabled: bool,
+    pub readonly_command_timeout_secs: u64,
+    pub readonly_command_max_output_bytes: usize,
     pub redact_secrets: bool,
     pub default_max_bytes: usize,
     pub max_file_bytes: usize,
@@ -619,6 +623,9 @@ impl Default for LocalToolsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            readonly_command_enabled: true,
+            readonly_command_timeout_secs: 3,
+            readonly_command_max_output_bytes: 32_768,
             redact_secrets: true,
             default_max_bytes: 65_536,
             max_file_bytes: 1_048_576,
@@ -777,6 +784,252 @@ pub struct LoadedConfig {
 pub fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     Path::new(&home).join(".config/termlm/config.toml")
+}
+
+pub fn default_data_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("TERMLM_DATA_DIR")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var("XDG_DATA_HOME")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path).join("termlm");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".local/share/termlm")
+}
+
+pub fn filesystem_context_path() -> PathBuf {
+    if let Ok(path) = std::env::var("TERMLM_FILESYSTEM_CONTEXT_PATH")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    default_data_dir().join("context/filesystem.md")
+}
+
+pub fn read_filesystem_context_snapshot() -> Option<String> {
+    fs::read_to_string(filesystem_context_path())
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+}
+
+pub fn refresh_filesystem_context_snapshot(
+    cwd: Option<&Path>,
+    env_subset: &BTreeMap<String, String>,
+) -> Result<PathBuf> {
+    let path = filesystem_context_path();
+    let content = build_filesystem_context_block(cwd, env_subset)
+        .unwrap_or_else(|| "## Filesystem context\nfilesystem_context_unavailable: true\n".into());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("md.tmp");
+    fs::write(&tmp, content).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
+pub fn build_filesystem_context_block(
+    cwd: Option<&Path>,
+    env_subset: &BTreeMap<String, String>,
+) -> Option<String> {
+    let home = home_dir_from_env(env_subset);
+    let cwd = cwd
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_subset
+                .get("PWD")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| std::env::current_dir().ok());
+
+    if home.is_none() && cwd.is_none() {
+        return None;
+    }
+
+    let mut out = String::from("## Filesystem context\n");
+    out.push_str("generated_at_unix_secs: ");
+    out.push_str(&unix_secs_now().to_string());
+    out.push('\n');
+
+    if let Some(home) = home.as_ref() {
+        out.push_str("home: ");
+        out.push_str(&home.display().to_string());
+        out.push('\n');
+    }
+    if let Some(cwd) = cwd.as_ref() {
+        out.push_str("snapshot_current_directory: ");
+        out.push_str(&cwd.display().to_string());
+        out.push('\n');
+    }
+
+    if let Some(home) = home.as_ref() {
+        out.push_str("standard_home_directories:\n");
+        for name in STANDARD_HOME_DIRS {
+            let path = home.join(name);
+            let status = if path.is_dir() {
+                "exists"
+            } else if path.exists() {
+                "not_directory"
+            } else {
+                "missing"
+            };
+            out.push_str("- ");
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(&path.display().to_string());
+            out.push_str(" (");
+            out.push_str(status);
+            out.push_str(")\n");
+        }
+
+        if let Some(summary) = summarize_directory_entries(home, 32, 0) {
+            if !summary.dirs.is_empty() {
+                out.push_str("home_dirs: ");
+                out.push_str(&summary.dirs.join(", "));
+                out.push('\n');
+            }
+            if summary.hidden_skipped > 0 || summary.truncated {
+                out.push_str("home_listing_note: ");
+                append_listing_note(&mut out, summary.hidden_skipped, summary.truncated);
+                out.push('\n');
+            }
+        }
+    }
+
+    if let Some(cwd) = cwd.as_ref()
+        && let Some(summary) = summarize_directory_entries(cwd, 18, 18)
+    {
+        if !summary.dirs.is_empty() {
+            out.push_str("snapshot_current_directory_dirs: ");
+            out.push_str(&summary.dirs.join(", "));
+            out.push('\n');
+        }
+        if !summary.files.is_empty() {
+            out.push_str("snapshot_current_directory_files: ");
+            out.push_str(&summary.files.join(", "));
+            out.push('\n');
+        }
+        if summary.hidden_skipped > 0 || summary.truncated {
+            out.push_str("snapshot_current_directory_listing_note: ");
+            append_listing_note(&mut out, summary.hidden_skipped, summary.truncated);
+            out.push('\n');
+        }
+    }
+
+    Some(out)
+}
+
+const STANDARD_HOME_DIRS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Pictures",
+    "Movies",
+    "Music",
+    "Public",
+    "Library",
+];
+
+fn home_dir_from_env(env_subset: &BTreeMap<String, String>) -> Option<PathBuf> {
+    env_subset
+        .get("HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
+struct DirectoryEntrySummary {
+    dirs: Vec<String>,
+    files: Vec<String>,
+    hidden_skipped: usize,
+    truncated: bool,
+}
+
+fn summarize_directory_entries(
+    root: &Path,
+    max_dirs: usize,
+    max_files: usize,
+) -> Option<DirectoryEntrySummary> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut dirs = Vec::<String>::new();
+    let mut files = Vec::<String>::new();
+    let mut hidden_skipped = 0usize;
+    let mut dir_overflow = false;
+    let mut file_overflow = false;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if name.starts_with('.') {
+            hidden_skipped = hidden_skipped.saturating_add(1);
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if max_dirs == 0 {
+                dir_overflow = true;
+            } else if dirs.len() < max_dirs {
+                dirs.push(name);
+            } else {
+                dir_overflow = true;
+            }
+        } else if kind.is_file() {
+            if max_files == 0 {
+                continue;
+            } else if files.len() < max_files {
+                files.push(name);
+            } else {
+                file_overflow = true;
+            }
+        }
+    }
+
+    dirs.sort_by_key(|name| name.to_ascii_lowercase());
+    files.sort_by_key(|name| name.to_ascii_lowercase());
+
+    Some(DirectoryEntrySummary {
+        dirs,
+        files,
+        hidden_skipped,
+        truncated: dir_overflow || file_overflow,
+    })
+}
+
+fn append_listing_note(out: &mut String, hidden_skipped: usize, truncated: bool) {
+    if hidden_skipped > 0 {
+        out.push_str(&format!("{hidden_skipped} hidden entries omitted"));
+    }
+    if hidden_skipped > 0 && truncated {
+        out.push_str("; ");
+    }
+    if truncated {
+        out.push_str("listing truncated");
+    }
 }
 
 pub fn load_or_create(path: Option<&Path>) -> Result<LoadedConfig> {
@@ -1232,6 +1485,11 @@ recent_context_max_tokens = 6000
 older_context_max_tokens = 4000
 capture_command_output = false
 
+[local_tools]
+readonly_command_enabled = true
+readonly_command_timeout_secs = 3
+readonly_command_max_output_bytes = 32768
+
 [tool_routing]
 expose_terminal_context_only_when_needed = true
 expose_file_tools_for_local_questions = true
@@ -1302,5 +1560,32 @@ repeat_penalty = 1.05
         cfg.web.search_endpoint = "http://example.com/search".to_string();
         cfg.web.allow_plain_http = false;
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn filesystem_context_block_includes_home_and_snapshot_entries() {
+        let root =
+            std::env::temp_dir().join(format!("termlm-fs-context-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let cwd = home.join("Projects/termlm");
+        std::fs::create_dir_all(home.join("Desktop")).expect("desktop");
+        std::fs::create_dir_all(home.join("Downloads")).expect("downloads");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(cwd.join("README.md"), "hello").expect("readme");
+        std::fs::write(cwd.join(".env"), "secret").expect("hidden");
+
+        let mut env_subset = BTreeMap::new();
+        env_subset.insert("HOME".to_string(), home.display().to_string());
+        let block = build_filesystem_context_block(Some(&cwd), &env_subset).expect("block");
+
+        assert!(block.contains("home: "));
+        assert!(block.contains("Desktop"));
+        assert!(block.contains("Downloads"));
+        assert!(block.contains("snapshot_current_directory_files: README.md"));
+        assert!(block.contains("hidden entries omitted"));
+        assert!(!block.contains(".env"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

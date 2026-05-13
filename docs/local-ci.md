@@ -27,6 +27,26 @@ bash scripts/ci/run_local_ci.sh --quick
 
 `--quick` skips reliability, security, hardware matrix, Ollama parity, and release-packaging/rehearsal lanes.
 
+Run the focused real-model usability suite directly when you are checking prompt quality before a release:
+
+```bash
+TERMLM_E2E_REAL=1 TERMLM_TEST_REINDEX_TIMEOUT_SECS=240 \
+cargo run -p termlm-test -- \
+  --suite tests/fixtures/termlm-usability-suite.toml \
+  --mode e2e \
+  --skip-benchmarks
+```
+
+Check command-doc retrieval for the same prompts:
+
+```bash
+TERMLM_E2E_REAL=1 TERMLM_TEST_REINDEX_TIMEOUT_SECS=240 \
+cargo run -p termlm-test -- \
+  --suite tests/fixtures/termlm-usability-suite.toml \
+  --mode retrieval \
+  --skip-benchmarks
+```
+
 Custom artifact directory:
 
 ```bash

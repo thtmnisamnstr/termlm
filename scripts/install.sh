@@ -354,6 +354,7 @@ else
 fi
 
 verify_installed_payload
+"${TERMLM_INSTALL_BIN_DIR:-$HOME/.local/bin}/termlm" refresh-context --cwd "$PWD" >/dev/null 2>&1 || true
 
 echo "Done."
 

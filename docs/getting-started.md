@@ -28,6 +28,8 @@ Install notes:
 - readiness and model-chunk download phases emit periodic progress lines
 - first install can take several minutes depending on model/index state
 - a clean install downloads local model assets and builds both vector and lexical command-doc indexes
+- command docs include generated task phrases and bounded usage hints so common wording can retrieve the right local command docs
+- install writes a small filesystem context snapshot for home folders such as Desktop, Documents, and Downloads
 - web search/read is available by default through DuckDuckGo HTML search and does not need an API key
 
 Manual install is documented in [release-upgrades.md](release-upgrades.md).

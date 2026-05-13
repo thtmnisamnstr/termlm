@@ -347,16 +347,19 @@ Every requirement has a stable identifier (`FR‑n`). "MUST" is normative; "SHOU
   ]
 
   [local_tools]
-  enabled                  = true           # enables read-only local grounding tools by default
-  redact_secrets           = true
-  default_max_bytes        = 65536
-  max_file_bytes           = 1048576
-  max_search_results       = 100
-  max_search_files         = 20000
-  max_workspace_entries    = 500
-  respect_gitignore        = true
-  allow_home_as_workspace  = false
-  allow_system_dirs        = false
+  enabled                          = true   # enables read-only local grounding tools by default
+  readonly_command_enabled         = true
+  readonly_command_timeout_secs    = 3
+  readonly_command_max_output_bytes = 32768
+  redact_secrets                   = true
+  default_max_bytes                = 65536
+  max_file_bytes                   = 1048576
+  max_search_results               = 100
+  max_search_files                 = 20000
+  max_workspace_entries            = 500
+  respect_gitignore                = true
+  allow_home_as_workspace          = false
+  allow_system_dirs                = false
   include_hidden_by_default = false
 
   [local_tools.text_detection]
@@ -1120,6 +1123,18 @@ Model-facing tools available to every provider, subject to config gating:
     }
   },
   {
+    "name": "retrieve_command_docs",
+    "description": "Run hybrid local command-doc retrieval for a natural-language query and return deduplicated, source-expanded command docs. Use before exact lookup when the best command is not known.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string" },
+        "top_k": { "type": "integer" }
+      },
+      "required": ["query"]
+    }
+  },
+  {
     "name": "lookup_command_docs",
     "description": "Fetch full local documentation for a specific installed command by name. Use when the cheat sheet or retrieved snippets are insufficient.",
     "parameters": {
@@ -1129,6 +1144,18 @@ Model-facing tools available to every provider, subject to config gating:
         "section": { "type": "string", "description": "Optional man section name, e.g. OPTIONS or EXAMPLES" }
       },
       "required": ["name"]
+    }
+  },
+  {
+    "name": "run_readonly_command",
+    "description": "Run a tightly allowlisted, non-modifying local command probe with no shell metacharacters, redirection, pipelines, command substitution, or control operators. Results are fed back to the model as observations and are not displayed in the user's terminal UI.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "cmd": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "required": ["cmd"]
     }
   },
   {
@@ -1239,7 +1266,7 @@ Model-facing tools available to every provider, subject to config gating:
 ]
 ```
 
-Read-only local grounding tools are exposed by default when `[local_tools].enabled = true`. `web_search` and `web_read` are exposed by default when `[web].enabled = true` and `[web].expose_tools = true`, but the orchestrator MUST prefer local context first and use web for explicit current/external-information needs, URLs, online docs/releases/packages/APIs/errors, or local command-doc/retrieval gaps. If web is disabled, web tools MUST be omitted from the provider tool list.
+Read-only local grounding tools are exposed by default when `[local_tools].enabled = true`. The model may call them over multiple rounds, inspect observations, and revise its plan before emitting an answer or `execute_shell_command`. `run_readonly_command` MUST stay allowlist-only, non-mutating, timeout/output bounded, and hidden from the terminal UI. `web_search` and `web_read` are exposed by default when `[web].enabled = true` and `[web].expose_tools = true`, but the orchestrator MUST prefer local context first and use web for explicit current/external-information needs, URLs, online docs/releases/packages/APIs/errors, or local command-doc/retrieval gaps. If web is disabled, web tools MUST be omitted from the provider tool list.
 
 
 ## 6. Implementation Plan
@@ -1458,7 +1485,7 @@ Required contract coverage:
 
 ### 7.6 End‑to‑End Tests with a Tiny Model
 
-- Use a stub inference backend behind a Cargo feature `runtime-stub` that responds to specific prompts with hard‑coded canned tool calls and text.
+- Use a test-only stub inference backend behind a Cargo feature `runtime-stub` for deterministic adapter/daemon integration tests. Normal builds MUST use real provider orchestration and MUST NOT substitute hard-coded command drafts for user prompts.
 - Drive the full daemon via `termlm-client`. Assert wire events match expected.
 - A separate `runtime-real` feature runs a small subset of e2e tests with the real Gemma‑4‑E2B model when `TERMLM_E2E_REAL=1` is set.
 

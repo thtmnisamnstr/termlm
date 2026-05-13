@@ -27,7 +27,8 @@ See [`release-upgrades.md`](release-upgrades.md) for full behavior and env contr
 ### `termlm reload-config`
 
 Signals daemon config reload (`SIGHUP` using configured pid file). Hot-reload keys apply without
-daemon restart.
+daemon restart. This also refreshes the generated filesystem context snapshot before signaling
+the daemon.
 
 ### `termlm stop`
 

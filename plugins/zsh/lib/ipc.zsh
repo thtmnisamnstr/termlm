@@ -417,6 +417,12 @@ termlm-client-bin() {
   fi
 }
 
+termlm-refresh-filesystem-context() {
+  local client_bin
+  client_bin="$(termlm-client-bin)"
+  "$client_bin" refresh-context --cwd "$PWD" >/dev/null 2>&1 &!
+}
+
 termlm-daemon-boot-timeout-ms() {
   if [[ -n "${TERMLM_DAEMON_BOOT_TIMEOUT_SECS:-}" ]]; then
     local env_secs="${TERMLM_DAEMON_BOOT_TIMEOUT_SECS}"
@@ -560,6 +566,9 @@ termlm-mark-task-closed() {
   local closed_task_id="${_TERMLM_TASK_ID:-${_TERMLM_APPROVAL_TASK_ID:-${_TERMLM_CLARIFICATION_TASK_ID:-}}}"
   if [[ -n "$closed_task_id" ]]; then
     _TERMLM_CLOSED_TASK_ID="$closed_task_id"
+  fi
+  if [[ -n "${_TERMLM_ACKED_PENDING_TASK_ID:-}" && "$closed_task_id" == "$_TERMLM_ACKED_PENDING_TASK_ID" ]]; then
+    _TERMLM_ACKED_PENDING_TASK_ID=""
   fi
   _TERMLM_WAITING_MODEL=0
   _TERMLM_TASK_ID=""
@@ -785,12 +794,24 @@ termlm-handle-run-task-line() {
       if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
+      local suppress_prompt_reset=0
+      if [[ $_TERMLM_SESSION_MODE -eq 0 \
+        && -n "${_TERMLM_ACKED_PENDING_TASK_ID:-}" \
+        && "$task_id" == "$_TERMLM_ACKED_PENDING_TASK_ID" ]]; then
+        suppress_prompt_reset=1
+      fi
       if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
         print -r -- ""
       fi
       termlm-mark-task-closed
       if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
-        termlm-exit-prompt-mode
+        if (( suppress_prompt_reset == 0 )); then
+          termlm-exit-prompt-mode
+        else
+          _TERMLM_MODE="normal"
+          PS1="${_TERMLM_SAVED_PS1:-$PS1}"
+          zle -K main
+        fi
       else
         zle reset-prompt
       fi
@@ -869,6 +890,7 @@ termlm-run-approved-command() {
   local task_id="$1"
   local approved_cmd="$2"
 
+  _TERMLM_ACKED_PENDING_TASK_ID=""
   _TERMLM_PENDING_TASK_ID="$task_id"
   _TERMLM_PENDING_CMD="$approved_cmd"
   _TERMLM_PENDING_CWD_BEFORE="$PWD"

@@ -1,4 +1,6 @@
-use crate::tool_parser::{extract_partial_execute_shell_command, parse_tagged_tool_calls};
+use crate::tool_parser::{
+    extract_partial_execute_shell_command, parse_json_tool_call, parse_tagged_tool_calls,
+};
 use crate::{
     ChatMessage, ChatRequest, InferenceProvider, ProviderCapabilities, ProviderEvent,
     ProviderHealth, ProviderKind, ProviderStream, ProviderUsage, StructuredOutputMode, ToolCall,
@@ -26,6 +28,8 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatTemplate, LlamaModel};
 #[cfg(feature = "local-runtime")]
 use llama_cpp_2::sampling::LlamaSampler;
+#[cfg(feature = "local-runtime")]
+use llama_cpp_2::token::{LlamaToken, logit_bias::LlamaLogitBias};
 
 #[derive(Debug, Clone)]
 pub struct LocalLlamaProvider {
@@ -176,7 +180,24 @@ impl LocalLlamaProvider {
         extract_int("num_predict")
             .or_else(|| extract_int("max_tokens"))
             .unwrap_or(384)
-            .clamp(16, 4096)
+            .clamp(1, 4096)
+    }
+
+    fn string_list_option(request: &ChatRequest, key: &str) -> Vec<String> {
+        match request.options.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(ToString::to_string)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn first_stop_match(text: &str, stops: &[String]) -> Option<usize> {
+        stops.iter().filter_map(|stop| text.find(stop)).min()
     }
 
     #[cfg(feature = "local-runtime")]
@@ -420,17 +441,69 @@ impl LocalLlamaProvider {
     fn build_context_params(runtime: &LoadedRuntime, n_ctx: u32) -> LlamaContextParams {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx)
-            // Keep ubatch aligned with batch/context. Prompt-prefill decode can
-            // fail on some local runtimes when n_ubatch stays below submitted
-            // token count.
-            .with_n_ubatch(n_ctx);
+            .with_n_batch(n_ctx.min(1024))
+            .with_n_ubatch(n_ctx.min(1024));
         if runtime.threads > 0 {
             params = params
                 .with_n_threads(runtime.threads)
                 .with_n_threads_batch(runtime.threads);
         }
         params
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn invalid_generation_token_biases(
+        model: &LlamaModel,
+        include_eog: bool,
+    ) -> Vec<LlamaLogitBias> {
+        let mut biases = Vec::new();
+        let n_vocab = model.n_vocab().max(0).min(512);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        for id in 0..n_vocab {
+            let token = LlamaToken(id);
+            let invalid = (include_eog && model.is_eog_token(token))
+                || match model.token_to_piece(token, &mut decoder, true, None) {
+                    Ok(piece) => {
+                        let normalized = piece.trim().to_ascii_lowercase();
+                        normalized.is_empty()
+                            || piece
+                                .chars()
+                                .any(|c| c.is_control() && c != '\n' && c != '\t')
+                            || normalized.starts_with("<unused")
+                            || (normalized.starts_with('<') && normalized.ends_with('>'))
+                            || normalized == "<unk>"
+                            || normalized == "<pad>"
+                    }
+                    Err(_) => true,
+                };
+            if invalid {
+                biases.push(LlamaLogitBias::new(token, -1.0e9));
+            }
+        }
+        biases
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn build_generation_sampler(
+        model: &LlamaModel,
+        grammar: Option<&str>,
+        biases: &[LlamaLogitBias],
+    ) -> LlamaSampler {
+        let invalid_token_filter = || LlamaSampler::logit_bias(model.n_vocab(), biases);
+        if let Some(grammar) = grammar {
+            match LlamaSampler::grammar(model, grammar, "root") {
+                Ok(grammar_sampler) => LlamaSampler::chain_simple([
+                    invalid_token_filter(),
+                    grammar_sampler,
+                    LlamaSampler::greedy(),
+                ]),
+                Err(_) => {
+                    LlamaSampler::chain_simple([invalid_token_filter(), LlamaSampler::greedy()])
+                }
+            }
+        } else {
+            LlamaSampler::chain_simple([invalid_token_filter(), LlamaSampler::greedy()])
+        }
     }
 
     #[cfg(feature = "local-runtime")]
@@ -555,7 +628,21 @@ impl LocalLlamaProvider {
         tx: tokio::sync::mpsc::Sender<Result<ProviderEvent>>,
     ) -> Result<()> {
         let messages_json = serde_json::to_string(&Self::to_openai_messages(&request.messages))?;
-        let tools_json = serde_json::to_string(&Self::to_openai_tools(&request.tools))?;
+        let tools_json = if request.tools.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&Self::to_openai_tools(
+                &request.tools,
+            ))?)
+        };
+        let tool_choice = if request.tools.is_empty() {
+            None
+        } else {
+            // llama.cpp's required-tool grammar is not stable for the current
+            // local Gemma build. The daemon enforces command-mode tool output
+            // at the prompt/parser layer instead.
+            Some("auto")
+        };
         let template = runtime
             .chat_template
             .clone()
@@ -568,15 +655,15 @@ impl LocalLlamaProvider {
                 &template,
                 &llama_cpp_2::openai::OpenAIChatTemplateParams {
                     messages_json: &messages_json,
-                    tools_json: Some(&tools_json),
-                    tool_choice: Some("auto"),
+                    tools_json: tools_json.as_deref(),
+                    tool_choice,
                     json_schema: None,
                     grammar: None,
                     reasoning_format: None,
                     chat_template_kwargs: Some("{}"),
                     add_generation_prompt: true,
                     use_jinja: true,
-                    parallel_tool_calls: true,
+                    parallel_tool_calls: false,
                     enable_thinking: request.think,
                     add_bos: false,
                     add_eos: false,
@@ -584,7 +671,6 @@ impl LocalLlamaProvider {
                 },
             )
             .context("apply local chat template")?;
-
         let mut prompt_tokens = runtime
             .model
             .str_to_token(&template_result.prompt, AddBos::Always)
@@ -603,6 +689,7 @@ impl LocalLlamaProvider {
         }
 
         let max_output_tokens = Self::max_output_tokens(&request);
+        let stop_sequences = Self::string_list_option(&request, "stop_sequences");
         let model_ctx = runtime.model.n_ctx_train();
         let mut n_ctx = runtime.context_tokens.max(512);
         if model_ctx > 0 {
@@ -631,14 +718,21 @@ impl LocalLlamaProvider {
             )
             .context("create local llama context")?;
 
-        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
-        let last_index = prompt_tokens.len().saturating_sub(1) as i32;
-        for (idx, token) in (0_i32..).zip(prompt_tokens.iter()) {
-            batch
-                .add(*token, idx, &[0], idx == last_index)
-                .context("fill local prompt batch")?;
+        let prompt_batch_tokens = n_ctx.min(1024).max(1) as usize;
+        let mut batch = LlamaBatch::new(prompt_batch_tokens, 1);
+        let prompt_len = prompt_tokens.len();
+        for chunk_start in (0..prompt_len).step_by(prompt_batch_tokens) {
+            batch.clear();
+            let chunk_end = (chunk_start + prompt_batch_tokens).min(prompt_len);
+            for (offset, token) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
+                let absolute_idx = chunk_start + offset;
+                let pos = i32::try_from(absolute_idx).unwrap_or(i32::MAX);
+                batch
+                    .add(*token, pos, &[0], absolute_idx + 1 == prompt_len)
+                    .context("fill local prompt batch")?;
+            }
+            ctx.decode(&mut batch).context("local prompt decode")?;
         }
-        ctx.decode(&mut batch).context("local prompt decode")?;
 
         let mut preserved_tokens = HashSet::new();
         for token_str in &template_result.preserved_tokens {
@@ -649,20 +743,20 @@ impl LocalLlamaProvider {
             }
         }
 
-        let mut sampler = if let Some(grammar) = template_result.grammar.as_deref() {
-            match LlamaSampler::grammar(&runtime.model, grammar, "root") {
-                Ok(grammar_sampler) => {
-                    LlamaSampler::chain_simple([grammar_sampler, LlamaSampler::greedy()])
-                }
-                Err(_) => LlamaSampler::greedy(),
-            }
-        } else {
-            LlamaSampler::greedy()
-        };
+        let first_token_biases = Self::invalid_generation_token_biases(&runtime.model, true);
+        let continuation_biases = Self::invalid_generation_token_biases(&runtime.model, false);
+        // llama.cpp's generated tool grammars currently assert on the bundled
+        // local Gemma template. Keep generation unconstrained and let the
+        // daemon parse/validate tool output.
+        let grammar = None;
+        let mut first_token_sampler =
+            Self::build_generation_sampler(&runtime.model, grammar, &first_token_biases);
+        let mut continuation_sampler =
+            Self::build_generation_sampler(&runtime.model, grammar, &continuation_biases);
 
         let mut generated = String::new();
         let mut completion_tokens = 0_u64;
-        let mut n_cur = batch.n_tokens();
+        let mut n_cur = i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX);
         let max_tokens = n_cur.saturating_add(i32::try_from(max_output_tokens).unwrap_or(2048));
         let mut decoder = encoding_rs::UTF_8.new_decoder();
 
@@ -675,8 +769,11 @@ impl LocalLlamaProvider {
                 bail!("local provider request cancelled");
             }
 
-            let sample_idx = batch.n_tokens().saturating_sub(1);
-            let token = sampler.sample(&ctx, sample_idx);
+            let token = if completion_tokens == 0 {
+                first_token_sampler.sample(&ctx, -1)
+            } else {
+                continuation_sampler.sample(&ctx, -1)
+            };
             if runtime.model.is_eog_token(token) {
                 break;
             }
@@ -685,7 +782,7 @@ impl LocalLlamaProvider {
             let piece = runtime
                 .model
                 .token_to_piece(token, &mut decoder, preserved_tokens.contains(&token), None)
-                .context("decode sampled token")?;
+                .with_context(|| format!("decode sampled token piece token={}", token.0))?;
             if !piece.is_empty() {
                 generated.push_str(&piece);
                 if request.stream {
@@ -710,6 +807,11 @@ impl LocalLlamaProvider {
                 break;
             }
 
+            if let Some(stop_at) = Self::first_stop_match(&generated, &stop_sequences) {
+                generated.truncate(stop_at);
+                break;
+            }
+
             // Some local templates stream complete tagged tool-call payloads and
             // then continue generating silent/non-rendered tokens for a while.
             // If we already have a valid tagged tool call, stop immediately so
@@ -726,13 +828,25 @@ impl LocalLlamaProvider {
             {
                 break;
             }
+            if generated.contains("\"name\"")
+                && generated.contains("\"arguments\"")
+                && parse_json_tool_call(&generated).is_ok()
+            {
+                break;
+            }
 
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .context("append sampled token")?;
+            let next_tokens = [token];
+            let mut next_batch =
+                LlamaBatch::get_one(&next_tokens).context("prepare sampled token batch")?;
             n_cur += 1;
-            ctx.decode(&mut batch).context("decode sampled token")?;
+            if let Err(e) = ctx.decode(&mut next_batch) {
+                if !generated.trim().is_empty() {
+                    break;
+                }
+                bail!("decode sampled token token={} pos={}: {e}", token.0, n_cur);
+            }
+            first_token_sampler.accept(token);
+            continuation_sampler.accept(token);
         }
 
         if !request.stream && !generated.is_empty() {

@@ -9,6 +9,9 @@ mod source_ledger;
 mod system_prompt;
 mod tasks;
 
+#[cfg(all(feature = "runtime-stub", not(debug_assertions)))]
+compile_error!("runtime-stub is a test harness feature and must not be used in release builds");
+
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use base64::Engine;
@@ -39,7 +42,7 @@ use termlm_indexer::{
 };
 use termlm_inference::{
     ChatMessage, ChatRequest, InferenceProvider, LocalLlamaProvider, OllamaProvider,
-    ProviderCapabilities, ProviderEvent, StructuredOutputMode, ToolSchema,
+    ProviderCapabilities, ProviderEvent, StructuredOutputMode, ToolCall, ToolSchema,
     tool_parser::{parse_json_tool_call, parse_tagged_tool_calls},
 };
 use termlm_protocol::{
@@ -117,6 +120,7 @@ struct CommandPlan {
     intent: String,
     expected_effect: String,
     commands_used: Vec<String>,
+    continue_after_execution: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +545,8 @@ async fn main() -> Result<()> {
         last_provider_usage: Mutex::new(ProviderUsageSnapshot::default()),
     });
 
+    refresh_generated_filesystem_context_for_process("startup");
+
     let state_for_reload = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(e) = watch_config_reload_signals(state_for_reload).await {
@@ -641,6 +647,8 @@ async fn watch_config_reload_signals(_state: Arc<DaemonState>) -> Result<()> {
 }
 
 async fn reload_runtime_config(state: &Arc<DaemonState>) -> Result<()> {
+    refresh_generated_filesystem_context_for_process("config reload");
+
     let loaded = load_or_create(Some(&state.config_path))?;
     for w in loaded.warnings {
         warn!("{w}");
@@ -717,6 +725,34 @@ async fn reload_runtime_config(state: &Arc<DaemonState>) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn refresh_generated_filesystem_context_for_process(reason: &str) {
+    let mut env_subset = BTreeMap::new();
+    for key in ["HOME", "PWD"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            env_subset.insert(key.to_string(), value);
+        }
+    }
+    let cwd = std::env::current_dir().ok();
+    refresh_generated_filesystem_context(cwd.as_deref(), &env_subset, reason);
+}
+
+fn refresh_generated_filesystem_context(
+    cwd: Option<&Path>,
+    env_subset: &BTreeMap<String, String>,
+    reason: &str,
+) {
+    match termlm_config::refresh_filesystem_context_snapshot(cwd, env_subset) {
+        Ok(path) => debug!(
+            reason = reason,
+            path = %path.display(),
+            "filesystem context refreshed"
+        ),
+        Err(e) => warn!(reason = reason, "filesystem context refresh failed: {e:#}"),
+    }
 }
 
 fn preserve_restart_required_fields(old: &AppConfig, next: &mut AppConfig) {
@@ -851,6 +887,12 @@ async fn handle_connection(
                     continue;
                 }
                 let shell_id = Uuid::now_v7();
+                let env_subset = payload.env_subset.clone();
+                let cwd = env_subset
+                    .get("PWD")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from);
+                refresh_generated_filesystem_context(cwd.as_deref(), &env_subset, "shell register");
                 {
                     let mut reg = state.registry.lock().await;
                     reg.insert(
@@ -860,7 +902,7 @@ async fn handle_connection(
                             tty: payload.tty,
                             shell_kind: payload.shell_kind.clone(),
                             shell_version: payload.shell_version,
-                            env_subset: payload.env_subset,
+                            env_subset,
                             context: None,
                         },
                     );
@@ -1343,96 +1385,9 @@ async fn process_start_task(
         "source_ledger_ms".to_string(),
         source_ledger_started.elapsed().as_millis() as u64,
     );
-    let mut drafting_prompt = context_assembly.prompt.clone();
-    let retrieval_started = std::time::Instant::now();
-    if matches!(
-        classification.classification,
-        tasks::TaskClassification::FreshCommandRequest
-            | tasks::TaskClassification::DiagnosticDebugging
-            | tasks::TaskClassification::ReferentialFollowup
-            | tasks::TaskClassification::ExploratoryShellQuestion
-    ) {
-        let retrieved_chunks = retrieve_chunks_for_prompt(
-            state,
-            &payload.prompt,
-            Some(state.config_snapshot().indexer.rag_top_k as u32),
-        )
-        .await;
-        if retrieved_chunks.is_empty() {
-            drafting_prompt.push_str(
-                "\n\n## Relevant local command docs\nNo local command-doc retrieval hits matched this prompt. Use lookup_command_docs for likely commands; if local docs are missing or insufficient and web tools are available, use web_search/web_read before proposing a command. Ask one focused clarification question only if no grounded command is possible.",
-            );
-        } else {
-            drafting_prompt.push_str("\n\n");
-            drafting_prompt.push_str(&format_retrieved_docs_block(&retrieved_chunks));
-            append_source_refs(state, retrieved_chunk_source_refs(&retrieved_chunks)).await;
-        }
-        maybe_write_retrieval_trace(
-            state,
-            Some(payload.task_id),
-            &payload.prompt,
-            Some(state.config_snapshot().indexer.rag_top_k as u32),
-            &retrieved_chunks,
-        )
-        .await;
-    }
-    stage_timings.insert(
-        "prompt_retrieval_ms".to_string(),
-        retrieval_started.elapsed().as_millis() as u64,
-    );
+    let drafting_prompt = with_orchestration_guidance(context_assembly.prompt.as_str());
 
-    if payload.mode == "?"
-        && matches!(
-            classification.classification,
-            tasks::TaskClassification::WebCurrentInfoQuestion
-        )
-        && state.config_snapshot().web.enabled
-        && state.config_snapshot().web.expose_tools
-    {
-        let web_started = std::time::Instant::now();
-        let web_cfg = state.config_snapshot();
-        let call = termlm_inference::ToolCall {
-            name: "web_search".to_string(),
-            arguments: serde_json::json!({
-                "query": payload.prompt.clone(),
-                "freshness": infer_search_freshness(&payload.prompt, &web_cfg.web.freshness_required_terms),
-                "max_results": web_cfg.web.max_results.min(4),
-            }),
-        };
-        if let Some((tool_name, tool_output)) =
-            handle_readonly_tool_call(state, &payload, &session, &call).await?
-        {
-            let budgeted_output = context::trim_to_tokens(
-                &tool_output,
-                tool_output_budget_tokens(web_cfg.as_ref(), &tool_name).max(256),
-            );
-            drafting_prompt.push_str("\n\n## Automatic web_search results\n");
-            drafting_prompt.push_str(&budgeted_output);
-            drafting_prompt.push_str(
-                "\n\nUse the web_search results above only if they are relevant. Emit one execute_shell_command tool call when they are enough to ground the command.",
-            );
-        }
-        stage_timings.insert(
-            "automatic_web_search_ms".to_string(),
-            web_started.elapsed().as_millis() as u64,
-        );
-    }
-
-    let progress_started = std::time::Instant::now();
-    let progress = state.index_progress.lock().await.clone();
-    let usable_index_loaded = !state.index_runtime.lock().await.chunks.is_empty();
-    if let Some(progress_line) = indexing_progress_banner(&progress, usable_index_loaded) {
-        transport
-            .send(ServerMessage::ModelText {
-                task_id: payload.task_id,
-                chunk: progress_line,
-            })
-            .await?;
-    }
-    stage_timings.insert(
-        "progress_banner_ms".to_string(),
-        progress_started.elapsed().as_millis() as u64,
-    );
+    stage_timings.insert("progress_banner_ms".to_string(), 0);
 
     let allow_non_command_shortcuts = payload.mode != "?";
     let result = if allow_non_command_shortcuts
@@ -1475,26 +1430,57 @@ async fn process_start_task(
         if handled_local {
             Ok(())
         } else {
-            let shortcut_started = std::time::Instant::now();
-            let handled_by_shortcut = maybe_run_high_confidence_command_shortcut(
-                state,
-                transport,
-                &payload,
-                &session,
-                &classification,
-            )
-            .await?;
-            if handled_by_shortcut {
-                stage_timings.insert(
-                    "heuristic_shortcut_ms".to_string(),
-                    shortcut_started.elapsed().as_millis() as u64,
-                );
+            let mut handled_by_runtime_stub = false;
+            if runtime_stub_provider_enabled() {
+                let stub_started = std::time::Instant::now();
+                if maybe_run_runtime_stub_provider(
+                    state,
+                    transport,
+                    &payload,
+                    &session,
+                    false,
+                    &classification,
+                    &payload.prompt,
+                )
+                .await?
+                {
+                    stage_timings.insert(
+                        "runtime_stub_provider_ms".to_string(),
+                        stub_started.elapsed().as_millis() as u64,
+                    );
+                    handled_by_runtime_stub = true;
+                }
+            }
+            if handled_by_runtime_stub {
                 Ok(())
             } else {
-                let mut handled_by_runtime_stub = false;
-                if runtime_stub_provider_enabled() {
-                    let stub_started = std::time::Instant::now();
-                    if maybe_run_runtime_stub_provider(
+                let orchestration_started = std::time::Instant::now();
+                let handled_provider = match try_provider_orchestration(
+                    state,
+                    transport,
+                    &payload,
+                    &session,
+                    &classification,
+                    &drafting_prompt,
+                    true,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        cancel_and_clear_task(state, payload.task_id).await;
+                        return Err(e);
+                    }
+                };
+                stage_timings.insert(
+                    "provider_orchestration_ms".to_string(),
+                    orchestration_started.elapsed().as_millis() as u64,
+                );
+                if handled_provider {
+                    Ok(())
+                } else {
+                    let fallback_started = std::time::Instant::now();
+                    let handled_fallback = maybe_run_runtime_stub_provider(
                         state,
                         transport,
                         &payload,
@@ -1503,106 +1489,46 @@ async fn process_start_task(
                         &classification,
                         &payload.prompt,
                     )
-                    .await?
-                    {
+                    .await?;
+                    if handled_fallback {
                         stage_timings.insert(
-                            "runtime_stub_provider_ms".to_string(),
-                            stub_started.elapsed().as_millis() as u64,
+                            "provider_no_tool_call_ms".to_string(),
+                            fallback_started.elapsed().as_millis() as u64,
                         );
-                        handled_by_runtime_stub = true;
-                    }
-                }
-                if handled_by_runtime_stub {
-                    Ok(())
-                } else {
-                    let orchestration_started = std::time::Instant::now();
-                    let handled_provider = match try_provider_orchestration(
-                        state,
-                        transport,
-                        &payload,
-                        &session,
-                        &classification,
-                        &drafting_prompt,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            cancel_and_clear_task(state, payload.task_id).await;
-                            return Err(e);
-                        }
-                    };
-                    stage_timings.insert(
-                        "provider_orchestration_ms".to_string(),
-                        orchestration_started.elapsed().as_millis() as u64,
-                    );
-                    if handled_provider {
                         Ok(())
                     } else {
-                        let fallback_started = std::time::Instant::now();
-                        let handled_fallback = if maybe_run_runtime_stub_provider(
-                            state,
-                            transport,
-                            &payload,
-                            &session,
-                            false,
-                            &classification,
-                            &payload.prompt,
-                        )
-                        .await?
-                        {
-                            true
-                        } else {
-                            maybe_run_heuristic_command_fallback(
-                                state,
-                                transport,
-                                &payload,
-                                &session,
-                                &classification,
-                            )
-                            .await?
-                        };
-                        if handled_fallback {
-                            stage_timings.insert(
-                                "provider_no_tool_call_ms".to_string(),
-                                fallback_started.elapsed().as_millis() as u64,
-                            );
-                            Ok(())
-                        } else {
-                            let shell_override =
-                                approval_override_for_shell(state, payload.shell_id).await;
-                            state.tasks.lock().await.insert(
-                                payload.task_id,
-                                InFlightTask {
-                                    task_id: payload.task_id,
-                                    shell_id: payload.shell_id,
-                                    mode: payload.mode.clone(),
-                                    original_prompt: payload.prompt.clone(),
-                                    proposed_command: String::new(),
-                                    classification: classification.classification.clone(),
-                                    classification_confidence: classification.confidence,
-                                    approval_override: shell_override,
-                                    awaiting_clarification: true,
-                                    provider_continuation: true,
-                                    tool_round: 0,
-                                    created_at: std::time::Instant::now(),
-                                },
-                            );
-                            transport
-                                .send(ServerMessage::NeedsClarification {
-                                    task_id: payload.task_id,
-                                    question:
-                                        "I couldn't produce a structured command tool call yet. What exact command behavior should run?"
-                                            .to_string(),
-                                })
-                                .await?;
-                            stage_timings.insert(
-                                "provider_no_tool_call_ms".to_string(),
-                                fallback_started.elapsed().as_millis() as u64,
-                            );
-                            Ok(())
-                        }
+                        let shell_override =
+                            approval_override_for_shell(state, payload.shell_id).await;
+                        state.tasks.lock().await.insert(
+                            payload.task_id,
+                            InFlightTask {
+                                task_id: payload.task_id,
+                                shell_id: payload.shell_id,
+                                mode: payload.mode.clone(),
+                                original_prompt: payload.prompt.clone(),
+                                proposed_command: String::new(),
+                                classification: classification.classification.clone(),
+                                classification_confidence: classification.confidence,
+                                approval_override: shell_override,
+                                awaiting_clarification: true,
+                                provider_continuation: true,
+                                tool_round: 0,
+                                created_at: std::time::Instant::now(),
+                            },
+                        );
+                        transport
+                            .send(ServerMessage::NeedsClarification {
+                                task_id: payload.task_id,
+                                question:
+                                    "I couldn't produce a grounded command from the available context yet. What exact command behavior should run, and which path or target should it use?"
+                                        .to_string(),
+                            })
+                            .await?;
+                        stage_timings.insert(
+                            "provider_no_tool_call_ms".to_string(),
+                            fallback_started.elapsed().as_millis() as u64,
+                        );
+                        Ok(())
                     }
                 }
             }
@@ -1970,37 +1896,6 @@ async fn process_user_response(
                         question,
                     })
                     .await?;
-                return Ok(());
-            }
-
-            if let Some(draft) = tasks::high_confidence_shortcut_for_prompt(&detail)
-                .or_else(|| tasks::draft_command_for_prompt(&detail))
-                .or_else(|| tasks::draft_command_for_prompt(&refined_prompt))
-            {
-                propose_command_for_execution(
-                    state,
-                    transport,
-                    &synth,
-                    &session,
-                    true,
-                    &clarified_classification,
-                    CommandPlan {
-                        cmd: draft.cmd.trim().to_string(),
-                        rationale: draft.rationale,
-                        intent: draft.intent,
-                        expected_effect: draft.expected_effect,
-                        commands_used: draft.commands_used,
-                    },
-                )
-                .await?;
-                if let Some(active) = state.tasks.lock().await.get_mut(&payload.task_id) {
-                    active.awaiting_clarification = false;
-                    active.provider_continuation = true;
-                    active.original_prompt = refined_prompt;
-                    active.classification = clarified_classification.classification;
-                    active.classification_confidence = clarified_classification.confidence;
-                    active.created_at = std::time::Instant::now();
-                }
                 return Ok(());
             }
 
@@ -2559,24 +2454,6 @@ async fn send_provider_health(
         .await?;
 
     Ok(())
-}
-
-fn indexing_progress_banner(progress: &IndexProgress, usable_index_loaded: bool) -> Option<String> {
-    if usable_index_loaded {
-        return None;
-    }
-    if progress.phase == "complete" || progress.phase == "idle" {
-        return None;
-    }
-    let display_percent = if progress.phase == "embed" && progress.percent >= 99.9 {
-        99.0
-    } else {
-        progress.percent
-    };
-    Some(format!(
-        "Note: documentation indexing is in progress ({:.1}% complete; {} commands available so far).\nIf a command you need is missing from the cheat sheet, try lookup_command_docs(name) — the index may still have it.\n",
-        display_percent, progress.scanned
-    ))
 }
 
 fn split_web_cache_bytes(total_bytes: usize) -> (usize, usize) {
@@ -4669,6 +4546,125 @@ async fn try_handle_local_tool_request(
     Ok(false)
 }
 
+async fn handle_command_docs_tool_call(
+    state: &Arc<DaemonState>,
+    payload: &termlm_protocol::StartTask,
+    call: &termlm_inference::ToolCall,
+) -> Result<Option<(String, String)>> {
+    let render_json = |value: serde_json::Value| -> String {
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    };
+
+    match call.name.as_str() {
+        "retrieve_command_docs" => {
+            let Some(query) = call.arguments.get("query").and_then(|v| v.as_str()) else {
+                return Ok(Some((
+                    "retrieve_command_docs".to_string(),
+                    render_json(serde_json::json!({"error":"missing_query"})),
+                )));
+            };
+            let cfg = state.config_snapshot();
+            let requested_top_k = call
+                .arguments
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cfg.indexer.rag_top_k as u64)
+                .max(1)
+                .min(
+                    cfg.indexer
+                        .command_aware_top_k
+                        .max(cfg.indexer.rag_top_k)
+                        .max(1) as u64,
+                ) as u32;
+            let chunks = retrieve_chunks_for_prompt(state, query, Some(requested_top_k)).await;
+            maybe_write_retrieval_trace(
+                state,
+                Some(payload.task_id),
+                query,
+                Some(requested_top_k),
+                &chunks,
+            )
+            .await;
+            append_source_refs(state, retrieved_chunk_source_refs(&chunks)).await;
+            let value = serde_json::json!({
+                "query": query,
+                "top_k": requested_top_k,
+                "expanded_to_source_document": true,
+                "deduplicated_by_command": true,
+                "chunks": chunks,
+            });
+            Ok(Some((
+                "retrieve_command_docs".to_string(),
+                render_json(value),
+            )))
+        }
+        "lookup_command_docs" => {
+            let name = call
+                .arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Ok(Some((
+                    "lookup_command_docs".to_string(),
+                    render_json(serde_json::json!({"error":"missing_name"})),
+                )));
+            }
+            let section = call.arguments.get("section").and_then(|v| v.as_str());
+            let lookup = {
+                let runtime = state.index_runtime.lock().await;
+                lookup_command_docs(
+                    &runtime.chunks,
+                    &name,
+                    section,
+                    state.config_snapshot().indexer.lookup_max_bytes,
+                )
+            };
+            let value = match lookup {
+                Ok(found) => {
+                    append_source_refs(
+                        state,
+                        vec![source_ledger::SourceRef {
+                            source_type: "docs_lookup".to_string(),
+                            source_id: found.name.clone(),
+                            hash: hash_prefix(&found.text),
+                            redacted: false,
+                            truncated: found.truncated,
+                            observed_at: chrono::Utc::now(),
+                            detail: Some("lookup_command_docs".to_string()),
+                            section: found.section.clone(),
+                            offset_start: None,
+                            offset_end: None,
+                            extraction_method: Some("lookup_command_docs".to_string()),
+                            extracted_at: None,
+                            index_version: Some(current_index_version()),
+                        }],
+                    )
+                    .await;
+                    serde_json::json!({
+                        "name": found.name,
+                        "section": found.section,
+                        "text": found.text,
+                        "truncated": found.truncated
+                    })
+                }
+                Err(suggestions) => serde_json::json!({
+                    "error": "unknown_command",
+                    "command": name,
+                    "suggestions": suggestions
+                }),
+            };
+            Ok(Some((
+                "lookup_command_docs".to_string(),
+                render_json(value),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn handle_readonly_tool_call(
     state: &Arc<DaemonState>,
     payload: &termlm_protocol::StartTask,
@@ -4742,6 +4738,47 @@ async fn handle_readonly_tool_call(
         };
 
     match call.name.as_str() {
+        "run_readonly_command"
+            if cfg.local_tools.enabled && cfg.local_tools.readonly_command_enabled =>
+        {
+            let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) else {
+                return Ok(Some((
+                    "run_readonly_command".to_string(),
+                    render_json(serde_json::json!({"error":"missing_cmd"})),
+                )));
+            };
+            let result = run_readonly_command_probe(cfg.as_ref(), &cwd, cmd).await;
+            append_source_refs(
+                state,
+                vec![source_ledger::SourceRef {
+                    source_type: "readonly_command".to_string(),
+                    source_id: truncate_string(cmd, 200),
+                    hash: hash_prefix(&result.to_string()),
+                    redacted: cfg.local_tools.redact_secrets,
+                    truncated: result
+                        .get("stdout_truncated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || result
+                            .get("stderr_truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    observed_at: chrono::Utc::now(),
+                    detail: result.get("exit_code").map(|v| format!("exit_code={v}")),
+                    section: None,
+                    offset_start: None,
+                    offset_end: None,
+                    extraction_method: Some("run_readonly_command".to_string()),
+                    extracted_at: None,
+                    index_version: None,
+                }],
+            )
+            .await;
+            Ok(Some((
+                "run_readonly_command".to_string(),
+                render_json(result),
+            )))
+        }
         "read_file" if cfg.local_tools.enabled => {
             let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
                 return Ok(Some((
@@ -5557,6 +5594,169 @@ async fn handle_readonly_tool_call(
     }
 }
 
+async fn run_readonly_command_probe(cfg: &AppConfig, cwd: &Path, cmd: &str) -> serde_json::Value {
+    let tokens = match validate_readonly_command_tokens(cmd) {
+        Ok(tokens) => tokens,
+        Err(reason) => {
+            return serde_json::json!({
+                "error": "rejected_readonly_probe",
+                "reason": reason,
+                "cmd": cmd
+            });
+        }
+    };
+    let Some((program, args)) = tokens.split_first() else {
+        return serde_json::json!({
+            "error": "rejected_readonly_probe",
+            "reason": "empty command",
+            "cmd": cmd
+        });
+    };
+
+    let timeout_secs = cfg.local_tools.readonly_command_timeout_secs.clamp(1, 10);
+    let max_output = cfg
+        .local_tools
+        .readonly_command_max_output_bytes
+        .clamp(1024, 262_144);
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        command.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return serde_json::json!({
+                "error": "readonly_probe_failed",
+                "message": e.to_string(),
+                "cmd": cmd
+            });
+        }
+        Err(_) => {
+            return serde_json::json!({
+                "error": "readonly_probe_timeout",
+                "timeout_secs": timeout_secs,
+                "cmd": cmd
+            });
+        }
+    };
+
+    let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut stdout = truncate_string(&stdout_raw, max_output / 2);
+    let mut stderr = truncate_string(&stderr_raw, max_output / 2);
+    if cfg.local_tools.redact_secrets {
+        stdout = termlm_local_tools::redaction::redact_secrets(&stdout);
+        stderr = termlm_local_tools::redaction::redact_secrets(&stderr);
+    }
+
+    serde_json::json!({
+        "cmd": cmd,
+        "cwd": cwd.display().to_string(),
+        "exit_code": output.status.code(),
+        "success": output.status.success(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_raw.chars().count() > stdout.chars().count(),
+        "stderr_truncated": stderr_raw.chars().count() > stderr.chars().count(),
+    })
+}
+
+fn validate_readonly_command_tokens(cmd: &str) -> std::result::Result<Vec<String>, String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Err("empty command".to_string());
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') || trimmed.contains('`') {
+        return Err("shell newlines and backtick substitution are not allowed".to_string());
+    }
+    let parsed = parse_command(trimmed);
+    if parsed.ambiguous {
+        return Err("ambiguous shell syntax is not allowed".to_string());
+    }
+    if parsed.has_pipeline
+        || parsed.has_control_operators
+        || parsed.has_redirection
+        || parsed.has_command_substitution
+        || parsed.has_grouping
+    {
+        return Err(
+            "pipelines, control operators, redirection, grouping, and command substitution are not allowed"
+                .to_string(),
+        );
+    }
+    if parsed.tokens.len() > 40 {
+        return Err("too many arguments for a read-only probe".to_string());
+    }
+    if parsed
+        .tokens
+        .iter()
+        .any(|token| token.contains('$') || token.starts_with('~'))
+    {
+        return Err(
+            "shell expansions are not available; use absolute or relative paths".to_string(),
+        );
+    }
+    let Some(program) = parsed.tokens.first().map(String::as_str) else {
+        return Err("empty command".to_string());
+    };
+    if !readonly_probe_program_allowed(program, &parsed.tokens[1..]) {
+        return Err(format!(
+            "`{program}` is not allowlisted as a read-only probe"
+        ));
+    }
+    Ok(parsed.tokens)
+}
+
+fn readonly_probe_program_allowed(program: &str, args: &[String]) -> bool {
+    match program {
+        "pwd" => args.iter().all(|arg| matches!(arg.as_str(), "-L" | "-P")),
+        "ls" | "stat" | "df" | "head" | "tail" | "wc" | "du" => true,
+        "find" => !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fls"
+                    | "-fprint"
+                    | "-fprintf"
+            )
+        }),
+        "which" | "whereis" | "uname" | "date" | "whoami" | "id" | "sw_vers" | "ps" | "pgrep"
+        | "uptime" => true,
+        "sysctl" => !args.iter().any(|arg| arg == "-w" || arg.contains('=')),
+        "git" => readonly_git_probe_allowed(args),
+        _ => false,
+    }
+}
+
+fn readonly_git_probe_allowed(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+    match subcommand {
+        "status" | "rev-parse" | "log" | "diff" | "show" | "ls-files" | "describe" => true,
+        "branch" => args.iter().skip(1).all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--show-current" | "--list" | "--all" | "-a" | "-r" | "-v" | "-vv"
+            )
+        }),
+        _ => false,
+    }
+}
+
 async fn try_provider_orchestration(
     state: &Arc<DaemonState>,
     transport: &mut ipc::ServerTransport,
@@ -5574,8 +5774,12 @@ async fn try_provider_orchestration(
     let mut tools = Vec::<ToolSchema>::new();
     if expose_execute {
         tools.push(tool_schema_execute_shell_command());
+        if payload.mode == "?" {
+            tools.push(tool_schema_ask_clarification());
+        }
     }
     if expose_lookup {
+        tools.push(tool_schema_retrieve_command_docs());
         tools.push(tool_schema_lookup_docs());
     }
     let local_tools = local_tool_schemas_for_profile(cfg.as_ref(), &profile);
@@ -5589,6 +5793,7 @@ async fn try_provider_orchestration(
     if tools.is_empty() {
         return Ok(false);
     }
+    let stream_to_user = cfg.inference.stream && tools.is_empty();
     *state.last_provider_usage.lock().await = ProviderUsageSnapshot::default();
 
     let mut system = system_prompt::build_system_prompt(
@@ -5600,14 +5805,14 @@ async fn try_provider_orchestration(
         &classification.classification,
         classification.confidence,
     );
-    let progress_note = {
-        let progress = state.index_progress.lock().await;
-        let usable_index_loaded = !state.index_runtime.lock().await.chunks.is_empty();
-        indexing_progress_banner(&progress, usable_index_loaded)
-    };
-    if let Some(note) = progress_note {
-        system.push('\n');
-        system.push_str(&note);
+    if payload.mode == "?" && expose_execute {
+        system.push_str(
+            "\nCommand mode contract: respond with a tool call, not plain text. \
+             For obvious shell tasks, call execute_shell_command immediately. \
+             Common installed commands such as pwd, ls, find, grep, du, tail, mkdir, and date \
+             can be grounded by the shell/PATH check even if the documentation index is still warming. \
+             Use ask_clarification only when the user's target, path, or requested behavior is actually missing.",
+        );
     }
     if profile.web_tools && cfg.web.enabled && cfg.web.expose_tools && cfg.web.citation_required {
         system.push_str(
@@ -5617,7 +5822,9 @@ async fn try_provider_orchestration(
     }
     if profile.web_tools && cfg.web.enabled && cfg.web.expose_tools {
         system.push_str(
-            "\nFor command requests, use local command docs/retrieval first. If local docs are \
+            "\nFor command requests, plan silently before acting. Use retrieve_command_docs for \
+             broad local command-doc search, lookup_command_docs for exact commands, and \
+             run_readonly_command/local tools for safe factual probes. If local observations are \
              missing or insufficient for the requested action, use web_search/web_read as a \
              fallback, then emit one execute_shell_command tool call. Ask one focused \
              clarification question only when neither local nor web context is enough.",
@@ -5689,95 +5896,63 @@ async fn try_provider_orchestration(
         }
     };
 
+    let mut request_options = provider_request_options(cfg.as_ref());
+    if payload.mode == "?" {
+        request_options.insert("max_tokens".to_string(), serde_json::json!(96));
+        request_options.insert("num_predict".to_string(), serde_json::json!(96));
+    }
     let chat_request = ChatRequest {
         task_id: Some(payload.task_id.to_string()),
         model: active_model_name(state.config_snapshot().as_ref()),
         messages,
         tools,
-        stream: cfg.inference.stream,
+        stream: stream_to_user,
         think: cfg.behavior.thinking,
-        options: provider_request_options(cfg.as_ref()),
+        options: request_options,
     };
-    let stream_result = {
-        let provider = state.provider.lock().await;
-        provider.chat_stream(chat_request).await
-    };
-    let mut stream = match stream_result {
-        Ok(stream) => stream,
-        Err(e) => {
-            cancel_provider_task(state, payload.task_id).await;
-            transport
-                .send(ServerMessage::Error {
-                    task_id: Some(payload.task_id),
-                    kind: ErrorKind::InferenceProviderUnavailable,
-                    message: format!("provider request failed: {e}"),
-                    matched_pattern: None,
-                })
-                .await?;
-            state
-                .task_conversations
-                .lock()
-                .await
-                .remove(&payload.task_id);
-            return Ok(false);
-        }
-    };
-
+    let exposed_tool_names = chat_request
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let json_fallback_messages = chat_request.messages.clone();
+    let json_fallback_tools = chat_request.tools.clone();
     let mut text_buffer = String::new();
     let mut tool_calls = Vec::new();
-    let mut pending_stream_chunk = String::new();
-    let mut last_stream_emit = std::time::Instant::now();
     let mut provider_usage = ProviderUsageSnapshot::default();
-    let idle =
-        std::time::Duration::from_secs(state.config_snapshot().inference.token_idle_timeout_secs);
 
-    loop {
-        let next = tokio::time::timeout(idle, stream.next()).await;
-        let evt = match next {
-            Ok(Some(Ok(e))) => e,
-            Ok(Some(Err(e))) => {
+    if payload.mode == "?"
+        && cfg.inference.provider == "local"
+        && let Some((call, raw_text, usage)) = try_local_action_fallback(
+            state,
+            payload,
+            &json_fallback_messages,
+            &json_fallback_tools,
+        )
+        .await?
+    {
+        text_buffer = raw_text;
+        provider_usage = usage;
+        tool_calls.push(call);
+    }
+
+    if tool_calls.is_empty() {
+        let stream_result = {
+            let provider = state.provider.lock().await;
+            provider.chat_stream(chat_request).await
+        };
+        let mut stream = match stream_result {
+            Ok(stream) => stream,
+            Err(e) => {
                 cancel_provider_task(state, payload.task_id).await;
                 transport
                     .send(ServerMessage::Error {
                         task_id: Some(payload.task_id),
-                        kind: ErrorKind::Internal,
-                        message: format!("provider stream error: {e}"),
+                        kind: ErrorKind::InferenceProviderUnavailable,
+                        message: format!("provider request failed: {e}"),
                         matched_pattern: None,
                     })
                     .await?;
-                state
-                    .task_conversations
-                    .lock()
-                    .await
-                    .remove(&payload.task_id);
-                return Ok(false);
-            }
-            Ok(None) => break,
-            Err(_) => {
-                cancel_provider_task(state, payload.task_id).await;
-                transport
-                    .send(ServerMessage::Error {
-                        task_id: Some(payload.task_id),
-                        kind: ErrorKind::ModelStalled,
-                        message: "provider token stream idle timeout".to_string(),
-                        matched_pattern: None,
-                    })
-                    .await?;
-                transport
-                    .send(ServerMessage::TaskComplete {
-                        task_id: payload.task_id,
-                        reason: TaskCompleteReason::Timeout,
-                        summary: "Provider timed out.".to_string(),
-                    })
-                    .await?;
-                append_session_turn_if_session_mode(
-                    state,
-                    &payload.mode,
-                    payload.shell_id,
-                    payload.prompt.clone(),
-                    "Provider timed out.".to_string(),
-                )
-                .await;
                 state
                     .task_conversations
                     .lock()
@@ -5787,67 +5962,130 @@ async fn try_provider_orchestration(
             }
         };
 
-        match evt {
-            ProviderEvent::TextChunk { content } => {
-                text_buffer.push_str(&content);
-                if tool_calls.is_empty() && text_buffer.contains("tool_call") {
-                    if let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
-                        && !parsed_tagged.is_empty()
-                    {
-                        tool_calls = parsed_tagged;
-                        cancel_provider_task(state, payload.task_id).await;
-                        break;
-                    }
-                    if let Some(partial_call) =
-                        extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
-                    {
-                        tool_calls.push(partial_call);
-                        cancel_provider_task(state, payload.task_id).await;
-                        break;
-                    }
-                }
-                if cfg.inference.stream {
-                    pending_stream_chunk.push_str(&content);
-                    let should_emit = pending_stream_chunk.chars().count() >= 16
-                        || pending_stream_chunk.contains('\n')
-                        || last_stream_emit.elapsed() >= std::time::Duration::from_millis(25);
-                    if !should_emit {
-                        continue;
-                    }
+        let mut pending_stream_chunk = String::new();
+        let mut last_stream_emit = std::time::Instant::now();
+        let idle = std::time::Duration::from_secs(
+            state.config_snapshot().inference.token_idle_timeout_secs,
+        );
+
+        loop {
+            let next = tokio::time::timeout(idle, stream.next()).await;
+            let evt = match next {
+                Ok(Some(Ok(e))) => e,
+                Ok(Some(Err(e))) => {
+                    cancel_provider_task(state, payload.task_id).await;
                     transport
-                        .send(ServerMessage::ModelText {
-                            task_id: payload.task_id,
-                            chunk: pending_stream_chunk.clone(),
+                        .send(ServerMessage::Error {
+                            task_id: Some(payload.task_id),
+                            kind: ErrorKind::Internal,
+                            message: format!("provider stream error: {e}"),
+                            matched_pattern: None,
                         })
                         .await?;
-                    pending_stream_chunk.clear();
-                    last_stream_emit = std::time::Instant::now();
+                    state
+                        .task_conversations
+                        .lock()
+                        .await
+                        .remove(&payload.task_id);
+                    return Ok(true);
                 }
+                Ok(None) => break,
+                Err(_) => {
+                    cancel_provider_task(state, payload.task_id).await;
+                    transport
+                        .send(ServerMessage::Error {
+                            task_id: Some(payload.task_id),
+                            kind: ErrorKind::ModelStalled,
+                            message: "provider token stream idle timeout".to_string(),
+                            matched_pattern: None,
+                        })
+                        .await?;
+                    transport
+                        .send(ServerMessage::TaskComplete {
+                            task_id: payload.task_id,
+                            reason: TaskCompleteReason::Timeout,
+                            summary: "Provider timed out.".to_string(),
+                        })
+                        .await?;
+                    append_session_turn_if_session_mode(
+                        state,
+                        &payload.mode,
+                        payload.shell_id,
+                        payload.prompt.clone(),
+                        "Provider timed out.".to_string(),
+                    )
+                    .await;
+                    state
+                        .task_conversations
+                        .lock()
+                        .await
+                        .remove(&payload.task_id);
+                    return Ok(true);
+                }
+            };
+
+            match evt {
+                ProviderEvent::TextChunk { content } => {
+                    text_buffer.push_str(&content);
+                    if tool_calls.is_empty() && text_buffer.contains("tool_call") {
+                        if let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
+                            && !parsed_tagged.is_empty()
+                        {
+                            tool_calls = parsed_tagged;
+                            cancel_provider_task(state, payload.task_id).await;
+                            break;
+                        }
+                        if let Some(partial_call) =
+                            extract_execute_shell_command_from_partial_tagged_call(&text_buffer)
+                        {
+                            tool_calls.push(partial_call);
+                            cancel_provider_task(state, payload.task_id).await;
+                            break;
+                        }
+                    }
+                    if stream_to_user {
+                        pending_stream_chunk.push_str(&content);
+                        let should_emit = pending_stream_chunk.chars().count() >= 16
+                            || pending_stream_chunk.contains('\n')
+                            || last_stream_emit.elapsed() >= std::time::Duration::from_millis(25);
+                        if !should_emit {
+                            continue;
+                        }
+                        transport
+                            .send(ServerMessage::ModelText {
+                                task_id: payload.task_id,
+                                chunk: pending_stream_chunk.clone(),
+                            })
+                            .await?;
+                        pending_stream_chunk.clear();
+                        last_stream_emit = std::time::Instant::now();
+                    }
+                }
+                ProviderEvent::ThinkingChunk { .. } => {}
+                ProviderEvent::ToolCall { call } => {
+                    tool_calls.push(call);
+                }
+                ProviderEvent::Usage { usage } => {
+                    provider_usage = ProviderUsageSnapshot {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        reported: true,
+                    };
+                }
+                ProviderEvent::Done => break,
             }
-            ProviderEvent::ThinkingChunk { .. } => {}
-            ProviderEvent::ToolCall { call } => {
-                tool_calls.push(call);
-            }
-            ProviderEvent::Usage { usage } => {
-                provider_usage = ProviderUsageSnapshot {
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    reported: true,
-                };
-            }
-            ProviderEvent::Done => break,
+        }
+        if stream_to_user && !pending_stream_chunk.is_empty() {
+            transport
+                .send(ServerMessage::ModelText {
+                    task_id: payload.task_id,
+                    chunk: pending_stream_chunk.clone(),
+                })
+                .await?;
         }
     }
-    *state.last_provider_usage.lock().await = provider_usage;
 
-    if cfg.inference.stream && !pending_stream_chunk.is_empty() {
-        transport
-            .send(ServerMessage::ModelText {
-                task_id: payload.task_id,
-                chunk: pending_stream_chunk.clone(),
-            })
-            .await?;
-    }
+    *state.last_provider_usage.lock().await = provider_usage;
 
     if tool_calls.is_empty()
         && let Ok(parsed_tagged) = parse_tagged_tool_calls(&text_buffer)
@@ -5863,13 +6101,25 @@ async fn try_provider_orchestration(
     }
 
     if tool_calls.is_empty()
-        && matches!(
-            state.provider_caps.structured_mode,
-            StructuredOutputMode::StrictJsonFallback
-        )
+        && !exposed_tool_names.is_empty()
         && let Ok(parsed) = parse_json_tool_call(&text_buffer)
+        && exposed_tool_names.iter().any(|name| name == &parsed.name)
     {
         tool_calls.push(parsed);
+    }
+    if tool_calls.is_empty()
+        && payload.mode == "?"
+        && let Some((call, raw_text, usage)) = try_local_action_fallback(
+            state,
+            payload,
+            &json_fallback_messages,
+            &json_fallback_tools,
+        )
+        .await?
+    {
+        text_buffer = raw_text;
+        *state.last_provider_usage.lock().await = usage;
+        tool_calls.push(call);
     }
     if tool_calls.is_empty()
         && payload.mode == "?"
@@ -5973,7 +6223,7 @@ async fn try_provider_orchestration(
                 final_text.push_str(&appended_citations);
             }
         }
-        if !cfg.inference.stream {
+        if !stream_to_user {
             transport
                 .send(ServerMessage::ModelText {
                     task_id: payload.task_id,
@@ -6022,100 +6272,17 @@ async fn try_provider_orchestration(
 
     let mut sent_docs = false;
     for call in &tool_calls {
-        if call.name.as_str() == "lookup_command_docs" {
-            let name = call
-                .arguments
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let lookup = {
-                let runtime = state.index_runtime.lock().await;
-                lookup_command_docs(
-                    &runtime.chunks,
-                    &name,
-                    call.arguments.get("section").and_then(|v| v.as_str()),
-                    state.config_snapshot().indexer.lookup_max_bytes,
-                )
-            };
-            let (tool_response, display_chunk) = match lookup {
-                Ok(found) => {
-                    let tool = serde_json::json!({
-                        "name": found.name,
-                        "section": found.section,
-                        "text": found.text,
-                        "truncated": found.truncated
-                    });
-                    let serialized =
-                        serde_json::to_string(&tool).unwrap_or_else(|_| "{}".to_string());
-                    let display = format!(
-                        "## {}\n{}",
-                        found.name,
-                        truncate_string(
-                            tool.get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default(),
-                            4000
-                        )
-                    );
-                    (
-                        context::trim_to_tokens(
-                            &serialized,
-                            cfg.context_budget.docs_rag_tokens.max(256),
-                        ),
-                        context::trim_to_tokens(
-                            &display,
-                            cfg.context_budget.docs_rag_tokens.max(256),
-                        ),
-                    )
-                }
-                Err(s) => {
-                    let tool = serde_json::json!({
-                        "error": "unknown_command",
-                        "command": name,
-                        "suggestions": s
-                    });
-                    let serialized =
-                        serde_json::to_string(&tool).unwrap_or_else(|_| "{}".to_string());
-                    (
-                        context::trim_to_tokens(
-                            &serialized,
-                            cfg.context_budget.docs_rag_tokens.max(256),
-                        ),
-                        context::trim_to_tokens(
-                            &format!(
-                                "unknown command: {}; suggestions: {}",
-                                name,
-                                tool.get("suggestions")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| arr
-                                        .iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", "))
-                                    .unwrap_or_default()
-                            ),
-                            cfg.context_budget.docs_rag_tokens.max(256),
-                        ),
-                    )
-                }
-            };
+        if let Some((tool_name, tool_output)) =
+            handle_command_docs_tool_call(state, payload, call).await?
+        {
+            let budgeted_output =
+                context::trim_to_tokens(&tool_output, cfg.context_budget.docs_rag_tokens.max(256));
             {
                 let mut conversations = state.task_conversations.lock().await;
                 if let Some(history) = conversations.get_mut(&payload.task_id) {
-                    history.push(ChatMessage::tool("lookup_command_docs", tool_response));
+                    history.push(ChatMessage::tool(tool_name, budgeted_output));
                 }
             }
-            transport
-                .send(ServerMessage::ModelText {
-                    task_id: payload.task_id,
-                    chunk: display_chunk,
-                })
-                .await?;
             sent_docs = true;
         }
     }
@@ -6135,27 +6302,67 @@ async fn try_provider_orchestration(
                     history.push(ChatMessage::tool(tool_name, budgeted_output.clone()));
                 }
             }
-            transport
-                .send(ServerMessage::ModelText {
-                    task_id: payload.task_id,
-                    chunk: truncate_string(&budgeted_output, 6000),
-                })
-                .await?;
             sent_readonly = true;
         }
+    }
+
+    for call in &tool_calls {
+        if call.name.as_str() != "ask_clarification" {
+            continue;
+        }
+        let question = call
+            .arguments
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("What exact command behavior should run?")
+            .trim_end_matches('\n')
+            .to_string();
+        let question = if question.ends_with('?') {
+            question
+        } else {
+            format!("{question}?")
+        };
+        let shell_override = approval_override_for_shell(state, payload.shell_id).await;
+        state.tasks.lock().await.insert(
+            payload.task_id,
+            InFlightTask {
+                task_id: payload.task_id,
+                shell_id: payload.shell_id,
+                mode: payload.mode.clone(),
+                original_prompt: payload.prompt.clone(),
+                proposed_command: String::new(),
+                classification: classification.classification.clone(),
+                classification_confidence: classification.confidence,
+                approval_override: shell_override,
+                awaiting_clarification: true,
+                provider_continuation,
+                tool_round: readonly_tool_round_count(state, payload.task_id).await,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        transport
+            .send(ServerMessage::NeedsClarification {
+                task_id: payload.task_id,
+                question,
+            })
+            .await?;
+        return Ok(true);
     }
 
     for call in tool_calls {
         if call.name.as_str() != "execute_shell_command" {
             continue;
         }
-        let cmd = call
+        let mut cmd = call
             .arguments
             .get("cmd")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .trim()
             .to_string();
+        cmd = sanitize_local_execute_command(&cmd, payload.prompt.trim());
         if cmd.is_empty() {
             continue;
         }
@@ -6184,6 +6391,11 @@ async fn try_provider_orchestration(
                 intent: "provider generated command".to_string(),
                 expected_effect: "execute validated shell command".to_string(),
                 commands_used,
+                continue_after_execution: call
+                    .arguments
+                    .get("continue_after_execution")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             },
         )
         .await?;
@@ -6307,10 +6519,1005 @@ async fn validation_web_fallback_attempt_count(state: &Arc<DaemonState>, task_id
 
 fn readonly_tool_continuation_prompt(web_available: bool) -> &'static str {
     if web_available {
-        "Use the read-only tool results above. If they are sufficient, emit exactly one execute_shell_command tool call for the user to approve. If local command docs are missing or insufficient, use web_search/web_read once before drafting. Ask one focused clarification question only if no grounded command is possible."
+        "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, read-only local tools, or web_search/web_read if another observation is needed. If the evidence is sufficient, emit exactly one execute_shell_command tool call for the user to approve. Ask one focused clarification question only if no grounded command is possible."
     } else {
-        "Use the read-only tool results above. If they are sufficient, emit exactly one execute_shell_command tool call for the user to approve. Ask one focused clarification question only if no grounded command is possible."
+        "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, or read-only local tools if another observation is needed. If the evidence is sufficient, emit exactly one execute_shell_command tool call for the user to approve. Ask one focused clarification question only if no grounded command is possible."
     }
+}
+
+async fn try_local_action_fallback(
+    state: &Arc<DaemonState>,
+    payload: &termlm_protocol::StartTask,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+) -> Result<Option<(ToolCall, String, ProviderUsageSnapshot)>> {
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let allowed_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let action_list = local_action_list(&allowed_names);
+    let filesystem_context = termlm_config::read_filesystem_context_snapshot()
+        .map(|text| context::trim_to_tokens(&text, 300))
+        .unwrap_or_else(|| "filesystem_context_unavailable: true".to_string());
+    let tool_observations = recent_tool_observations_for_local_action(messages, 900);
+    let fallback_messages = vec![
+        ChatMessage::system(
+            "You are termlm's local action planner. Output exactly one action line and no prose.",
+        ),
+        ChatMessage::user(format!(
+            "Allowed actions:\n{action_list}\n\nRules:\n- For ordinary terminal requests, choose EXECUTE with one zsh command for user approval.\n- The EXECUTE command must contain no explanation, no comments, no semicolons, and no extra confirmation commands.\n- Do not append sample output, guessed file names, shell errors, or command results.\n- When the request targets the current directory, use . instead of spelling out a guessed path.\n- Choose RETRIEVE or LOOKUP when command docs are needed before drafting.\n- Choose READONLY only for a safe factual probe needed before drafting.\n- Choose WEB_SEARCH only when local context is insufficient or external/current information is needed.\n- Choose ASK only when the user request is ambiguous.\n- Do not answer the user directly."
+        )),
+        ChatMessage::user(format!(
+            "Command idioms for common terminal requests:\n{}\n\nUser prompt: {}\nCurrent working directory: {}\nShell: {:?}\n\nFilesystem context:\n{}\n\nTool observations:\n{}\n\nAction:",
+            local_action_command_idioms(),
+            payload.prompt.trim(),
+            payload.cwd,
+            payload.shell_kind,
+            filesystem_context,
+            tool_observations
+        )),
+    ];
+
+    let mut options = provider_request_options(state.config_snapshot().as_ref());
+    options.insert("max_tokens".to_string(), serde_json::json!(24));
+    options.insert("num_predict".to_string(), serde_json::json!(24));
+    options.insert(
+        "stop_sequences".to_string(),
+        serde_json::json!([
+            "\n",
+            ";",
+            "#",
+            "```",
+            "<|turn>",
+            "zsh:",
+            "command not found"
+        ]),
+    );
+    let request = ChatRequest {
+        task_id: Some(payload.task_id.to_string()),
+        model: active_model_name(state.config_snapshot().as_ref()),
+        messages: fallback_messages,
+        tools: Vec::new(),
+        stream: false,
+        think: false,
+        options,
+    };
+    let stream_result = {
+        let provider = state.provider.lock().await;
+        provider.chat_stream(request).await
+    };
+    let mut stream = match stream_result {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("json tool-call fallback provider request failed: {e:#}");
+            return Ok(None);
+        }
+    };
+
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut usage = ProviderUsageSnapshot::default();
+    let idle =
+        std::time::Duration::from_secs(state.config_snapshot().inference.token_idle_timeout_secs);
+    loop {
+        let next = tokio::time::timeout(idle, stream.next()).await;
+        let evt = match next {
+            Ok(Some(Ok(e))) => e,
+            Ok(Some(Err(e))) => {
+                warn!("json tool-call fallback stream error: {e:#}");
+                return Ok(None);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                warn!("json tool-call fallback timed out");
+                return Ok(None);
+            }
+        };
+        match evt {
+            ProviderEvent::TextChunk { content } => text.push_str(&content),
+            ProviderEvent::ThinkingChunk { .. } => {}
+            ProviderEvent::ToolCall { call } => tool_calls.push(call),
+            ProviderEvent::Usage {
+                usage: provider_usage,
+            } => {
+                usage = ProviderUsageSnapshot {
+                    prompt_tokens: provider_usage.prompt_tokens,
+                    completion_tokens: provider_usage.completion_tokens,
+                    reported: true,
+                };
+            }
+            ProviderEvent::Done => break,
+        }
+    }
+
+    if let Some(call) = parse_local_action_tool_call(&text, &allowed_names) {
+        tool_calls.push(sanitize_local_action_tool_call(call, payload.prompt.trim()));
+    }
+    if tool_calls.is_empty()
+        && let Ok(parsed) = parse_json_tool_call(&text)
+    {
+        tool_calls.push(parsed);
+    }
+    if tool_calls.is_empty()
+        && let Ok(parsed_tagged) = parse_tagged_tool_calls(&text)
+    {
+        tool_calls.extend(parsed_tagged);
+    }
+    if tool_calls.is_empty()
+        && let Some(partial_call) = extract_execute_shell_command_from_partial_tagged_call(&text)
+    {
+        tool_calls.push(partial_call);
+    }
+    if tool_calls.is_empty()
+        && let Some(plain_call) = extract_execute_shell_command_from_plain_text(&text)
+    {
+        tool_calls.push(plain_call);
+    }
+
+    let call = tool_calls
+        .into_iter()
+        .find(|call| allowed_names.iter().any(|name| name == &call.name));
+    let call = call;
+    Ok(call.map(|call| (call, text, usage)))
+}
+
+fn sanitize_local_action_tool_call(mut call: ToolCall, prompt: &str) -> ToolCall {
+    if call.name != "execute_shell_command" {
+        return call;
+    }
+    let Some(raw_cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) else {
+        return call;
+    };
+    let cmd = sanitize_local_execute_command(raw_cmd, prompt);
+    call.arguments["cmd"] = serde_json::Value::String(cmd.clone());
+    call.arguments["commands_used"] = serde_json::json!(extract_command_names(&cmd, 8));
+    call
+}
+
+fn sanitize_local_execute_command(command: &str, prompt: &str) -> String {
+    let mut cmd = command.trim().to_string();
+    if let Some(pos) = cmd.find("\\n") {
+        cmd.truncate(pos);
+    }
+    for marker in ["zsh:", "command not found"] {
+        if let Some(pos) = cmd.find(marker) {
+            cmd.truncate(pos);
+        }
+    }
+    for marker in [":{}", " | xargs"] {
+        if let Some(pos) = cmd.find(marker) {
+            cmd.truncate(pos);
+        }
+    }
+    cmd = remove_bracketed_path_annotations(&cmd);
+    cmd = cmd.replace("-type f:", "-type f");
+    cmd = clean_local_action_value(&cmd);
+    cmd = strip_unbalanced_trailing_quote(&cmd);
+    cmd = normalize_first_command_token_artifact(&cmd);
+    cmd = normalize_standard_home_dir_artifacts(&cmd, prompt);
+    cmd = collapse_repeated_grep_v_slash(&cmd);
+    cmd = strip_trailing_incomplete_grep(&cmd);
+    cmd = strip_grep_dot_filter_artifact(&cmd);
+    cmd = normalize_grep_pattern_tail_artifacts(&cmd);
+    cmd = normalize_grep_find_predicate_artifacts(&cmd, prompt);
+    cmd = normalize_grep_directory_content_artifacts(&cmd, prompt);
+    cmd = normalize_unspecified_current_dir_path_args(&cmd, prompt);
+    cmd = normalize_find_print_artifacts(&cmd);
+    cmd = normalize_pipeline_wc_artifacts(&cmd, prompt);
+    cmd = normalize_no_arg_program_artifacts(&cmd);
+    cmd = normalize_mkdir_path_artifacts(&cmd, prompt);
+
+    let mut tokens = cmd
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return cmd;
+    };
+
+    if program == "ls" {
+        if let Some(dot_idx) = tokens
+            .iter()
+            .position(|token| matches!(token.as_str(), "." | "./" | "./."))
+        {
+            tokens[dot_idx] = ".".to_string();
+            tokens.truncate(dot_idx + 1);
+            return tokens.join(" ");
+        }
+    }
+
+    if matches!(program, "tail" | "head" | "cat" | "less" | "more" | "wc") {
+        let prompt_paths = filename_like_prompt_tokens(prompt);
+        if let Some(path_idx) = tokens.iter().position(|token| {
+            let stripped = token.trim_matches(|c: char| {
+                matches!(c, '"' | '\'' | '`' | ',' | ':' | ';' | ')' | '(')
+            });
+            prompt_paths.iter().any(|path| path == stripped)
+        }) {
+            tokens.truncate(path_idx + 1);
+            return tokens.join(" ");
+        }
+    }
+
+    cmd
+}
+
+fn strip_grep_dot_filter_artifact(command: &str) -> String {
+    for marker in [
+        r#"| grep -v '^\.$'"#,
+        r#"| grep -v '^\.$"#,
+        r#"| grep -v "^\.$""#,
+        r#"| grep -v "^\.$"#,
+    ] {
+        if let Some(pos) = command.find(marker) {
+            return command[..pos].trim_end().to_string();
+        }
+    }
+    command.to_string()
+}
+
+fn normalize_grep_pattern_tail_artifacts(command: &str) -> String {
+    let tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !matches!(tokens.first().map(String::as_str), Some("grep" | "rg")) {
+        return command.to_string();
+    }
+    let mut changed = false;
+    let mut cleaned = Vec::with_capacity(tokens.len());
+    let mut saw_dot = false;
+    for token in tokens {
+        if looks_like_grep_pattern_tail_artifact(&token) {
+            changed = true;
+            if token.trim_start().starts_with('.') && !saw_dot {
+                cleaned.push(".".to_string());
+                saw_dot = true;
+            }
+            continue;
+        }
+        if matches!(token.as_str(), "." | "./") {
+            saw_dot = true;
+        }
+        cleaned.push(token);
+    }
+    if changed {
+        cleaned.join(" ")
+    } else {
+        command.to_string()
+    }
+}
+
+fn looks_like_grep_pattern_tail_artifact(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| matches!(c, ',' | ':' | ';'));
+    trimmed.contains("[]")
+        || trimmed.starts_with(".\"")
+        || trimmed.starts_with(".'")
+        || trimmed.starts_with(".`")
+        || looks_like_zsh_glob_qualifier_artifact(trimmed)
+}
+
+fn looks_like_zsh_glob_qualifier_artifact(token: &str) -> bool {
+    token.contains("(.)")
+        || token.contains("(/)")
+        || token.contains("(*)")
+        || token.ends_with("(.)")
+}
+
+fn normalize_grep_find_predicate_artifacts(command: &str, prompt: &str) -> String {
+    let tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return command.to_string();
+    };
+    if !matches!(program, "grep" | "rg") {
+        return command.to_string();
+    }
+    if !tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-type"
+                | "-name"
+                | "-size"
+                | "-maxdepth"
+                | "-mindepth"
+                | "-mtime"
+                | "-mmin"
+                | "-empty"
+                | "-print"
+        )
+    }) {
+        return command.to_string();
+    }
+
+    let mut cleaned = Vec::with_capacity(tokens.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if matches!(
+            token,
+            "-type" | "-name" | "-size" | "-maxdepth" | "-mindepth" | "-mtime" | "-mmin"
+        ) {
+            i = (i + 2).min(tokens.len());
+            changed = true;
+            continue;
+        }
+        if matches!(token, "-empty" | "-print") {
+            i += 1;
+            changed = true;
+            continue;
+        }
+        cleaned.push(tokens[i].clone());
+        i += 1;
+    }
+
+    if !changed {
+        return command.to_string();
+    }
+
+    let mut seen_dot_arg = false;
+    cleaned.retain(|token| {
+        if matches!(token.as_str(), "." | "./") {
+            if seen_dot_arg {
+                return false;
+            }
+            seen_dot_arg = true;
+        }
+        true
+    });
+
+    if program == "grep"
+        && grep_tokens_have_flag(&cleaned, 'l', "--files-with-matches")
+        && !grep_tokens_have_flag(&cleaned, 'R', "--recursive")
+        && (seen_dot_arg || prompt_mentions_recursive_content_search(prompt))
+    {
+        ensure_short_flag_in_tokens(&mut cleaned, 'R');
+    }
+
+    cleaned.join(" ")
+}
+
+fn normalize_grep_directory_content_artifacts(command: &str, prompt: &str) -> String {
+    let mut tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !matches!(tokens.first().map(String::as_str), Some("grep")) {
+        return command.to_string();
+    }
+    if !prompt_mentions_recursive_content_search(prompt)
+        && !grep_tokens_have_flag(&tokens, 'l', "--files-with-matches")
+    {
+        return command.to_string();
+    }
+
+    let mut changed = false;
+    let mut seen_dot_arg = false;
+    tokens.retain(|token| {
+        if matches!(token.as_str(), "." | "./") {
+            if seen_dot_arg {
+                changed = true;
+                return false;
+            }
+            seen_dot_arg = true;
+        }
+        true
+    });
+
+    if seen_dot_arg
+        && grep_tokens_have_flag(&tokens, 'l', "--files-with-matches")
+        && !grep_tokens_have_flag(&tokens, 'R', "--recursive")
+    {
+        ensure_short_flag_in_tokens(&mut tokens, 'R');
+        changed = true;
+    }
+
+    if changed {
+        tokens.join(" ")
+    } else {
+        command.to_string()
+    }
+}
+
+fn prompt_mentions_recursive_content_search(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    (lower.contains("under here")
+        || lower.contains("in this directory")
+        || lower.contains("recursive"))
+        && (lower.contains("content") || lower.contains("contain") || lower.contains("match"))
+}
+
+fn grep_tokens_have_flag(tokens: &[String], short: char, long: &str) -> bool {
+    for token in tokens.iter().skip(1) {
+        if token == "--" {
+            break;
+        }
+        if token == long {
+            return true;
+        }
+        if token.starts_with('-') && !token.starts_with("--") && token[1..].contains(short) {
+            return true;
+        }
+    }
+    false
+}
+
+fn ensure_short_flag_in_tokens(tokens: &mut Vec<String>, flag: char) {
+    for token in tokens.iter_mut().skip(1) {
+        if token == "--" {
+            break;
+        }
+        if token.starts_with('-') && !token.starts_with("--") && token.len() > 1 {
+            if !token[1..].contains(flag) {
+                token.push(flag);
+            }
+            return;
+        }
+    }
+    tokens.insert(1, format!("-{flag}"));
+}
+
+fn collapse_repeated_grep_v_slash(command: &str) -> String {
+    let mut out = command.to_string();
+    while out.contains("| grep -v / | grep -v /") {
+        out = out.replace("| grep -v / | grep -v /", "| grep -v /");
+    }
+    out
+}
+
+fn strip_trailing_incomplete_grep(command: &str) -> String {
+    let trimmed = command.trim_end();
+    for suffix in ["| grep -v", "| grep"] {
+        if let Some(prefix) = trimmed.strip_suffix(suffix) {
+            return prefix.trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn strip_unbalanced_trailing_quote(command: &str) -> String {
+    let trimmed = command.trim_end();
+    for quote in ['"', '\''] {
+        if trimmed.ends_with(quote) && trimmed.matches(quote).count() % 2 == 1 {
+            let mut out = trimmed.to_string();
+            out.pop();
+            return out.trim_end().to_string();
+        }
+    }
+    command.to_string()
+}
+
+fn normalize_first_command_token_artifact(command: &str) -> String {
+    let mut tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let Some(first) = tokens.first_mut() else {
+        return command.to_string();
+    };
+    let stripped = first
+        .trim_end_matches(|c| matches!(c, '.' | ':'))
+        .to_string();
+    if stripped != *first && is_plain_command_token(&stripped) {
+        *first = stripped;
+        tokens.join(" ")
+    } else {
+        command.to_string()
+    }
+}
+
+fn normalize_standard_home_dir_artifacts(command: &str, prompt: &str) -> String {
+    let Some(home_dir_name) = prompt_standard_home_dir_name(prompt) else {
+        return command.to_string();
+    };
+    command
+        .split_whitespace()
+        .map(|token| normalize_standard_home_dir_token(token, home_dir_name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn prompt_standard_home_dir_name(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_ascii_lowercase();
+    const DIRS: &[(&str, &[&str])] = &[
+        ("Desktop", &["desktop"]),
+        ("Documents", &["documents"]),
+        ("Downloads", &["downloads", "download folder"]),
+        ("Pictures", &["pictures"]),
+        ("Movies", &["movies"]),
+        ("Music", &["music"]),
+        ("Public", &["public"]),
+    ];
+    DIRS.iter()
+        .find(|(_, needles)| needles.iter().any(|needle| lower.contains(needle)))
+        .map(|(name, _)| *name)
+}
+
+fn normalize_standard_home_dir_token(token: &str, home_dir_name: &str) -> String {
+    let leading_quote = token
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))
+        .unwrap_or('\0');
+    let trailing_quote = token
+        .chars()
+        .last()
+        .filter(|c| matches!(c, '"' | '\''))
+        .unwrap_or('\0');
+    let unquoted = token.trim_matches(|c| matches!(c, '"' | '\''));
+    let trimmed = unquoted.trim_end_matches(|c| matches!(c, ',' | ':' | ';'));
+    let slash_dir = format!("/{home_dir_name}");
+    let repeated_dir = format!("/{home_dir_name}/{home_dir_name}");
+
+    let should_normalize = trimmed == home_dir_name
+        || trimmed == format!("~/{home_dir_name}")
+        || trimmed == format!("$HOME/{home_dir_name}")
+        || trimmed.contains(&repeated_dir)
+        || (trimmed.contains(&slash_dir)
+            && (trimmed.starts_with("/Users/")
+                || trimmed.starts_with("/home/")
+                || trimmed.starts_with("/private/var/")
+                || trimmed.starts_with("$HOME/")
+                || trimmed.starts_with("~/")));
+    if !should_normalize {
+        return token.to_string();
+    }
+
+    let normalized = format!("$HOME/{home_dir_name}");
+    if leading_quote != '\0' && trailing_quote == leading_quote {
+        format!("{leading_quote}{normalized}{leading_quote}")
+    } else {
+        normalized
+    }
+}
+
+fn normalize_unspecified_current_dir_path_args(command: &str, prompt: &str) -> String {
+    if !filename_like_prompt_tokens(prompt).is_empty() {
+        return command.to_string();
+    }
+    let mut tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return command.to_string();
+    };
+    if !matches!(program, "find" | "grep" | "rg" | "ls" | "du") {
+        return command.to_string();
+    }
+
+    let mut changed = false;
+    for token in tokens.iter_mut().skip(1) {
+        let quote = token
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''))
+            .unwrap_or('\0');
+        let end_quote = token
+            .chars()
+            .last()
+            .filter(|c| matches!(c, '"' | '\''))
+            .unwrap_or('\0');
+        let unquoted = token.trim_matches(|c| matches!(c, '"' | '\''));
+        if (unquoted.starts_with("./") && unquoted != "./")
+            || unquoted.starts_with(".:")
+            || looks_like_embedded_command_path_artifact(unquoted)
+        {
+            *token = if quote != '\0' && end_quote == quote {
+                format!("{quote}.{quote}")
+            } else {
+                ".".to_string()
+            };
+            changed = true;
+        }
+    }
+    if changed {
+        tokens.join(" ")
+    } else {
+        command.to_string()
+    }
+}
+
+fn looks_like_embedded_command_path_artifact(token: &str) -> bool {
+    let Some(suffix) = token.strip_prefix('.') else {
+        return false;
+    };
+    matches!(
+        suffix
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next(),
+        Some("find" | "grep" | "rg" | "ls" | "pwd" | "date" | "du" | "tail" | "mkdir")
+    )
+}
+
+fn normalize_find_print_artifacts(command: &str) -> String {
+    let mut tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !matches!(tokens.first().map(String::as_str), Some("find")) {
+        return command.to_string();
+    }
+    if let Some(print_idx) = tokens
+        .iter()
+        .position(|token| token == "-print" || token.starts_with("-print:"))
+    {
+        tokens[print_idx] = "-print".to_string();
+        tokens.truncate(print_idx + 1);
+        return tokens.join(" ");
+    }
+    command.to_string()
+}
+
+fn normalize_pipeline_wc_artifacts(command: &str, prompt: &str) -> String {
+    if !filename_like_prompt_tokens(prompt).is_empty() || !command.contains("| wc ") {
+        return command.to_string();
+    }
+    command
+        .split('|')
+        .map(|segment| {
+            let trimmed = segment.trim();
+            let mut tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+            if matches!(tokens.first(), Some(&"wc")) {
+                while matches!(tokens.last(), Some(&"." | &"./")) {
+                    tokens.pop();
+                }
+                tokens.join(" ")
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn normalize_no_arg_program_artifacts(command: &str) -> String {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let Some(program) = tokens.first().copied() else {
+        return command.to_string();
+    };
+    match program {
+        "pwd" => "pwd".to_string(),
+        "date" => {
+            let mut out = vec!["date"];
+            for token in tokens.iter().skip(1) {
+                out.push(token);
+                if token.starts_with('+') {
+                    break;
+                }
+            }
+            out.join(" ")
+        }
+        _ => command.to_string(),
+    }
+}
+
+fn normalize_mkdir_path_artifacts(command: &str, prompt: &str) -> String {
+    if !filename_like_prompt_tokens(prompt).is_empty() {
+        return command.to_string();
+    }
+    let mut tokens = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !matches!(tokens.first().map(String::as_str), Some("mkdir")) {
+        return command.to_string();
+    }
+    let before_len = tokens.len();
+    tokens.retain(|token| !(token.starts_with("./") || token.starts_with(".:")));
+    if tokens.len() != before_len {
+        tokens.join(" ")
+    } else {
+        command.to_string()
+    }
+}
+
+fn remove_bracketed_path_annotations(command: &str) -> String {
+    let mut out = command.to_string();
+    while let Some(start) = out.find(".[") {
+        let after = start + 2;
+        let Some(relative_end) = out[after..].find(']') else {
+            break;
+        };
+        let end = after + relative_end + 1;
+        out.replace_range(start..end, ".");
+    }
+    out
+}
+
+fn filename_like_prompt_tokens(prompt: &str) -> Vec<String> {
+    prompt
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '`' | ',' | ':' | ';' | ')' | '(' | '[' | ']'
+                    )
+                })
+                .to_string()
+        })
+        .filter(|token| {
+            token.len() > 1
+                && (token.contains('/')
+                    || token.contains('.')
+                    || token.chars().any(|c| c.is_ascii_digit()))
+        })
+        .collect()
+}
+
+fn local_action_list(allowed_names: &[String]) -> String {
+    let mut out = Vec::new();
+    if allowed_names
+        .iter()
+        .any(|name| name == "execute_shell_command")
+    {
+        out.push("EXECUTE: one zsh command");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "retrieve_command_docs")
+    {
+        out.push("RETRIEVE: command docs search query");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "lookup_command_docs")
+    {
+        out.push("LOOKUP: exact command name");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "run_readonly_command")
+    {
+        out.push("READONLY: safe read-only command");
+    }
+    if allowed_names.iter().any(|name| name == "web_search") {
+        out.push("WEB_SEARCH: web search query");
+    }
+    if allowed_names.iter().any(|name| name == "web_read") {
+        out.push("WEB_READ: url");
+    }
+    if allowed_names.iter().any(|name| name == "ask_clarification") {
+        out.push("ASK: one focused question");
+    }
+    out.join("\n")
+}
+
+fn local_action_command_idioms() -> &'static str {
+    "Use concise zsh commands. Examples:\n\
+- Current directory -> EXECUTE: pwd\n\
+- List everything in current directory -> EXECUTE: ls -la .\n\
+- Files only, no directories -> EXECUTE: find . -maxdepth 1 -type f -print\n\
+- Hidden entries -> EXECUTE: ls -a\n\
+- Find README.md below current directory -> EXECUTE: find . -name README.md -type f -print\n\
+- Count files in current directory -> EXECUTE: find . -maxdepth 1 -type f | wc -l\n\
+- Last 5 lines of app.log -> EXECUTE: tail -n 5 app.log\n\
+- Recursive text search for TODO -> EXECUTE: grep -R TODO .\n\
+- Empty directories below current directory -> EXECUTE: find . -type d -empty\n\
+- Human-readable total disk usage -> EXECUTE: du -sh .\n\
+- Create directory named reports if missing -> EXECUTE: mkdir -p reports\n\
+- Today's date as YYYY-MM-DD -> EXECUTE: date +%Y-%m-%d"
+}
+
+fn recent_tool_observations_for_local_action(
+    messages: &[ChatMessage],
+    token_budget: usize,
+) -> String {
+    let mut observations = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "tool")
+        .take(4)
+        .map(|message| {
+            let name = message.tool_name.as_deref().unwrap_or("tool");
+            format!("{}: {}", name, message.content.trim())
+        })
+        .collect::<Vec<_>>();
+    observations.reverse();
+    if observations.is_empty() {
+        "none".to_string()
+    } else {
+        context::trim_to_tokens(&observations.join("\n\n"), token_budget)
+    }
+}
+
+fn parse_local_action_tool_call(text: &str, allowed_names: &[String]) -> Option<ToolCall> {
+    let sanitized = text
+        .replace('\u{200b}', "")
+        .replace('\u{200c}', "")
+        .replace('\u{feff}', "");
+    for raw_line in sanitized.lines().take(4) {
+        let mut line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        line = line.trim_matches('`').trim();
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("ACTION:") {
+            line = line["ACTION:".len()..].trim();
+        }
+        if let Some(call) = parse_local_action_line(line, allowed_names) {
+            return Some(call);
+        }
+    }
+
+    let line = sanitized.trim().trim_matches('`').trim();
+    parse_local_action_line(line, allowed_names)
+}
+
+fn parse_local_action_line(line: &str, allowed_names: &[String]) -> Option<ToolCall> {
+    let allowed = |name: &str| allowed_names.iter().any(|allowed| allowed == name);
+    let Some((action, value)) = split_local_action_line(line) else {
+        if allowed("execute_shell_command")
+            && let Some(cmd) = normalize_plain_command_candidate(line)
+        {
+            return Some(ToolCall {
+                name: "execute_shell_command".to_string(),
+                arguments: serde_json::json!({
+                    "cmd": cmd,
+                    "intent": "local action planner",
+                    "expected_effect": "execute validated shell command",
+                    "commands_used": extract_command_names(line, 8),
+                }),
+            });
+        }
+        return None;
+    };
+    let value = clean_local_action_value(value);
+    if value.is_empty() {
+        return None;
+    }
+    match action {
+        "EXECUTE" if allowed("execute_shell_command") => Some(ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({
+                "cmd": value,
+                "intent": "local action planner",
+                "expected_effect": "execute validated shell command",
+                "commands_used": extract_command_names(&value, 8),
+            }),
+        }),
+        "RETRIEVE" if allowed("retrieve_command_docs") => Some(ToolCall {
+            name: "retrieve_command_docs".to_string(),
+            arguments: serde_json::json!({"query": value, "top_k": 5}),
+        }),
+        "LOOKUP" if allowed("lookup_command_docs") => {
+            let name = value
+                .split_whitespace()
+                .next()
+                .unwrap_or(value.as_str())
+                .trim_matches(|c: char| c == '`' || c == '"' || c == '\'')
+                .to_string();
+            (!name.is_empty()).then(|| ToolCall {
+                name: "lookup_command_docs".to_string(),
+                arguments: serde_json::json!({"name": name}),
+            })
+        }
+        "READONLY" if allowed("run_readonly_command") => Some(ToolCall {
+            name: "run_readonly_command".to_string(),
+            arguments: serde_json::json!({
+                "cmd": value,
+                "reason": "local action planner requested a safe factual probe"
+            }),
+        }),
+        "WEB_SEARCH" if allowed("web_search") => Some(ToolCall {
+            name: "web_search".to_string(),
+            arguments: serde_json::json!({"query": value, "max_results": 5}),
+        }),
+        "WEB_READ" if allowed("web_read") => Some(ToolCall {
+            name: "web_read".to_string(),
+            arguments: serde_json::json!({"url": value}),
+        }),
+        "ASK" if allowed("ask_clarification") => {
+            let question = if value.ends_with('?') {
+                value
+            } else {
+                format!("{value}?")
+            };
+            Some(ToolCall {
+                name: "ask_clarification".to_string(),
+                arguments: serde_json::json!({"question": question}),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn split_local_action_line(line: &str) -> Option<(&'static str, &str)> {
+    const ACTIONS: &[(&str, &str)] = &[
+        ("WEB_SEARCH:", "WEB_SEARCH"),
+        ("WEB_SEARCH ", "WEB_SEARCH"),
+        ("WEB READ:", "WEB_READ"),
+        ("WEB READ ", "WEB_READ"),
+        ("WEB_READ:", "WEB_READ"),
+        ("WEB_READ ", "WEB_READ"),
+        ("EXECUTE:", "EXECUTE"),
+        ("EXECUTE ", "EXECUTE"),
+        ("RETRIEVE:", "RETRIEVE"),
+        ("RETRIEVE ", "RETRIEVE"),
+        ("LOOKUP:", "LOOKUP"),
+        ("LOOKUP ", "LOOKUP"),
+        ("READONLY:", "READONLY"),
+        ("READONLY ", "READONLY"),
+        ("ASK:", "ASK"),
+        ("ASK ", "ASK"),
+    ];
+
+    let trimmed = line.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("ACTION:") {
+        return split_local_action_line(trimmed["ACTION:".len()..].trim());
+    }
+    for (prefix, action) in ACTIONS {
+        if upper.starts_with(prefix) {
+            return Some((*action, trimmed[prefix.len()..].trim()));
+        }
+    }
+    None
+}
+
+fn clean_local_action_value(value: &str) -> String {
+    let mut out = value.trim();
+    for marker in ["<|", "```"] {
+        if let Some(pos) = out.find(marker) {
+            out = &out[..pos];
+        }
+    }
+    let mut cleaned = out.trim().trim_matches('`').trim().to_string();
+    cleaned = strip_wrapping_quotes(&cleaned).trim().to_string();
+    cleaned = cleaned
+        .trim_end_matches(|c| c == '\u{200b}' || c == '\u{200c}')
+        .trim()
+        .to_string();
+    if cleaned.ends_with('.') && !cleaned.ends_with(" .") {
+        cleaned.pop();
+    }
+    if let Some(stripped) = strip_trailing_bracket_artifact(&cleaned) {
+        cleaned = stripped;
+    }
+    cleaned.trim().to_string()
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0] as char;
+        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
+        if matches!(first, '"' | '\'') && first == last {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
+fn strip_trailing_bracket_artifact(value: &str) -> Option<String> {
+    let trimmed = value.trim_end();
+    if !trimmed.ends_with(']') {
+        return None;
+    }
+    let token_start = trimmed
+        .rfind(char::is_whitespace)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let token = &trimmed[token_start..];
+    let bracket = token.find('[')?;
+    let before = &token[..bracket];
+    let inside = &token[bracket + 1..token.len().saturating_sub(1)];
+    let artifact = inside.is_empty() || inside.starts_with('/') || inside.contains(']');
+    if before.is_empty() || !artifact {
+        return None;
+    }
+    let mut out = trimmed[..token_start].to_string();
+    out.push_str(before);
+    Some(out)
 }
 
 async fn maybe_run_runtime_stub_provider(
@@ -6322,92 +7529,45 @@ async fn maybe_run_runtime_stub_provider(
     classification: &tasks::ClassificationResult,
     drafting_prompt: &str,
 ) -> Result<bool> {
-    let enabled = runtime_stub_provider_enabled();
-    if !enabled {
+    #[cfg(not(feature = "runtime-stub"))]
+    {
+        let _ = (
+            state,
+            transport,
+            payload,
+            session,
+            provider_continuation,
+            classification,
+            drafting_prompt,
+        );
         return Ok(false);
     }
 
-    let Some(draft) = tasks::draft_command_for_prompt(drafting_prompt) else {
-        return Ok(false);
-    };
+    #[cfg(feature = "runtime-stub")]
+    {
+        let Some(draft) = tasks::draft_command_for_prompt(drafting_prompt) else {
+            return Ok(false);
+        };
 
-    propose_command_for_execution(
-        state,
-        transport,
-        payload,
-        session,
-        provider_continuation,
-        classification,
-        CommandPlan {
-            cmd: draft.cmd,
-            rationale: draft.rationale,
-            intent: draft.intent,
-            expected_effect: draft.expected_effect,
-            commands_used: draft.commands_used,
-        },
-    )
-    .await?;
-    Ok(true)
-}
-
-async fn maybe_run_high_confidence_command_shortcut(
-    state: &Arc<DaemonState>,
-    transport: &mut ipc::ServerTransport,
-    payload: &termlm_protocol::StartTask,
-    session: &ShellSession,
-    classification: &tasks::ClassificationResult,
-) -> Result<bool> {
-    let Some(draft) = tasks::high_confidence_shortcut_for_prompt(&payload.prompt) else {
-        return Ok(false);
-    };
-
-    propose_command_for_execution(
-        state,
-        transport,
-        payload,
-        session,
-        false,
-        classification,
-        CommandPlan {
-            cmd: draft.cmd,
-            rationale: draft.rationale,
-            intent: draft.intent,
-            expected_effect: draft.expected_effect,
-            commands_used: draft.commands_used,
-        },
-    )
-    .await?;
-    Ok(true)
-}
-
-async fn maybe_run_heuristic_command_fallback(
-    state: &Arc<DaemonState>,
-    transport: &mut ipc::ServerTransport,
-    payload: &termlm_protocol::StartTask,
-    session: &ShellSession,
-    classification: &tasks::ClassificationResult,
-) -> Result<bool> {
-    let Some(draft) = tasks::draft_command_for_prompt(&payload.prompt) else {
-        return Ok(false);
-    };
-
-    propose_command_for_execution(
-        state,
-        transport,
-        payload,
-        session,
-        true,
-        classification,
-        CommandPlan {
-            cmd: draft.cmd,
-            rationale: draft.rationale,
-            intent: draft.intent,
-            expected_effect: draft.expected_effect,
-            commands_used: draft.commands_used,
-        },
-    )
-    .await?;
-    Ok(true)
+        propose_command_for_execution(
+            state,
+            transport,
+            payload,
+            session,
+            provider_continuation,
+            classification,
+            CommandPlan {
+                cmd: draft.cmd,
+                rationale: draft.rationale,
+                intent: draft.intent,
+                expected_effect: draft.expected_effect,
+                commands_used: draft.commands_used,
+                continue_after_execution: false,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
 }
 
 fn runtime_stub_provider_enabled() -> bool {
@@ -6433,9 +7593,29 @@ fn tool_schema_execute_shell_command() -> ToolSchema {
                 "commands_used": {
                     "type":"array",
                     "items": {"type":"string"}
+                },
+                "continue_after_execution": {
+                    "type":"boolean",
+                    "description":"Set true only when the task explicitly requires another model/tool round after this approved command runs. Omit or false for normal one-command answers."
                 }
             },
             "required": ["cmd"]
+        }),
+    }
+}
+
+fn tool_schema_ask_clarification() -> ToolSchema {
+    ToolSchema {
+        name: "ask_clarification".to_string(),
+        description:
+            "Ask one focused clarification question when no grounded command can be proposed yet."
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": {"type":"string"}
+            },
+            "required": ["question"]
         }),
     }
 }
@@ -6451,6 +7631,21 @@ fn tool_schema_lookup_docs() -> ToolSchema {
                 "section": {"type":"string"}
             },
             "required": ["name"]
+        }),
+    }
+}
+
+fn tool_schema_retrieve_command_docs() -> ToolSchema {
+    ToolSchema {
+        name: "retrieve_command_docs".to_string(),
+        description: "Run hybrid local command-doc retrieval for a natural-language query. Use this when you do not yet know the exact command, need multiple candidate commands, or need broader local docs before drafting.".to_string(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties": {
+                "query": {"type":"string"},
+                "top_k": {"type":"integer"}
+            },
+            "required": ["query"]
         }),
     }
 }
@@ -6504,6 +7699,18 @@ fn local_tool_schemas(cfg: &AppConfig) -> Vec<ToolSchema> {
             }),
         },
         ToolSchema {
+            name: "run_readonly_command".to_string(),
+            description: "Run a tightly allowlisted, non-modifying local command probe for facts needed to answer the prompt. Use absolute or relative paths; shell expansions like ~ and $HOME are not expanded. The daemon rejects shell metacharacters, redirection, pipelines, command substitution, and non-allowlisted commands.".to_string(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "cmd": {"type":"string"},
+                    "reason": {"type":"string"}
+                },
+                "required": ["cmd"]
+            }),
+        },
+        ToolSchema {
             name: "search_terminal_context".to_string(),
             description: "Search previously observed terminal commands and output.".to_string(),
             parameters: serde_json::json!({
@@ -6516,6 +7723,10 @@ fn local_tool_schemas(cfg: &AppConfig) -> Vec<ToolSchema> {
             }),
         },
     ];
+
+    if !cfg.local_tools.readonly_command_enabled {
+        out.retain(|tool| tool.name != "run_readonly_command");
+    }
 
     if cfg.project_metadata.enabled {
         out.push(ToolSchema {
@@ -6603,6 +7814,23 @@ fn web_tool_schemas() -> Vec<ToolSchema> {
     ]
 }
 
+fn with_orchestration_guidance(prompt: &str) -> String {
+    let mut out = prompt.to_string();
+    out.push_str(
+        "\n\n## Orchestration guidance\n\
+Before answering or proposing a command, decide what information is missing. \
+Use retrieve_command_docs for broad local command-doc search, lookup_command_docs for exact commands, \
+run_readonly_command/list_workspace_files/read_file/search_files/git_context/project_metadata/search_terminal_context for safe local observations, \
+and web_search/web_read only when local context is missing, insufficient, current, or external. \
+You may make multiple tool calls over multiple rounds; wait for dependent observations before choosing the next call. \
+For obvious commands using common installed utilities, emit execute_shell_command directly instead of asking for clarification just because command docs are unavailable. \
+Keep command families separate: find predicates like -type, -name, -size, and -maxdepth belong to find, not grep/rg; for names of files whose contents match text, use grep -R/-r -l PATTERN PATH or rg -l PATTERN PATH. \
+Do not narrate tool use. Emit execute_shell_command only after the command is grounded and validated enough for user approval. \
+If no grounded command or answer is possible, ask one focused clarification question instead of returning blank text.",
+    );
+    out
+}
+
 async fn propose_command_for_execution(
     state: &Arc<DaemonState>,
     transport: &mut ipc::ServerTransport,
@@ -6613,11 +7841,11 @@ async fn propose_command_for_execution(
     plan: CommandPlan,
 ) -> Result<()> {
     let mut effective_plan = plan;
+    effective_plan.cmd = sanitize_local_execute_command(&effective_plan.cmd, payload.prompt.trim());
     let mut working_cmd = effective_plan.cmd.trim().to_string();
     let max_rounds = state.config_snapshot().behavior.max_planning_rounds.max(1);
     let mut planning_round = 1u32;
     let mut last_findings = Vec::new();
-    let mut validation_status = "passed".to_string();
     let critical_matcher =
         CriticalMatcher::from_patterns(&state.config_snapshot().approval.critical_patterns);
     let shell_override = approval_override_for_shell(state, payload.shell_id).await;
@@ -6629,7 +7857,8 @@ async fn propose_command_for_execution(
             (shell_override, false, 0)
         }
     };
-    let task_provider_continuation = provider_continuation || prior_provider_continuation;
+    let task_provider_continuation = (provider_continuation || prior_provider_continuation)
+        && effective_plan.continue_after_execution;
 
     let (first, grounding_refs, final_parse) = loop {
         if let Some(matched) = matches_safety_floor(&working_cmd) {
@@ -6829,13 +8058,15 @@ async fn propose_command_for_execution(
             }
         }
 
-        if let Some(redraft_cmd) =
-            provider_redraft_from_validation(state, payload, classification).await?
-            && redraft_cmd.trim() != working_cmd.trim()
-        {
-            working_cmd = redraft_cmd.trim().to_string();
-            planning_round += 1;
-            continue;
+        if state.config_snapshot().inference.provider != "local" {
+            if let Some(redraft_cmd) =
+                provider_redraft_from_validation(state, payload, classification).await?
+                && redraft_cmd.trim() != working_cmd.trim()
+            {
+                working_cmd = redraft_cmd.trim().to_string();
+                planning_round += 1;
+                continue;
+            }
         }
 
         if planning_round >= max_rounds {
@@ -6869,73 +8100,12 @@ async fn propose_command_for_execution(
                 return Ok(());
             }
 
-            let fallback = tasks::validation_incomplete_fallback(&payload.prompt);
-            effective_plan = CommandPlan {
-                cmd: fallback.cmd.trim().to_string(),
-                rationale: fallback.rationale,
-                intent: fallback.intent,
-                expected_effect: fallback.expected_effect,
-                commands_used: fallback.commands_used,
-            };
-            working_cmd = effective_plan.cmd.clone();
-
-            let fallback_parsed = parse_command(&working_cmd);
-            let fallback_first = fallback_parsed.first_token.clone().unwrap_or_default();
-            let fallback_exists = !fallback_first.is_empty()
-                && cached_command_exists(state, session, &fallback_first).await;
-            let fallback_docs = if fallback_first.is_empty() {
-                String::new()
-            } else {
-                lookup_docs_excerpt(state, &fallback_first).await
-            };
-            let fallback_grounding =
-                build_grounding_refs(state, &payload.prompt, &fallback_first, &working_cmd).await;
-            let fallback_grounded = planning::GroundedProposal {
-                command: working_cmd.clone(),
-                intent: effective_plan.intent.clone(),
-                expected_effect: effective_plan.expected_effect.clone(),
-                commands_used: vec![fallback_first.clone()],
-                risk_level: "read_only".to_string(),
-                destructive: false,
-                requires_approval: true,
-                grounding: fallback_grounding
-                    .iter()
-                    .map(|g| format!("{}#{}", g.source, g.command))
-                    .collect(),
-                validation: Vec::new(),
-            };
-            let mut fallback_findings = planning::validate_round(
-                &fallback_grounded,
-                &planning::ValidationContext {
-                    prompt: payload.prompt.clone(),
-                    command_exists: fallback_exists,
-                    docs_excerpt: fallback_docs,
-                    validate_command_flags: state.config_snapshot().indexer.validate_command_flags,
-                    parse_ambiguous: fallback_parsed.ambiguous,
-                    parse_warnings: fallback_parsed.warnings.clone(),
-                    parse_risky_constructs: fallback_parsed.has_risky_constructs(),
-                },
-            );
-            if effective_plan.rationale != "provider_tool_call" {
-                fallback_findings.retain(|f| f.kind != "unsupported_flag");
-            }
-
-            if fallback_findings.is_empty() {
-                validation_status = "validation_incomplete".to_string();
-                last_findings.push(planning::ValidationFinding {
-                    kind: "validation_incomplete".to_string(),
-                    detail: format!("max planning rounds ({max_rounds}) exhausted: {message}"),
-                });
-                break (fallback_first, fallback_grounding, fallback_parsed);
-            }
-
-            let fallback_message = summarize_validation_findings(&fallback_findings);
             transport
                 .send(ServerMessage::Error {
                     task_id: Some(payload.task_id),
                     kind: ErrorKind::BadToolCall,
                     message: format!(
-                        "planning validation failed: {message}; validation_incomplete fallback failed: {fallback_message}"
+                        "planning validation failed: {message}; no hard-coded fallback command was substituted"
                     ),
                     matched_pattern: None,
                 })
@@ -7076,9 +8246,7 @@ async fn propose_command_for_execution(
         },
         grounding: grounding_refs,
         validation: termlm_protocol::ValidationSummary {
-            status: if validation_status == "validation_incomplete" {
-                validation_status
-            } else if last_findings.is_empty() {
+            status: if last_findings.is_empty() {
                 "passed".to_string()
             } else {
                 "revised".to_string()
@@ -7175,6 +8343,7 @@ async fn provider_redraft_from_validation(
         tools.push(tool_schema_execute_shell_command());
     }
     if profile.lookup_command_docs {
+        tools.push(tool_schema_retrieve_command_docs());
         tools.push(tool_schema_lookup_docs());
     }
     let local_tools = local_tool_schemas_for_profile(cfg.as_ref(), &profile);
@@ -7476,6 +8645,19 @@ async fn build_grounding_refs(
             index_version: Some(current_index_version()),
         })
         .collect::<Vec<_>>();
+    let refs = if refs.is_empty() && !command_name.trim().is_empty() {
+        vec![termlm_protocol::GroundingRef {
+            command: command_name.to_string(),
+            source: "shell_path".to_string(),
+            sections: Vec::new(),
+            extraction_method: Some("command_exists".to_string()),
+            doc_hash: None,
+            extracted_at: None,
+            index_version: Some(current_index_version()),
+        }]
+    } else {
+        refs
+    };
     if cache_enabled {
         state
             .retrieval_cache
@@ -7648,6 +8830,7 @@ async fn assemble_task_prompt(
     payload: &termlm_protocol::StartTask,
     classification: &tasks::ClassificationResult,
 ) -> context::ContextAssembly {
+    let cfg = state.config_snapshot();
     let observed = {
         let observed = state.observed.lock().await;
         observed
@@ -7685,13 +8868,44 @@ async fn assemble_task_prompt(
             .unwrap_or_default()
     };
 
-    context::assemble_user_prompt(
+    let mut assembly = context::assemble_user_prompt(
         &payload.prompt,
         classification,
         &observed,
         &session_memory,
-        state.config_snapshot().as_ref(),
-    )
+        cfg.as_ref(),
+    );
+    if cfg.context_budget.enabled
+        && let Some(block) = generated_filesystem_context_block(payload)
+    {
+        let block = context::trim_to_tokens(&block, 700);
+        if !block.trim().is_empty() {
+            assembly.prompt.push_str("\n\n");
+            assembly.prompt.push_str(&block);
+            assembly
+                .included_blocks
+                .push("filesystem_context".to_string());
+        }
+    }
+    assembly
+}
+
+fn generated_filesystem_context_block(payload: &termlm_protocol::StartTask) -> Option<String> {
+    let mut block = termlm_config::read_filesystem_context_snapshot().or_else(|| {
+        let cwd = if payload.cwd.trim().is_empty() {
+            None
+        } else {
+            Some(Path::new(payload.cwd.trim()))
+        };
+        termlm_config::build_filesystem_context_block(cwd, &payload.env_subset)
+    })?;
+
+    if !payload.cwd.trim().is_empty() {
+        block.push_str("active_prompt_directory: ");
+        block.push_str(payload.cwd.trim());
+        block.push('\n');
+    }
+    Some(block)
 }
 
 async fn append_session_turn(
@@ -8274,7 +9488,8 @@ async fn retrieve_chunks_for_prompt(
         if let Some(chunk) = runtime.chunks.iter().find(|c| c.command_name == hint)
             && seen_commands.insert(chunk.command_name.clone())
         {
-            out.push(render_retrieval_chunk_with_meta(
+            out.push(render_retrieval_document_with_meta(
+                &runtime.chunks,
                 chunk,
                 None,
                 None,
@@ -8308,7 +9523,8 @@ async fn retrieve_chunks_for_prompt(
         if !seen_commands.insert(hit.chunk.command_name.clone()) {
             continue;
         }
-        out.push(render_retrieval_chunk_with_meta(
+        out.push(render_retrieval_document_with_meta(
+            &runtime.chunks,
             &hit.chunk,
             Some(hit.score),
             Some(search_rank + 1),
@@ -8337,30 +9553,94 @@ async fn retrieve_chunks_for_prompt(
     budgeted
 }
 
-fn render_retrieval_chunk_with_meta(
-    chunk: &Chunk,
+fn render_retrieval_document_with_meta(
+    chunks: &[Chunk],
+    seed: &Chunk,
     retrieval_score: Option<f32>,
     retrieval_rank: Option<usize>,
     retrieval_source: Option<String>,
 ) -> RetrievedChunk {
+    let doc_chunks = selected_document_chunks(chunks, seed);
+    let text = render_document_chunks(&doc_chunks);
+    let total_chunks = doc_chunks.len().max(1);
+
     RetrievedChunk {
-        command_name: chunk.command_name.clone(),
-        section_name: chunk.section_name.clone(),
-        path: chunk.path.clone(),
+        command_name: seed.command_name.clone(),
+        section_name: "FULL_DOCUMENT".to_string(),
+        path: seed.path.clone(),
         retrieval_rank,
         retrieval_score,
         retrieval_source,
-        extraction_method: chunk.extraction_method.clone(),
-        chunk_index: chunk.chunk_index,
-        total_chunks: chunk.total_chunks,
-        doc_hash: chunk.doc_hash.clone(),
-        extracted_at: chunk.extracted_at,
-        text: truncate_string(&chunk.text, 800),
+        extraction_method: seed.extraction_method.clone(),
+        chunk_index: 0,
+        total_chunks,
+        doc_hash: seed.doc_hash.clone(),
+        extracted_at: seed.extracted_at,
+        text,
     }
 }
 
+fn selected_document_chunks<'a>(chunks: &'a [Chunk], seed: &'a Chunk) -> Vec<&'a Chunk> {
+    let mut selected = chunks
+        .iter()
+        .filter(|chunk| {
+            chunk.command_name == seed.command_name
+                && chunk.path == seed.path
+                && chunk.extraction_method == seed.extraction_method
+                && chunk.doc_hash == seed.doc_hash
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        selected.push(seed);
+    }
+    selected.sort_by_key(|chunk| chunk.chunk_index);
+    selected
+}
+
+fn render_document_chunks(chunks: &[&Chunk]) -> String {
+    let mut out = String::new();
+    let mut last_section = String::new();
+    let mut seen_texts = BTreeSet::<String>::new();
+
+    for chunk in chunks {
+        let text = chunk.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let text_hash = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
+        if !seen_texts.insert(text_hash) {
+            continue;
+        }
+        let section = chunk.section_name.trim();
+        if !section.is_empty() && section != last_section {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("### ");
+            out.push_str(section);
+            out.push('\n');
+            last_section = section.to_string();
+        } else if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+        out.push('\n');
+    }
+
+    if out.trim().is_empty()
+        && let Some(seed) = chunks.first()
+    {
+        return seed.text.trim().to_string();
+    }
+
+    out.trim().to_string()
+}
+
+#[cfg(test)]
 fn format_retrieved_docs_block(chunks: &[RetrievedChunk]) -> String {
-    let mut out = String::from("## Relevant local command docs\n");
+    let mut out = String::from(
+        "## Relevant local command docs\nDocs are deduplicated by command and expanded from the matched chunk to the selected source document when available.\n",
+    );
     for chunk in chunks {
         out.push_str("\n### ");
         out.push_str(&chunk.command_name);
@@ -8389,7 +9669,7 @@ fn retrieved_chunk_source_refs(chunks: &[RetrievedChunk]) -> Vec<source_ledger::
             ),
             hash: chunk.doc_hash.clone(),
             redacted: false,
-            truncated: chunk.text.chars().count() >= 800,
+            truncated: chunk.text.ends_with('…'),
             observed_at: chrono::Utc::now(),
             detail: Some(format!("prompt retrieval for {}", chunk.command_name)),
             section: Some(chunk.section_name.clone()),
@@ -10175,7 +11455,7 @@ fn blake3_file_hash(path: &Path) -> Result<String> {
 }
 
 fn current_index_version() -> u32 {
-    3
+    4
 }
 
 fn decode_b64_maybe(input: &Option<String>) -> String {
@@ -11585,7 +12865,7 @@ mod tests {
                 download_url: None,
                 allow_download: false,
                 required: true,
-                expected_sha256: Some(sha),
+                expected_sha256: Some(sha.clone()),
                 timeout: std::time::Duration::from_secs(1),
                 user_agent: "test-agent",
             },
@@ -11593,6 +12873,16 @@ mod tests {
         .await
         .expect("ensure model second pass");
         assert!(!changed_again);
+        assert!(
+            can_trust_cached_model_asset_record(
+                &manifest,
+                "inference_model",
+                "file.gguf",
+                &path,
+                Some(&sha),
+            )
+            .expect("cached record check")
+        );
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(root);
@@ -11732,52 +13022,6 @@ mod tests {
         assert!(block.contains("## Citations"));
         assert!(block.contains("[1] https://"));
         assert!(has_citation_block(&block));
-    }
-
-    #[test]
-    fn indexing_progress_banner_includes_lookup_hint() {
-        let progress = IndexProgress {
-            scanned: 12,
-            total: 100,
-            percent: 12.0,
-            phase: "scan".to_string(),
-        };
-        let msg = indexing_progress_banner(&progress, false).expect("banner");
-        assert!(msg.contains("lookup_command_docs(name)"));
-        assert!(msg.contains("12 commands available so far"));
-    }
-
-    #[test]
-    fn indexing_progress_banner_suppresses_background_refresh_when_index_loaded() {
-        let scan_progress = IndexProgress {
-            scanned: 0,
-            total: 100,
-            percent: 0.0,
-            phase: "scan".to_string(),
-        };
-        assert!(indexing_progress_banner(&scan_progress, true).is_none());
-
-        let progress = IndexProgress {
-            scanned: 100,
-            total: 100,
-            percent: 100.0,
-            phase: "embed".to_string(),
-        };
-        assert!(indexing_progress_banner(&progress, true).is_none());
-        assert!(indexing_progress_banner(&progress, false).is_some());
-    }
-
-    #[test]
-    fn indexing_progress_banner_does_not_claim_embed_phase_is_complete() {
-        let progress = IndexProgress {
-            scanned: 100,
-            total: 100,
-            percent: 100.0,
-            phase: "embed".to_string(),
-        };
-        let msg = indexing_progress_banner(&progress, false).expect("banner");
-        assert!(msg.contains("99.0% complete"));
-        assert!(!msg.contains("100.0% complete"));
     }
 
     #[test]
@@ -12119,6 +13363,11 @@ mod tests {
         let file_only = local_tool_schemas_for_profile(&cfg, &profile);
         assert!(file_only.iter().any(|tool| tool.name == "read_file"));
         assert!(
+            file_only
+                .iter()
+                .any(|tool| tool.name == "run_readonly_command")
+        );
+        assert!(
             !file_only
                 .iter()
                 .any(|tool| tool.name == "search_terminal_context")
@@ -12138,6 +13387,243 @@ mod tests {
                 .any(|tool| tool.name == "search_terminal_context")
         );
         assert!(!terminal_only.iter().any(|tool| tool.name == "read_file"));
+
+        let mut cfg_without_probe = cfg.clone();
+        cfg_without_probe.local_tools.readonly_command_enabled = false;
+        let file_only_without_probe = local_tool_schemas_for_profile(&cfg_without_probe, &profile);
+        assert!(
+            !file_only_without_probe
+                .iter()
+                .any(|tool| tool.name == "run_readonly_command")
+        );
+    }
+
+    #[test]
+    fn readonly_command_probe_accepts_only_allowlisted_readonly_shapes() {
+        assert!(validate_readonly_command_tokens("pwd").is_ok());
+        assert!(validate_readonly_command_tokens("ls -la Desktop").is_ok());
+        assert!(validate_readonly_command_tokens("find . -type f -maxdepth 1").is_ok());
+        assert!(validate_readonly_command_tokens("git status --short").is_ok());
+        assert!(validate_readonly_command_tokens("git branch --show-current").is_ok());
+
+        assert!(validate_readonly_command_tokens("rm -rf tmp").is_err());
+        assert!(validate_readonly_command_tokens("ls > out.txt").is_err());
+        assert!(validate_readonly_command_tokens("find . -delete").is_err());
+        assert!(validate_readonly_command_tokens("git branch -D main").is_err());
+        assert!(validate_readonly_command_tokens("sysctl -w kern.foo=1").is_err());
+        assert!(validate_readonly_command_tokens("ls ~/Desktop").is_err());
+    }
+
+    #[test]
+    fn local_action_parser_maps_execute_line_to_tool_call() {
+        let allowed = vec![
+            "execute_shell_command".to_string(),
+            "retrieve_command_docs".to_string(),
+        ];
+        let call =
+            parse_local_action_tool_call("Action: EXECUTE: find . -maxdepth 1 -type f", &allowed)
+                .expect("tool call");
+        assert_eq!(call.name, "execute_shell_command");
+        assert_eq!(call.arguments["cmd"], "find . -maxdepth 1 -type f");
+
+        let no_colon = parse_local_action_tool_call("EXECUTE pwd", &allowed).expect("no colon");
+        assert_eq!(no_colon.arguments["cmd"], "pwd");
+
+        let plain = parse_local_action_tool_call("find . -name README.md -print", &allowed)
+            .expect("plain command");
+        assert_eq!(plain.arguments["cmd"], "find . -name README.md -print");
+    }
+
+    #[test]
+    fn local_action_parser_maps_retrieval_and_clarification() {
+        let allowed = vec![
+            "retrieve_command_docs".to_string(),
+            "ask_clarification".to_string(),
+        ];
+        let retrieve =
+            parse_local_action_tool_call("RETRIEVE: list files but not directories", &allowed)
+                .expect("retrieve");
+        assert_eq!(retrieve.name, "retrieve_command_docs");
+        assert_eq!(
+            retrieve.arguments["query"],
+            "list files but not directories"
+        );
+
+        let ask = parse_local_action_tool_call("ASK: Which directory", &allowed).expect("ask");
+        assert_eq!(ask.name, "ask_clarification");
+        assert_eq!(ask.arguments["question"], "Which directory?");
+    }
+
+    #[test]
+    fn local_action_sanitizer_removes_model_output_artifacts() {
+        assert_eq!(
+            sanitize_local_execute_command("ls -aF .[/tmp/demo]", "list files here"),
+            "ls -aF ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "tail -n 5 app.log ./.app.log.bak.gz.zst.",
+                "show the last 5 lines of app.log",
+            ),
+            "tail -n 5 app.log"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("pwd[]]", "what directory am I in"),
+            "pwd"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("pwd .", "what directory am I in"),
+            "pwd"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("pwd.", "what directory am I in"),
+            "pwd"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "pwd. -P: /private/var/folders/kj/512gg4jn7",
+                "what directory am I in",
+            ),
+            "pwd"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("ls -la .find .", "list all files in this directory",),
+            "ls -la ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "echo $HOME/Desktop/Desktop/Desktop",
+                "show me the path to my Desktop directory",
+            ),
+            "echo $HOME/Desktop"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "ls -la /Users/gavin/Desktop/ .",
+                "list all files in my Desktop directory",
+            ),
+            "ls -la $HOME/Desktop ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "find /Users/gavin/Desktop -maxdepth 1 -type f -print",
+                "list files but not directories in my Desktop directory",
+            ),
+            "find $HOME/Desktop -maxdepth 1 -type f -print"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "echo $HOME/Downloads/Downloads/Downloads",
+                "show me the path to my Downloads folder",
+            ),
+            "echo $HOME/Downloads"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "ls -p | grep -v / | grep -v / | grep -v",
+                "list all files but not directories",
+            ),
+            "ls -p | grep -v /"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "grep -R TODO ./SEARCH-ONLY/SEARCH-ONLY/SEARCH-ONLY",
+                "search recursively for TODO",
+            ),
+            "grep -R TODO ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "grep -l TODO . . -type f | grep -v '^\\.$'",
+                "show only the names of files whose contents contain TODO",
+            ),
+            "grep -lR TODO ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "grep -l TODO . . . . .",
+                "show only the names of files whose contents contain TODO",
+            ),
+            "grep -lR TODO ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "grep -lR TODO . .*/*(.)",
+                "show only the names of files whose contents contain TODO",
+            ),
+            "grep -lR TODO ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "grep -ri TODO .\"TODO\"[]\"TODO\"[]\"TODO\"[]\"TODO\"",
+                "search for TODO case insensitively in this directory",
+            ),
+            "grep -ri TODO ."
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "mkdir -p reports/reports_dir_name_placeholder",
+                "create a directory named reports if it does not already exist",
+            ),
+            "mkdir -p reports/reports_dir_name_placeholder"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "mkdir -p reports ./.reports_test_dir/reports_test_dir_reports_test",
+                "create a directory named reports if it does not already exist",
+            ),
+            "mkdir -p reports"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("date +%Y-%m-%d\\n", "show today's date"),
+            "date +%Y-%m-%d"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "date +%Y-%m-%d .:date +%Y-%m-%d .",
+                "show today's date as YYYY-MM-DD",
+            ),
+            "date +%Y-%m-%d"
+        );
+        assert_eq!(
+            sanitize_local_execute_command("ls -p | grep -v /", "list files but not directories"),
+            "ls -p | grep -v /"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "find . -name README.md -type f -print: USAB-005/README",
+                "find every README.md under here",
+            ),
+            "find . -name README.md -type f -print"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "find . -name README.md -type f -print:USAB-005/README",
+                "find every README.md under here",
+            ),
+            "find . -name README.md -type f -print"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "find . -maxdepth 1 -type f | wc -l .",
+                "count the files in this directory",
+            ),
+            "find . -maxdepth 1 -type f | wc -l"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "find . -type d -empty\"",
+                "find empty directories under here",
+            ),
+            "find . -type d -empty"
+        );
+        assert_eq!(
+            sanitize_local_execute_command(
+                "du -sh ./ | awk '{total+=$1}'",
+                "show the total disk usage of this directory in human readable form",
+            ),
+            "du -sh ./ | awk '{total+=$1}'"
+        );
     }
 
     #[test]
@@ -12274,6 +13760,62 @@ mod tests {
         assert!(block.contains("### find / OPTIONS"));
         assert!(block.contains("source: /usr/share/man/man1/find.1"));
         assert!(block.contains("Use -name"));
+    }
+
+    #[test]
+    fn retrieval_rendering_expands_matched_chunk_to_source_document() {
+        let now = chrono::Utc::now();
+        let chunks = vec![
+            Chunk {
+                command_name: "pwd".to_string(),
+                path: "/usr/share/man/man1/pwd.1".to_string(),
+                extraction_method: "man".to_string(),
+                section_name: "NAME".to_string(),
+                chunk_index: 0,
+                total_chunks: 2,
+                doc_hash: "doc1".to_string(),
+                extracted_at: now,
+                text: "pwd - print working directory".to_string(),
+            },
+            Chunk {
+                command_name: "pwd".to_string(),
+                path: "/usr/share/man/man1/pwd.1".to_string(),
+                extraction_method: "man".to_string(),
+                section_name: "DESCRIPTION".to_string(),
+                chunk_index: 1,
+                total_chunks: 2,
+                doc_hash: "doc1".to_string(),
+                extracted_at: now,
+                text: "The pwd utility writes the absolute pathname of the current directory."
+                    .to_string(),
+            },
+            Chunk {
+                command_name: "pwd".to_string(),
+                path: "/other/pwd-help".to_string(),
+                extraction_method: "help".to_string(),
+                section_name: "HELP".to_string(),
+                chunk_index: 0,
+                total_chunks: 1,
+                doc_hash: "doc2".to_string(),
+                extracted_at: now,
+                text: "unselected duplicate source".to_string(),
+            },
+        ];
+
+        let rendered = render_retrieval_document_with_meta(
+            &chunks,
+            &chunks[1],
+            Some(0.9),
+            Some(1),
+            Some("hybrid_search".to_string()),
+        );
+
+        assert_eq!(rendered.section_name, "FULL_DOCUMENT");
+        assert_eq!(rendered.total_chunks, 2);
+        assert!(rendered.text.contains("### NAME"));
+        assert!(rendered.text.contains("### DESCRIPTION"));
+        assert!(rendered.text.contains("absolute pathname"));
+        assert!(!rendered.text.contains("unselected duplicate source"));
     }
 
     #[test]

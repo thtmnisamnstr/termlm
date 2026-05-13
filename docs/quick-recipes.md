@@ -13,6 +13,17 @@ Expected behavior:
 - local file/search tools are used
 - proposal likely includes `rg` command(s)
 
+## Search file contents but print filenames only
+
+Prompt:
+
+`? show only the names of files whose contents contain TODO`
+
+Expected behavior:
+
+- command-doc retrieval should distinguish content search from filename search
+- proposal likely includes `rg -l TODO .` or `grep -R -l TODO .`
+
 ## Fix failing tests quickly
 
 Prompt:

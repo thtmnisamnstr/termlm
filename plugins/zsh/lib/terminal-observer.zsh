@@ -320,8 +320,10 @@ termlm-precmd() {
     local ack_ok=0
     if termlm-helper-send "$ack_json" >/dev/null 2>&1; then
       ack_ok=1
+      _TERMLM_ACKED_PENDING_TASK_ID="$_TERMLM_PENDING_TASK_ID"
       _TERMLM_WAITING_MODEL=1
     else
+      _TERMLM_ACKED_PENDING_TASK_ID=""
       _TERMLM_WAITING_MODEL=0
       zle -M "termlm: connection lost" 2>/dev/null || print -r -- "termlm: connection lost"
       if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
@@ -425,6 +427,7 @@ termlm-zshexit() {
   fi
   termlm-observer-stop-capture
   _TERMLM_WAITING_MODEL=0
+  _TERMLM_ACKED_PENDING_TASK_ID=""
   _TERMLM_TASK_ID=""
   zle -K main 2>/dev/null || true
   PS1="${_TERMLM_SAVED_PS1:-$PS1}"

@@ -34,6 +34,7 @@ pub struct ClassificationResult {
     pub confidence: f32,
 }
 
+#[cfg(feature = "runtime-stub")]
 #[derive(Debug, Clone)]
 pub struct DraftCommand {
     pub cmd: String,
@@ -316,6 +317,7 @@ pub fn extract_command_name_from_doc_prompt(prompt: &str) -> Option<String> {
     None
 }
 
+#[cfg(feature = "runtime-stub")]
 pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     let p = prompt.to_ascii_lowercase();
 
@@ -1585,6 +1587,7 @@ pub fn draft_command_for_prompt(prompt: &str) -> Option<DraftCommand> {
     None
 }
 
+#[cfg(feature = "runtime-stub")]
 fn package_name_after_keyword(prompt: &str, keyword: &str) -> Option<String> {
     let mut after_keyword = false;
     for raw in prompt.split_whitespace() {
@@ -1627,6 +1630,7 @@ fn package_name_after_keyword(prompt: &str, keyword: &str) -> Option<String> {
     None
 }
 
+#[cfg(feature = "runtime-stub")]
 fn trim_package_token(raw: &str) -> String {
     raw.trim_matches(|c: char| {
         !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@'))
@@ -1634,6 +1638,7 @@ fn trim_package_token(raw: &str) -> String {
     .to_string()
 }
 
+#[cfg(feature = "runtime-stub")]
 fn is_safe_package_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 80
@@ -1642,88 +1647,7 @@ fn is_safe_package_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@'))
 }
 
-pub fn high_confidence_shortcut_for_prompt(prompt: &str) -> Option<DraftCommand> {
-    let p = prompt.to_ascii_lowercase();
-    let pwd_request = p.contains("current directory")
-        || p.contains("working directory")
-        || p.contains("where am i")
-        || p.contains("which directory")
-        || p.contains("what directory")
-        || p.contains("which folder")
-        || p.contains("what folder")
-        || p.trim() == "pwd";
-    let archive_dir_request = p.contains("folder named archive")
-        || p.contains("create a folder named archive")
-        || p.contains("directory called archive")
-        || p.contains("create a directory called archive");
-    let common_filesystem_request = (p.contains("list") && p.contains("files"))
-        || p.contains("hidden files")
-        || p.contains("disk usage")
-        || (p.contains("find") && p.contains("files") && p.contains("named"))
-        || (p.contains("last") && p.contains("lines"))
-        || p.contains("count lines")
-        || p.contains("count files")
-        || p.contains("search recursively")
-        || (p.contains("empty director") && p.contains("find"))
-        || (p.contains("file") && (p.contains("newest first") || p.contains("sorted newest")))
-        || (p.contains("git") && p.contains("status"))
-        || (p.contains("tar.gz") && p.contains("archive"))
-        || ((p.contains("current date") || p.contains("today")) && p.contains("iso"))
-        || p.contains("current date")
-        || p == "date"
-        || p.contains("show date")
-        || p.contains("show the date")
-        || p.contains("print date")
-        || p.contains("print the date")
-        || ((p.contains("create") || p.contains("make"))
-            && (p.contains("directory") || p.contains("folder"))
-            && (p.contains(" named ") || p.contains(" called ")));
-
-    if pwd_request || archive_dir_request || common_filesystem_request {
-        return draft_command_for_prompt(prompt);
-    }
-
-    None
-}
-
-pub fn validation_incomplete_fallback(prompt: &str) -> DraftCommand {
-    let p = prompt.to_ascii_lowercase();
-    if p.contains("git") || p.contains("branch") || p.contains("commit") {
-        return DraftCommand {
-            cmd: "git status --short".to_string(),
-            rationale: "validation_incomplete: proposing safe git inspection fallback.".to_string(),
-            intent: "Inspect repository working tree as a safe partial fallback.".to_string(),
-            expected_effect:
-                "Read-only git status output while awaiting clarification for full intent."
-                    .to_string(),
-            commands_used: vec!["git".to_string()],
-        };
-    }
-    if p.contains("list") || p.contains("file") || p.contains("directory") {
-        return DraftCommand {
-            cmd: "ls -la".to_string(),
-            rationale: "validation_incomplete: proposing safe filesystem inspection fallback."
-                .to_string(),
-            intent: "Inspect current directory contents as a safe partial fallback.".to_string(),
-            expected_effect:
-                "Read-only directory listing while awaiting clarification for full intent."
-                    .to_string(),
-            commands_used: vec!["ls".to_string()],
-        };
-    }
-
-    DraftCommand {
-        cmd: "pwd".to_string(),
-        rationale: "validation_incomplete: proposing safe shell-state inspection fallback."
-            .to_string(),
-        intent: "Inspect current shell working directory as a safe partial fallback.".to_string(),
-        expected_effect:
-            "Read-only shell context output while awaiting clarification for full intent."
-                .to_string(),
-        commands_used: vec!["pwd".to_string()],
-    }
-}
-
+#[cfg(feature = "runtime-stub")]
 fn extract_last_session_command(prompt: &str) -> Option<String> {
     let mut last = None::<String>;
     for line in prompt.lines() {
@@ -1739,16 +1663,19 @@ fn extract_last_session_command(prompt: &str) -> Option<String> {
     last
 }
 
+#[cfg(feature = "runtime-stub")]
 fn first_word(cmd: &str) -> Option<String> {
     cmd.split_whitespace().next().map(ToString::to_string)
 }
 
+#[cfg(feature = "runtime-stub")]
 fn number_after_marker(prompt_lower: &str, marker: &str) -> Option<u32> {
     let rest = prompt_lower.split(marker).nth(1)?;
     let token = rest.split_whitespace().next()?;
     token.parse::<u32>().ok()
 }
 
+#[cfg(feature = "runtime-stub")]
 fn path_after_any_marker(prompt: &str, prompt_lower: &str, markers: &[&str]) -> Option<String> {
     for marker in markers {
         if let Some(idx) = prompt_lower.find(marker) {
@@ -1763,6 +1690,7 @@ fn path_after_any_marker(prompt: &str, prompt_lower: &str, markers: &[&str]) -> 
     None
 }
 
+#[cfg(feature = "runtime-stub")]
 fn sanitize_path_token(token: &str) -> Option<String> {
     let cleaned = token
         .trim_matches(|c: char| {
@@ -1780,6 +1708,7 @@ fn sanitize_path_token(token: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "runtime-stub")]
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -1905,98 +1834,5 @@ mod tests {
                 "prompt should not require early clarification: {prompt}"
             );
         }
-    }
-
-    #[test]
-    fn validation_incomplete_fallback_prefers_git_when_prompt_mentions_git() {
-        let fallback = validation_incomplete_fallback("what changed in my git branch?");
-        assert_eq!(fallback.cmd, "git status --short");
-        assert!(fallback.rationale.contains("validation_incomplete"));
-    }
-
-    #[test]
-    fn validation_incomplete_fallback_prefers_listing_for_file_prompts() {
-        let fallback = validation_incomplete_fallback("list files and folders here");
-        assert_eq!(fallback.cmd, "ls -la");
-    }
-
-    #[test]
-    fn validation_incomplete_fallback_defaults_to_pwd() {
-        let fallback = validation_incomplete_fallback("do something unclear");
-        assert_eq!(fallback.cmd, "pwd");
-    }
-
-    #[test]
-    fn draft_command_recognizes_directory_wording() {
-        let draft = draft_command_for_prompt("which directory am I in?").expect("draft");
-        assert_eq!(draft.cmd, "pwd");
-    }
-
-    #[test]
-    fn draft_command_handles_common_smoke_prompts() {
-        let cases = [
-            ("list files in this directory", "ls"),
-            ("list the files in this directory one per line", "ls -1"),
-            (
-                "find files named README.md under this directory",
-                "find . -name README.md",
-            ),
-            (
-                "show disk usage for this directory in human readable form",
-                "du -sh .",
-            ),
-            (
-                "show the last 20 lines of README.md",
-                "tail -n 20 README.md",
-            ),
-            ("count lines in README.md", "wc -l README.md"),
-            ("print the current date in ISO format", "date +%F"),
-            ("show the current date", "date"),
-            ("show hidden files in the current directory", "ls -la"),
-            ("print the working directory", "pwd"),
-            (
-                "create a directory named smoke-output if it does not exist",
-                "mkdir -p smoke-output",
-            ),
-            ("show today as an ISO date", "date +%F"),
-            ("show files sorted newest first", "ls -lt"),
-            (
-                "search the web for Homebrew jq formula and propose the command to install jq",
-                "brew install jq",
-            ),
-            (
-                "install the ripgrep formula with Homebrew",
-                "brew install ripgrep",
-            ),
-            ("find empty directories under here", "find . -type d -empty"),
-            (
-                "make a tar.gz archive of the docs directory at /tmp/termlm-docs-test.tar.gz",
-                "tar -czf /tmp/termlm-docs-test.tar.gz docs",
-            ),
-        ];
-
-        for (prompt, expected) in cases {
-            let draft = draft_command_for_prompt(prompt).expect(prompt);
-            assert_eq!(draft.cmd, expected, "{prompt}");
-        }
-    }
-
-    #[test]
-    fn high_confidence_shortcut_is_limited_to_known_simple_requests() {
-        let pwd = high_confidence_shortcut_for_prompt("which directory am I in?").expect("pwd");
-        assert_eq!(pwd.cmd, "pwd");
-        let archive = high_confidence_shortcut_for_prompt("create a directory called archive")
-            .expect("mkdir");
-        assert_eq!(archive.cmd, "mkdir -p archive");
-        assert!(high_confidence_shortcut_for_prompt("find Python files containing TODO").is_none());
-        let hidden =
-            high_confidence_shortcut_for_prompt("show hidden files in the current directory")
-                .expect("hidden files");
-        assert_eq!(hidden.cmd, "ls -la");
-        let listing =
-            high_confidence_shortcut_for_prompt("list files in this directory").expect("ls");
-        assert_eq!(listing.cmd, "ls");
-        let date = high_confidence_shortcut_for_prompt("show the current date").expect("date");
-        assert_eq!(date.cmd, "date");
     }
 }

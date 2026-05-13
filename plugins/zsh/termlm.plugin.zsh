@@ -35,6 +35,7 @@ _TERMLM_PENDING_STARTED_AT=0
 _TERMLM_PENDING_STDOUT_FILE=""
 _TERMLM_PENDING_STDERR_FILE=""
 _TERMLM_PENDING_SEQ=0
+_TERMLM_ACKED_PENDING_TASK_ID=""
 _TERMLM_LAST_CONTEXT_HASH=""
 _TERMLM_WAITING_MODEL=0
 _TERMLM_NO_LLM_WARNING_SHOWN=0
@@ -75,3 +76,5 @@ bindkey -M termlm-prompt $'\e' termlm-cancel-prompt
 add-zsh-hook preexec termlm-preexec
 add-zsh-hook precmd termlm-precmd
 add-zsh-hook zshexit termlm-zshexit
+
+termlm-refresh-filesystem-context

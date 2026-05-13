@@ -45,7 +45,7 @@ pub fn exposure_for(classification: &TaskClassification) -> ToolExposureProfile 
         TaskClassification::FreshCommandRequest => ToolExposureProfile {
             execute_shell_command: true,
             lookup_command_docs: true,
-            local_file_tools: false,
+            local_file_tools: true,
             terminal_context_tool: false,
             web_tools: true,
         },

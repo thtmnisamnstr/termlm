@@ -19,9 +19,9 @@ pub fn build_system_prompt(
     };
 
     let capture_rule = if capture_enabled {
-        "12. Command output capture is enabled, but outputs may be truncated."
+        "17. Command output capture is enabled, but outputs may be truncated."
     } else {
-        "12. Command output capture is disabled; do not assume stdout/stderr will be available."
+        "17. Command output capture is disabled; do not assume stdout/stderr will be available."
     };
 
     format!(
@@ -36,13 +36,20 @@ Core rules:\n\
 2. Do not invent commands, flags, aliases, or functions.\n\
 3. For referential/debugging tasks, use recent terminal context first.\n\
 4. For fresh tasks, avoid terminal history unless the prompt references it.\n\
-5. Use lookup_command_docs or relevant docs before uncommon flags.\n\
-6. Prefer read-only local tools before executing shell commands when sufficient.\n\
+5. Use retrieve_command_docs for broad local docs search and lookup_command_docs for exact commands before uncommon flags.\n\
+6. Prefer read-only local tools, including run_readonly_command for allowlisted factual probes, before proposing executable commands when more context is needed.\n\
 7. Use web tools for current/web information, or as a fallback when local command docs/retrieval are missing or insufficient.\n\
 8. Keep local trust order: question, recent terminal, local files/git/project/docs, then web.\n\
 9. Use execute_shell_command only when the user wants execution.\n\
 10. If clarification is required, ask one focused question ending with '?'.\n\
-11. Keep responses concise and action-oriented.\n\
+11. Never return an empty response. If you cannot produce a command or answer, say what is missing and ask one focused clarification question.\n\
+12. Resolve common home folders from filesystem context: Desktop, Documents, Downloads, Pictures, Movies, Music, Public, and Library are normally under HOME.\n\
+13. For filesystem listing prompts, distinguish files from directories; use find -type f when the user asks for files only or excludes directories.\n\
+14. Do not mix find predicates such as -type, -name, -size, or -maxdepth into grep/rg commands. To print names of files whose contents match text, prefer grep -R/-r -l PATTERN PATH or rg -l PATTERN PATH.\n\
+15. Before tool calls, silently plan the minimum information needed. If a later call depends on an earlier result, wait for that result before choosing the next call.\n\
+16. Interleave reasoning and action: call tools, inspect observations, revise the plan, and continue until the command/answer is grounded or a clarification is necessary.\n\
+17. Do not reveal hidden reasoning; emit tool calls, concise answers, or one clarification question.\n\
+18. Keep responses concise and action-oriented.\n\
 {capture_rule}\n"
     )
 }

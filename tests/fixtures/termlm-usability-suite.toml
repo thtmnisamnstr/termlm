@@ -1,0 +1,198 @@
+# Focused real-model usability suite for everyday terminal prompts.
+
+[suite]
+version                = "1.0.0"
+total_tests            = 21
+default_approval_mode  = "auto"
+default_timeout_secs   = 120
+sandbox_root_template  = "${TMPDIR:-/tmp}/termlm-usability-{uuid}"
+
+[shell_context]
+aliases   = {}
+functions = {}
+
+[[test]]
+id = "USAB-001"
+category = "usability"
+prompt = "what directory am I in?"
+mode = "execute"
+expected = { command_regex = ['^pwd$'], must_succeed = true }
+relevant_commands = ["pwd"]
+
+[[test]]
+id = "USAB-002"
+category = "usability"
+prompt = "list all files in this directory"
+setup = ["touch alpha.txt bravo.md", "mkdir notes"]
+mode = "execute"
+expected = { command_regex = ['\bls\b', '\bfind\b.*\.'], must_succeed = true, stdout_contains = ["alpha.txt", "bravo.md"] }
+relevant_commands = ["ls", "find"]
+
+[[test]]
+id = "USAB-003"
+category = "usability"
+prompt = "list all files but not directories in this directory"
+setup = ["touch alpha.txt bravo.md", "mkdir notes"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-type\s+f', '\bls\b.*-[A-Za-z]*[pF].*\|.*grep\b.*-v'], must_succeed = true, stdout_contains = ["alpha.txt", "bravo.md"] }
+relevant_commands = ["find", "ls", "grep"]
+
+[[test]]
+id = "USAB-004"
+category = "usability"
+prompt = "show hidden files in this folder"
+setup = ["touch .env .secret visible.txt"]
+mode = "execute"
+expected = { command_regex = ['\bls\b.*-[A-Za-z]*[Aa]', '\bfind\b.*-name\s+\.\*'], must_succeed = true, stdout_contains = [".env", ".secret"] }
+relevant_commands = ["ls", "find"]
+
+[[test]]
+id = "USAB-005"
+category = "usability"
+prompt = "find every README.md under here"
+setup = ["mkdir -p docs packages/a", "touch README.md docs/README.md packages/a/README.md"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-name\s+README\.md'], must_succeed = true, stdout_contains = ["README.md"] }
+relevant_commands = ["find"]
+
+[[test]]
+id = "USAB-006"
+category = "usability"
+prompt = "count the files in this directory"
+setup = ["touch one two three", "mkdir subdir"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-type\s+f.*\|\s*wc\b', '\bls\b.*\|\s*wc\b'], must_succeed = true, stdout_contains = ["3"] }
+relevant_commands = ["find", "ls", "wc"]
+
+[[test]]
+id = "USAB-007"
+category = "usability"
+prompt = "show the last 5 lines of app.log"
+setup = ["for i in 1 2 3 4 5 6 7 8; do echo line$i >> app.log; done"]
+mode = "execute"
+expected = { command_regex = ['\btail\b.*-n\s*5.*app\.log', '\btail\b.*-5.*app\.log'], must_succeed = true, stdout_contains = ["line4", "line8"] }
+relevant_commands = ["tail"]
+
+[[test]]
+id = "USAB-008"
+category = "usability"
+prompt = "search recursively for TODO"
+setup = ["mkdir -p src docs", "echo 'TODO: fix this' > src/app.py", "echo 'done' > docs/readme.txt"]
+mode = "execute"
+expected = { command_regex = ['\b(rg|grep)\b.*TODO', '\bfind\b.*TODO'], must_succeed = true, stdout_contains = ["TODO"] }
+relevant_commands = ["rg", "grep"]
+
+[[test]]
+id = "USAB-009"
+category = "usability"
+prompt = "find empty directories under here"
+setup = ["mkdir -p empty nested/nonempty", "touch nested/nonempty/file.txt"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-type\s+d.*-empty', '\bfind\b.*-empty.*-type\s+d'], must_succeed = true, stdout_contains = ["empty"] }
+relevant_commands = ["find"]
+
+[[test]]
+id = "USAB-010"
+category = "usability"
+prompt = "show the total disk usage of this directory in human readable form"
+setup = ["dd if=/dev/zero of=data.bin bs=1024 count=4 status=none"]
+mode = "execute"
+expected = { command_regex = ['\bdu\b.*-[A-Za-z]*s[A-Za-z]*h', '\bdu\b.*-[A-Za-z]*h[A-Za-z]*s'], must_succeed = true }
+relevant_commands = ["du"]
+
+[[test]]
+id = "USAB-011"
+category = "usability"
+prompt = "create a directory named reports if it does not already exist"
+mode = "execute"
+expected = { command_regex = ['\bmkdir\b.*-p\s+reports'], must_succeed = true, filesystem_state_after = { exists = ["reports"] } }
+relevant_commands = ["mkdir"]
+
+[[test]]
+id = "USAB-012"
+category = "usability"
+prompt = "show today's date as YYYY-MM-DD"
+mode = "execute"
+expected = { command_regex = ['\bdate\b.*\+%F', '\bdate\b.*\+%Y-%m-%d'], must_succeed = true }
+relevant_commands = ["date"]
+
+[[test]]
+id = "USAB-013"
+category = "usability"
+prompt = "show me the path to my Desktop directory"
+setup = ["mkdir -p \"$HOME/Desktop\""]
+mode = "execute"
+expected = { command_regex = ['\b(echo|printf)\b.*(HOME|~).*Desktop', '\bpwd\b.*Desktop'], must_succeed = true, stdout_contains = ["Desktop"] }
+relevant_commands = []
+
+[[test]]
+id = "USAB-014"
+category = "usability"
+prompt = "list all files in my Desktop directory"
+setup = ["mkdir -p \"$HOME/Desktop/desk-dir\"", "touch \"$HOME/Desktop/desk-a.txt\" \"$HOME/Desktop/desk-b.md\""]
+mode = "execute"
+expected = { command_regex = ['\b(ls|find)\b.*(Desktop|\$HOME|~)'], must_succeed = true, stdout_contains = ["desk-a.txt", "desk-b.md"] }
+relevant_commands = ["ls", "find"]
+
+[[test]]
+id = "USAB-015"
+category = "usability"
+prompt = "list files but not directories in my Desktop directory"
+setup = ["mkdir -p \"$HOME/Desktop/desk-dir\"", "touch \"$HOME/Desktop/desk-a.txt\" \"$HOME/Desktop/desk-b.md\""]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*(Desktop|\$HOME|~).*-type\s+f', '\bls\b.*(Desktop|\$HOME|~).*\|.*grep\b.*-v'], must_succeed = true, stdout_contains = ["desk-a.txt", "desk-b.md"] }
+relevant_commands = ["find", "ls", "grep"]
+
+[[test]]
+id = "USAB-016"
+category = "usability"
+prompt = "show me the path to my Downloads folder"
+setup = ["mkdir -p \"$HOME/Downloads\""]
+mode = "execute"
+expected = { command_regex = ['\b(echo|printf)\b.*(HOME|~).*Downloads', '\bpwd\b.*Downloads'], must_succeed = true, stdout_contains = ["Downloads"] }
+relevant_commands = []
+
+[[test]]
+id = "USAB-017"
+category = "usability"
+prompt = "search for TODO case insensitively in this directory"
+setup = ["echo 'todo lowercase' > app.txt", "echo 'nothing' > notes.txt"]
+mode = "execute"
+expected = { command_regex = ['(?i)\b(rg|grep)\b.*-[A-Za-z]*i.*todo'], must_succeed = true, stdout_contains = ["todo lowercase"] }
+relevant_commands = ["rg", "grep"]
+
+[[test]]
+id = "USAB-018"
+category = "usability"
+prompt = "show only the names of files whose contents contain TODO"
+setup = ["echo 'TODO: fix this' > one.txt", "echo 'TODO: later' > two.md", "echo 'done' > three.log"]
+mode = "execute"
+expected = { command_regex = ['\b(rg|grep)\b.*-[A-Za-z]*l.*TODO'], must_succeed = true, stdout_contains = ["one.txt", "two.md"] }
+relevant_commands = ["rg", "grep"]
+
+[[test]]
+id = "USAB-019"
+category = "usability"
+prompt = "show the first 3 lines of notes.txt"
+setup = ["for i in 1 2 3 4 5; do echo line$i >> notes.txt; done"]
+mode = "execute"
+expected = { command_regex = ['\bhead\b.*-n\s*3.*notes\.txt', '\bhead\b.*-3.*notes\.txt'], must_succeed = true, stdout_contains = ["line1", "line3"] }
+relevant_commands = ["head"]
+
+[[test]]
+id = "USAB-020"
+category = "usability"
+prompt = "count the lines in notes.txt"
+setup = ["for i in 1 2 3 4; do echo line$i >> notes.txt; done"]
+mode = "execute"
+expected = { command_regex = ['\bwc\b.*-[A-Za-z]*l.*notes\.txt', '\bcat\b.*notes\.txt.*\|\s*wc\b.*-[A-Za-z]*l'], must_succeed = true, stdout_contains = ["4"] }
+relevant_commands = ["wc"]
+
+[[test]]
+id = "USAB-021"
+category = "usability"
+prompt = "show files larger than 1 KB under here"
+setup = ["dd if=/dev/zero of=big.bin bs=1024 count=2 status=none", "printf x > small.txt"]
+mode = "execute"
+expected = { command_regex = ['\bfind\b.*-type\s+f.*-size\s+\+'], must_succeed = true, stdout_contains = ["big.bin"] }
+relevant_commands = ["find"]
