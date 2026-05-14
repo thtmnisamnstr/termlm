@@ -1390,21 +1390,11 @@ async fn process_start_task(
     stage_timings.insert("progress_banner_ms".to_string(), 0);
 
     let allow_non_command_shortcuts = payload.mode != "?";
-    let local_fact_started = std::time::Instant::now();
-    let handled_direct_local_fact =
-        try_handle_direct_local_fact_question(state, transport, &payload, &classification).await?;
-    stage_timings.insert(
-        "direct_local_fact_ms".to_string(),
-        local_fact_started.elapsed().as_millis() as u64,
-    );
-    let result = if handled_direct_local_fact {
-        Ok(())
-    } else if allow_non_command_shortcuts
+    let result = if allow_non_command_shortcuts
         && matches!(
             classification.classification,
             tasks::TaskClassification::DocumentationQuestion
-        )
-    {
+        ) {
         let docs_started = std::time::Instant::now();
         let out = process_documentation_question(state, transport, &payload, &session).await;
         stage_timings.insert(
@@ -4126,6 +4116,17 @@ fn synthesize_concise_web_answer(
     source_extracts: &str,
 ) -> Option<String> {
     let lower = prompt.to_ascii_lowercase();
+    let haystack = format!(
+        "{}\n{}",
+        summary_points.join("\n"),
+        truncate_string(source_extracts, 8000)
+    );
+    if let Some(command) = extract_requested_command_from_web_evidence(prompt, &haystack) {
+        return Some(format!(
+            "The exact command I found is:\n```zsh\n{command}\n```"
+        ));
+    }
+
     let wants_version = lower.contains("latest")
         || lower.contains("current")
         || lower.contains("stable version")
@@ -4134,11 +4135,6 @@ fn synthesize_concise_web_answer(
         return None;
     }
 
-    let haystack = format!(
-        "{}\n{}",
-        summary_points.join("\n"),
-        truncate_string(source_extracts, 8000)
-    );
     let version = regex::Regex::new(
         r"(?i)(?:version\s+|release\s+|v)(\d{1,3}\.\d{1,3}\.\d{1,3})(?:\s*\((current|latest|lts)\))?",
     )
@@ -4172,6 +4168,299 @@ fn synthesize_concise_web_answer(
         answer.push_str(" If you meant the latest LTS line rather than the current release line, ask for the LTS version specifically.");
     }
     Some(answer)
+}
+
+fn extract_requested_command_from_web_evidence(prompt: &str, evidence: &str) -> Option<String> {
+    let lower = prompt.to_ascii_lowercase();
+    let wants_command = lower.contains("command")
+        || lower.contains("what should i run")
+        || lower.contains("how do i install")
+        || lower.contains("install ")
+        || lower.contains("upgrade")
+        || lower.contains("update");
+    if !wants_command {
+        return None;
+    }
+
+    let mut candidates = Vec::<(i32, String)>::new();
+    let inline_code = regex::Regex::new(r"`([^`\n]{3,240})`").ok();
+    let mut in_fence = false;
+    let logical_lines = coalesce_shell_flag_continuation_lines(evidence);
+    for raw in &logical_lines {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("Source:")
+            || trimmed.starts_with("Title:")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+        {
+            continue;
+        }
+
+        let context_score = command_evidence_context_score(trimmed);
+        if let Some(re) = inline_code.as_ref() {
+            for caps in re.captures_iter(trimmed) {
+                if let Some(value) = caps.get(1) {
+                    maybe_push_web_command_candidate(
+                        &mut candidates,
+                        value.as_str(),
+                        context_score + 5,
+                    );
+                }
+            }
+        }
+
+        if in_fence || raw.starts_with("    ") || raw.starts_with('\t') {
+            maybe_push_web_command_candidate(&mut candidates, trimmed, context_score + 8);
+        }
+
+        if let Some(candidate) = command_candidate_near_flags(trimmed) {
+            maybe_push_web_command_candidate(&mut candidates, &candidate, context_score + 3);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by(|(score_a, cmd_a), (score_b, cmd_b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| cmd_a.len().cmp(&cmd_b.len()))
+        })
+        .map(|(_, command)| command)
+}
+
+fn coalesce_shell_flag_continuation_lines(evidence: &str) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    for raw in evidence.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("--")
+            && let Some(prev) = lines.last_mut()
+            && !prev.trim_start().starts_with("```")
+        {
+            prev.push(' ');
+            prev.push_str(trimmed);
+            continue;
+        }
+        lines.push(raw.to_string());
+    }
+    lines
+}
+
+fn command_evidence_context_score(line: &str) -> i32 {
+    let lower = line.to_ascii_lowercase();
+    let mut score = 0;
+    for needle in [
+        "exact",
+        "recommended",
+        "command",
+        "run",
+        "install",
+        "upgrade",
+        "update",
+    ] {
+        if lower.contains(needle) {
+            score += 2;
+        }
+    }
+    score
+}
+
+fn command_candidate_near_flags(line: &str) -> Option<String> {
+    let tokens = line
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | ';' | '(' | ')'))
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let flag_idx = tokens
+        .iter()
+        .position(|token| token.starts_with('-') && token.len() > 1)?;
+    let mut start = (0..flag_idx)
+        .rev()
+        .find(|idx| token_can_start_shell_command(&tokens[*idx]))?;
+    if matches!(
+        tokens[start].as_str(),
+        "install" | "upgrade" | "update" | "run"
+    ) && start > 0
+        && let Some(prev) = (0..start)
+            .rev()
+            .find(|idx| token_can_start_shell_command(&tokens[*idx]))
+    {
+        start = prev;
+    }
+    Some(tokens[start..].join(" "))
+}
+
+fn maybe_push_web_command_candidate(
+    candidates: &mut Vec<(i32, String)>,
+    raw: &str,
+    base_score: i32,
+) {
+    let Some(command) = normalize_web_command_candidate(raw) else {
+        return;
+    };
+    if !web_command_candidate_looks_useful(&command) {
+        return;
+    }
+    let mut score = base_score;
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    score += tokens.len().min(12) as i32;
+    score += tokens
+        .iter()
+        .filter(|token| token.starts_with('-') && token.len() > 1)
+        .count() as i32
+        * 2;
+    if tokens
+        .iter()
+        .any(|token| matches!(*token, "install" | "upgrade" | "update" | "run"))
+    {
+        score += 3;
+    }
+    candidates.push((score, command));
+}
+
+fn normalize_web_command_candidate(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    for prefix in ["$", "%", ">", "❯"] {
+        value = value.strip_prefix(prefix).unwrap_or(value).trim_start();
+    }
+    if let Some(stripped) = value.strip_prefix("- ") {
+        value = stripped.trim_start();
+    } else if let Some(stripped) = value.strip_prefix("* ") {
+        value = stripped.trim_start();
+    } else if let Some(stripped) = strip_numbered_list_prefix(value) {
+        value = stripped.trim_start();
+    }
+    value = value
+        .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | ';'))
+        .trim();
+    let value = value.trim_end_matches('.');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn strip_numbered_list_prefix(value: &str) -> Option<&str> {
+    let mut chars = value.char_indices().peekable();
+    let mut saw_digit = false;
+    while let Some((_, ch)) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    let (_, dot) = chars.next()?;
+    if dot != '.' {
+        return None;
+    }
+    let (idx, ws) = chars.next()?;
+    if ws.is_whitespace() {
+        Some(&value[idx + ws.len_utf8()..])
+    } else {
+        None
+    }
+}
+
+fn web_command_candidate_looks_useful(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("://")
+        || lower.starts_with("source:")
+        || lower.starts_with("title:")
+        || lower.starts_with("based on ")
+        || lower.starts_with("the exact ")
+        || lower.starts_with("the recommended ")
+    {
+        return false;
+    }
+    if command.contains('\n') || command.chars().count() > 240 {
+        return false;
+    }
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() || !token_can_start_shell_command(tokens[0]) {
+        return false;
+    }
+    let has_command_signal = tokens
+        .iter()
+        .any(|token| token.starts_with('-') && token.len() > 1)
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "install" | "upgrade" | "update" | "run"))
+        || command.contains(" && ")
+        || command.contains(" | ")
+        || command.contains(";");
+    tokens.len() >= 2 && has_command_signal
+}
+
+fn token_can_start_shell_command(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '(' | ')'));
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        || shell_command_start_stopword(trimmed)
+    {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || matches!(first, '.' | '/' | '$' | '~'))
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '$' | '~'))
+}
+
+fn shell_command_start_stopword(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "are"
+            | "based"
+            | "by"
+            | "command"
+            | "current"
+            | "docs"
+            | "exact"
+            | "for"
+            | "from"
+            | "is"
+            | "latest"
+            | "notes"
+            | "on"
+            | "or"
+            | "recommended"
+            | "release"
+            | "remain"
+            | "remains"
+            | "run"
+            | "source"
+            | "stable"
+            | "that"
+            | "the"
+            | "this"
+            | "title"
+            | "to"
+            | "use"
+    )
 }
 
 async fn emit_local_tool_access_denied(
@@ -4217,637 +4506,6 @@ fn local_text_detection_options(cfg: &AppConfig) -> termlm_local_tools::TextDete
         accepted_encodings: cfg.local_tools.text_detection.accepted_encodings.clone(),
         deny_binary_magic: cfg.local_tools.text_detection.deny_binary_magic,
     }
-}
-
-async fn try_handle_direct_local_fact_question(
-    state: &Arc<DaemonState>,
-    transport: &mut ipc::ServerTransport,
-    payload: &termlm_protocol::StartTask,
-    classification: &tasks::ClassificationResult,
-) -> Result<bool> {
-    if payload.mode != "?"
-        || !tasks::prompt_prefers_direct_answer(&payload.prompt, &classification.classification)
-    {
-        return Ok(false);
-    }
-
-    let prompt = payload.prompt.trim();
-    let lower = prompt.to_ascii_lowercase();
-    let cwd = PathBuf::from(&payload.cwd);
-    let cfg = state.config_snapshot();
-
-    if prompt_asks_standard_directory_location(&lower) {
-        let target = resolve_prompt_directory(payload, &lower);
-        let answer = if target.path.exists() {
-            format!("Your {} is `{}`.", target.label, target.display_path)
-        } else {
-            format!(
-                "I expected your {} at `{}`, but that path does not exist.",
-                target.label, target.display_path
-            )
-        };
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if prompt_asks_current_directory(&lower) {
-        let answer = format!("Current directory: `{}`.", payload.cwd);
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if let Some(answer) = direct_terminal_advice_answer(&lower) {
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if lower.contains("git")
-        && lower.contains("version")
-        && (lower.contains("what version")
-            || lower.contains("which version")
-            || lower.contains("do i have")
-            || lower.contains("installed"))
-    {
-        let probe = run_readonly_command_probe(cfg.as_ref(), &cwd, "git --version").await;
-        let answer = match readonly_probe_stdout(&probe) {
-            Some(stdout) if !stdout.trim().is_empty() => {
-                format!("{}.", stdout.trim_end_matches('.'))
-            }
-            Some(_) => "I couldn't determine the installed Git version: `git --version` returned no output.".to_string(),
-            None => readonly_probe_failure_answer(
-                &probe,
-                "I couldn't determine the installed Git version",
-            ),
-        };
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if (lower.contains("git") && lower.contains("branch"))
-        || lower.contains("current branch")
-        || lower.contains("what branch")
-    {
-        let probe =
-            run_readonly_command_probe(cfg.as_ref(), &cwd, "git branch --show-current").await;
-        let answer = match readonly_probe_stdout(&probe) {
-            Some(stdout) if !stdout.trim().is_empty() => {
-                format!("Current Git branch: `{}`.", stdout.trim())
-            }
-            Some(_) => "Git did not report a named current branch. You may be in detached HEAD state or outside a normal branch checkout.".to_string(),
-            None => readonly_probe_failure_answer(
-                &probe,
-                "I couldn't determine the current Git branch",
-            ),
-        };
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if lower.contains("how many") && lower.contains("file") {
-        let target = resolve_prompt_directory(payload, &lower);
-        if let Some(answer) = direct_file_count_answer(&target, &lower) {
-            emit_direct_model_answer(state, transport, payload, answer).await?;
-            return Ok(true);
-        }
-    }
-
-    if (lower.contains("how much") || lower.contains("disk usage") || lower.contains("storage"))
-        && (lower.contains("folder")
-            || lower.contains("directory")
-            || lower.contains("documents")
-            || lower.contains("downloads")
-            || lower.contains("desktop"))
-        && !prompt_asks_how_to(&lower)
-    {
-        let target = resolve_prompt_directory(payload, &lower);
-        let answer = match du_storage_size(&target.path).await {
-            Ok(size) => {
-                format!("`{}` is using about {}.", target.label, size)
-            }
-            Err(message) => format!(
-                "I couldn't determine storage usage for `{}`: {}.",
-                target.label, message
-            ),
-        };
-        emit_direct_model_answer(state, transport, payload, answer).await?;
-        return Ok(true);
-    }
-
-    if lower.contains("oldest file") {
-        let target = resolve_prompt_directory(payload, &lower);
-        if let Some(answer) = oldest_file_answer(&target, &lower) {
-            emit_direct_model_answer(state, transport, payload, answer).await?;
-            return Ok(true);
-        }
-    }
-
-    if prompt_asks_newest_file(&lower) {
-        let target = resolve_prompt_directory(payload, &lower);
-        if let Some(answer) = newest_file_answer(&target, &lower) {
-            emit_direct_model_answer(state, transport, payload, answer).await?;
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-async fn emit_direct_model_answer(
-    state: &Arc<DaemonState>,
-    transport: &mut ipc::ServerTransport,
-    payload: &termlm_protocol::StartTask,
-    answer: String,
-) -> Result<()> {
-    transport
-        .send(ServerMessage::ModelText {
-            task_id: payload.task_id,
-            chunk: answer.clone(),
-        })
-        .await?;
-    transport
-        .send(ServerMessage::TaskComplete {
-            task_id: payload.task_id,
-            reason: TaskCompleteReason::ModelDone,
-            summary: truncate_string(&answer, 500),
-        })
-        .await?;
-    append_session_turn_if_session_mode(
-        state,
-        &payload.mode,
-        payload.shell_id,
-        payload.prompt.clone(),
-        truncate_string(&answer, 1200),
-    )
-    .await;
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct PromptDirectory {
-    label: String,
-    path: PathBuf,
-    display_path: String,
-}
-
-fn prompt_asks_current_directory(lower: &str) -> bool {
-    lower.contains("where am i")
-        || lower.contains("what directory am i in")
-        || lower.contains("which directory am i in")
-        || lower.contains("current directory")
-        || lower.contains("working directory")
-}
-
-fn prompt_asks_standard_directory_location(lower: &str) -> bool {
-    (lower.contains("where") || lower.contains("path"))
-        && (lower.contains("desktop") || lower.contains("downloads") || lower.contains("documents"))
-        && (lower.contains("directory") || lower.contains("folder"))
-}
-
-fn prompt_asks_newest_file(lower: &str) -> bool {
-    (lower.contains("newest") || lower.contains("most recent") || lower.contains("latest"))
-        && lower.contains("file")
-        && !lower.contains("open ")
-        && !lower.contains("copy ")
-        && !lower.contains("move ")
-}
-
-fn prompt_asks_how_to(lower: &str) -> bool {
-    lower.starts_with("how do i ")
-        || lower.starts_with("how can i ")
-        || lower.starts_with("what command ")
-        || lower.starts_with("which command ")
-        || lower.contains(" command ")
-}
-
-fn direct_terminal_advice_answer(lower: &str) -> Option<String> {
-    if (lower.starts_with("what command") || lower.starts_with("which command"))
-        && lower.contains("hidden")
-        && lower.contains("file")
-    {
-        return Some(
-            "Use `ls -a` to include hidden files, or `ls -A` to include hidden files without `.` and `..`."
-                .to_string(),
-        );
-    }
-    if (lower.starts_with("what command") || lower.starts_with("which command"))
-        && (lower.contains("markdown") || lower.contains(".md"))
-        && (lower.contains("recursive") || lower.contains("recursively"))
-    {
-        return Some(
-            "Use `find . -type f -iname '*.md' -print` to recursively list Markdown files from the current directory."
-                .to_string(),
-        );
-    }
-    if (lower.contains("brew") || lower.contains("homebrew"))
-        && lower.contains("permission")
-        && (lower.contains("fail") || lower.contains("error") || lower.contains("denied"))
-    {
-        return Some(
-            "Do not fix a normal Homebrew install failure with `sudo brew install`. Run `brew doctor`, read the exact path in the permission error, make sure the Homebrew prefix and that path are owned/writable by your user, then retry the install."
-                .to_string(),
-        );
-    }
-    None
-}
-
-fn resolve_prompt_directory(payload: &termlm_protocol::StartTask, lower: &str) -> PromptDirectory {
-    let home = payload
-        .env_subset
-        .get("HOME")
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let cwd = PathBuf::from(&payload.cwd);
-    let (label, path) = if lower.contains("desktop") {
-        let path = home
-            .as_ref()
-            .map(|h| h.join("Desktop"))
-            .unwrap_or_else(|| cwd.join("Desktop"));
-        ("Desktop".to_string(), path)
-    } else if lower.contains("download") {
-        let path = home
-            .as_ref()
-            .map(|h| h.join("Downloads"))
-            .unwrap_or_else(|| cwd.join("Downloads"));
-        ("Downloads".to_string(), path)
-    } else if lower.contains("document") {
-        let path = home
-            .as_ref()
-            .map(|h| h.join("Documents"))
-            .unwrap_or_else(|| cwd.join("Documents"));
-        ("Documents".to_string(), path)
-    } else if lower.contains("home directory") || lower.contains("home folder") {
-        let path = home.unwrap_or_else(|| cwd.clone());
-        ("home directory".to_string(), path)
-    } else {
-        ("current directory".to_string(), cwd)
-    };
-    let display_path = path.display().to_string();
-    PromptDirectory {
-        label,
-        path,
-        display_path,
-    }
-}
-
-fn direct_file_count_answer(target: &PromptDirectory, lower: &str) -> Option<String> {
-    if !target.path.exists() {
-        return Some(format!(
-            "I couldn't count files because `{}` does not exist.",
-            target.display_path
-        ));
-    }
-    if !target.path.is_dir() {
-        return Some(format!(
-            "I couldn't count files because `{}` is not a directory.",
-            target.display_path
-        ));
-    }
-    let recursive = lower.contains("recursive")
-        || lower.contains("subfolder")
-        || lower.contains("subdirectories")
-        || lower.contains("all folders");
-    let count = count_regular_files(&target.path, recursive);
-    let scope = if recursive {
-        "including subfolders"
-    } else {
-        "directly inside it"
-    };
-    let mut answer = format!(
-        "`{}` has {} regular file{} {}.",
-        target.label,
-        count.files,
-        if count.files == 1 { "" } else { "s" },
-        scope
-    );
-    if count.skipped > 0 {
-        answer.push_str(&format!(
-            " I skipped {} unreadable entr{}.",
-            count.skipped,
-            if count.skipped == 1 { "y" } else { "ies" }
-        ));
-    }
-    Some(answer)
-}
-
-#[derive(Debug, Default)]
-struct FileCount {
-    files: u64,
-    skipped: u64,
-}
-
-fn count_regular_files(path: &Path, recursive: bool) -> FileCount {
-    let mut out = FileCount::default();
-    let Ok(entries) = std::fs::read_dir(path) else {
-        out.skipped += 1;
-        return out;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            out.skipped += 1;
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            out.skipped += 1;
-            continue;
-        };
-        if file_type.is_file() {
-            out.files += 1;
-        } else if recursive && file_type.is_dir() {
-            let nested = count_regular_files(&entry.path(), true);
-            out.files += nested.files;
-            out.skipped += nested.skipped;
-        }
-    }
-    out
-}
-
-fn oldest_file_answer(target: &PromptDirectory, lower: &str) -> Option<String> {
-    if !target.path.exists() {
-        return Some(format!(
-            "I couldn't find the oldest file because `{}` does not exist.",
-            target.display_path
-        ));
-    }
-    if !target.path.is_dir() {
-        return Some(format!(
-            "I couldn't find the oldest file because `{}` is not a directory.",
-            target.display_path
-        ));
-    }
-    let recursive = lower.contains("recursive")
-        || lower.contains("subfolder")
-        || lower.contains("subdirectories");
-    let oldest = find_oldest_regular_file(&target.path, recursive);
-    match oldest.path {
-        Some(path) => {
-            let display = path.display().to_string();
-            let mut answer = format!("Oldest regular file in `{}`: `{}`.", target.label, display);
-            if oldest.skipped > 0 {
-                answer.push_str(&format!(
-                    " I skipped {} unreadable entr{}.",
-                    oldest.skipped,
-                    if oldest.skipped == 1 { "y" } else { "ies" }
-                ));
-            }
-            Some(answer)
-        }
-        None => Some(format!(
-            "I couldn't find any regular files in `{}`.",
-            target.label
-        )),
-    }
-}
-
-fn newest_file_answer(target: &PromptDirectory, lower: &str) -> Option<String> {
-    if !target.path.exists() {
-        return Some(format!(
-            "I couldn't find the newest file because `{}` does not exist.",
-            target.display_path
-        ));
-    }
-    if !target.path.is_dir() {
-        return Some(format!(
-            "I couldn't find the newest file because `{}` is not a directory.",
-            target.display_path
-        ));
-    }
-    let recursive = lower.contains("recursive")
-        || lower.contains("subfolder")
-        || lower.contains("subdirectories");
-    let newest = find_newest_regular_file(&target.path, recursive, lower);
-    match newest.path {
-        Some(path) => {
-            let display = path.display().to_string();
-            let kind = prompt_file_kind_label(lower);
-            let mut answer = format!("Newest {kind} in `{}`: `{}`.", target.label, display);
-            if newest.skipped > 0 {
-                answer.push_str(&format!(
-                    " I skipped {} unreadable entr{}.",
-                    newest.skipped,
-                    if newest.skipped == 1 { "y" } else { "ies" }
-                ));
-            }
-            Some(answer)
-        }
-        None => Some(format!(
-            "I couldn't find any {} in `{}`.",
-            prompt_file_kind_label(lower),
-            target.label
-        )),
-    }
-}
-
-#[derive(Debug, Default)]
-struct OldestFile {
-    path: Option<PathBuf>,
-    modified: Option<std::time::SystemTime>,
-    skipped: u64,
-}
-
-fn find_oldest_regular_file(path: &Path, recursive: bool) -> OldestFile {
-    let mut out = OldestFile::default();
-    let Ok(entries) = std::fs::read_dir(path) else {
-        out.skipped += 1;
-        return out;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            out.skipped += 1;
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            out.skipped += 1;
-            continue;
-        };
-        if file_type.is_dir() && recursive {
-            let nested = find_oldest_regular_file(&entry.path(), true);
-            out.skipped += nested.skipped;
-            if let Some(modified) = nested.modified
-                && out
-                    .modified
-                    .map(|current| modified < current)
-                    .unwrap_or(true)
-            {
-                out.modified = Some(modified);
-                out.path = nested.path;
-            }
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            out.skipped += 1;
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            out.skipped += 1;
-            continue;
-        };
-        if out
-            .modified
-            .map(|current| modified < current)
-            .unwrap_or(true)
-        {
-            out.modified = Some(modified);
-            out.path = Some(entry.path());
-        }
-    }
-    out
-}
-
-fn find_newest_regular_file(path: &Path, recursive: bool, lower: &str) -> OldestFile {
-    let mut out = OldestFile::default();
-    let Ok(entries) = std::fs::read_dir(path) else {
-        out.skipped += 1;
-        return out;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            out.skipped += 1;
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            out.skipped += 1;
-            continue;
-        };
-        if file_type.is_dir() && recursive {
-            let nested = find_newest_regular_file(&entry.path(), true, lower);
-            out.skipped += nested.skipped;
-            if let Some(modified) = nested.modified
-                && out
-                    .modified
-                    .map(|current| modified > current)
-                    .unwrap_or(true)
-            {
-                out.modified = Some(modified);
-                out.path = nested.path;
-            }
-            continue;
-        }
-        if !file_type.is_file() || !prompt_file_filter_matches(&entry.path(), lower) {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            out.skipped += 1;
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            out.skipped += 1;
-            continue;
-        };
-        if out
-            .modified
-            .map(|current| modified > current)
-            .unwrap_or(true)
-        {
-            out.modified = Some(modified);
-            out.path = Some(entry.path());
-        }
-    }
-    out
-}
-
-fn prompt_file_filter_matches(path: &Path, lower: &str) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .map(|v| v.to_ascii_lowercase());
-    if lower.contains("markdown") || lower.contains(".md") {
-        return matches!(ext.as_deref(), Some("md") | Some("markdown"));
-    }
-    if lower.contains("image") {
-        return matches!(
-            ext.as_deref(),
-            Some("jpg")
-                | Some("jpeg")
-                | Some("png")
-                | Some("gif")
-                | Some("webp")
-                | Some("heic")
-                | Some("tif")
-                | Some("tiff")
-                | Some("bmp")
-        );
-    }
-    true
-}
-
-fn prompt_file_kind_label(lower: &str) -> &'static str {
-    if lower.contains("markdown") || lower.contains(".md") {
-        "Markdown file"
-    } else if lower.contains("image") {
-        "image file"
-    } else {
-        "regular file"
-    }
-}
-
-fn readonly_probe_stdout(probe: &serde_json::Value) -> Option<String> {
-    if probe
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let stdout = probe.get("stdout")?.as_str()?.trim();
-        return Some(stdout.to_string());
-    }
-    None
-}
-
-fn readonly_probe_failure_answer(probe: &serde_json::Value, prefix: &str) -> String {
-    let detail = probe
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            probe
-                .get("message")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.trim().is_empty())
-        })
-        .or_else(|| {
-            probe
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.trim().is_empty())
-        })
-        .unwrap_or("the read-only probe returned no usable output");
-    format!("{prefix}: {}.", detail.trim())
-}
-
-async fn du_storage_size(path: &Path) -> std::result::Result<String, String> {
-    if !path.exists() {
-        return Err(format!("`{}` does not exist", path.display()));
-    }
-    let mut command = tokio::process::Command::new("du");
-    command
-        .arg("-sh")
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let output =
-        match tokio::time::timeout(std::time::Duration::from_secs(12), command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => return Err("`du -sh` timed out".to_string()),
-        };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(if detail.is_empty() {
-            format!("`du` exited with status {:?}", output.status.code())
-        } else {
-            detail.to_string()
-        });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(size) = stdout.split_whitespace().next() else {
-        return Err("`du` returned no output".to_string());
-    };
-    Ok(size.to_string())
 }
 
 async fn try_handle_local_tool_request(
@@ -5480,12 +5138,29 @@ async fn handle_readonly_tool_call(
         "run_readonly_command"
             if cfg.local_tools.enabled && cfg.local_tools.readonly_command_enabled =>
         {
-            let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) else {
+            let Some(cmd) = call
+                .arguments
+                .get("cmd")
+                .or_else(|| call.arguments.get("command"))
+                .and_then(|v| v.as_str())
+            else {
                 return Ok(Some((
                     "run_readonly_command".to_string(),
                     render_json(serde_json::json!({"error":"missing_cmd"})),
                 )));
             };
+            let prompt_findings = planning::validate_prompt_effects(cmd, &payload.prompt);
+            if !prompt_findings.is_empty() {
+                return Ok(Some((
+                    "run_readonly_command".to_string(),
+                    render_json(serde_json::json!({
+                        "error": "validation_failed",
+                        "cmd": cmd,
+                        "findings": prompt_findings,
+                        "guidance": "Choose another read-only probe whose output directly matches the user's requested fact."
+                    })),
+                )));
+            }
             let result = run_readonly_command_probe(cfg.as_ref(), &cwd, cmd).await;
             append_source_refs(
                 state,
@@ -6337,10 +6012,23 @@ async fn run_readonly_command_probe(cfg: &AppConfig, cwd: &Path, cmd: &str) -> s
     let tokens = match validate_readonly_command_tokens(cmd) {
         Ok(tokens) => tokens,
         Err(reason) => {
+            let lower = cmd.trim().to_ascii_lowercase();
+            let hint = if lower == "history"
+                || lower.starts_with("history ")
+                || lower == "fc"
+                || lower.starts_with("fc ")
+            {
+                Some(
+                    "Use search_terminal_context for recently-run user shell commands; run_readonly_command observes a daemon process, not the user's interactive zsh history.",
+                )
+            } else {
+                None
+            };
             return serde_json::json!({
                 "error": "rejected_readonly_probe",
                 "reason": reason,
-                "cmd": cmd
+                "cmd": cmd,
+                "hint": hint
             });
         }
     };
@@ -6421,29 +6109,42 @@ fn validate_readonly_command_tokens(cmd: &str) -> std::result::Result<Vec<String
     if parsed.ambiguous {
         return Err("ambiguous shell syntax is not allowed".to_string());
     }
-    if parsed.has_pipeline
-        || parsed.has_control_operators
+    if parsed.has_pipeline {
+        if parsed.has_control_operators
+            || parsed.has_redirection
+            || parsed.has_command_substitution
+            || parsed.has_grouping
+        {
+            return Err(
+                "control operators, redirection, grouping, and command substitution are not allowed"
+                    .to_string(),
+            );
+        }
+        if parsed.tokens.len() > 80 {
+            return Err("too many arguments for a read-only probe".to_string());
+        }
+        reject_readonly_shell_expansions(&parsed.tokens)?;
+        validate_readonly_pipeline_segments(trimmed)?;
+        return Ok(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            trimmed.to_string(),
+        ]);
+    }
+    if parsed.has_control_operators
         || parsed.has_redirection
         || parsed.has_command_substitution
         || parsed.has_grouping
     {
         return Err(
-            "pipelines, control operators, redirection, grouping, and command substitution are not allowed"
+            "control operators, redirection, grouping, and command substitution are not allowed"
                 .to_string(),
         );
     }
     if parsed.tokens.len() > 40 {
         return Err("too many arguments for a read-only probe".to_string());
     }
-    if parsed
-        .tokens
-        .iter()
-        .any(|token| token.contains('$') || token.starts_with('~'))
-    {
-        return Err(
-            "shell expansions are not available; use absolute or relative paths".to_string(),
-        );
-    }
+    reject_readonly_shell_expansions(&parsed.tokens)?;
     let Some(program) = parsed.tokens.first().map(String::as_str) else {
         return Err("empty command".to_string());
     };
@@ -6455,29 +6156,144 @@ fn validate_readonly_command_tokens(cmd: &str) -> std::result::Result<Vec<String
     Ok(parsed.tokens)
 }
 
+fn reject_readonly_shell_expansions(tokens: &[String]) -> std::result::Result<(), String> {
+    if tokens
+        .iter()
+        .any(|token| token.contains('$') || token.starts_with('~'))
+    {
+        return Err(
+            "shell expansions are not available; use absolute or relative paths".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_readonly_pipeline_segments(cmd: &str) -> std::result::Result<(), String> {
+    let segments = split_simple_readonly_pipeline(cmd)?;
+    if segments.len() < 2 {
+        return Err("pipeline must have at least two commands".to_string());
+    }
+    if segments.len() > 4 {
+        return Err("read-only pipelines may have at most four commands".to_string());
+    }
+    for segment in segments {
+        let parsed = parse_command(&segment);
+        if parsed.ambiguous
+            || parsed.has_pipeline
+            || parsed.has_control_operators
+            || parsed.has_redirection
+            || parsed.has_command_substitution
+            || parsed.has_grouping
+        {
+            return Err("pipeline segment contains unsupported shell syntax".to_string());
+        }
+        reject_readonly_shell_expansions(&parsed.tokens)?;
+        let Some(program) = parsed.tokens.first().map(String::as_str) else {
+            return Err("empty pipeline segment".to_string());
+        };
+        if !readonly_probe_program_allowed(program, &parsed.tokens[1..]) {
+            return Err(format!(
+                "`{program}` is not allowlisted as a read-only probe"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn split_simple_readonly_pipeline(cmd: &str) -> std::result::Result<Vec<String>, String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in cmd.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                current.push(ch);
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            '|' if !in_single && !in_double => {
+                let segment = current.trim();
+                if segment.is_empty() {
+                    return Err("empty pipeline segment".to_string());
+                }
+                segments.push(segment.to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let segment = current.trim();
+    if segment.is_empty() {
+        return Err("empty pipeline segment".to_string());
+    }
+    segments.push(segment.to_string());
+    Ok(segments)
+}
+
 fn readonly_probe_program_allowed(program: &str, args: &[String]) -> bool {
     match program {
         "pwd" => args.iter().all(|arg| matches!(arg.as_str(), "-L" | "-P")),
-        "ls" | "stat" | "df" | "head" | "tail" | "wc" | "du" => true,
-        "find" => !args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "-delete"
-                    | "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fls"
-                    | "-fprint"
-                    | "-fprintf"
-            )
-        }),
+        "ls" | "stat" | "df" | "head" | "tail" | "wc" | "du" | "sort" | "cut" => true,
+        "find" => readonly_find_probe_allowed(args),
         "which" | "whereis" | "uname" | "date" | "whoami" | "id" | "sw_vers" | "ps" | "pgrep"
         | "uptime" => true,
         "sysctl" => !args.iter().any(|arg| arg == "-w" || arg.contains('=')),
         "git" => readonly_git_probe_allowed(args),
         _ => false,
     }
+}
+
+fn readonly_find_probe_allowed(args: &[String]) -> bool {
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-delete" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprintf" => {
+                return false;
+            }
+            "-exec" => {
+                let Some(program) = args.get(i + 1).map(String::as_str) else {
+                    return false;
+                };
+                if program != "stat" {
+                    return false;
+                }
+                let mut j = i + 2;
+                let mut terminated = false;
+                while j < args.len() {
+                    let token = args[j].as_str();
+                    if matches!(token, "+" | ";" | "\\;") {
+                        terminated = true;
+                        break;
+                    }
+                    if token.contains('$') || token.starts_with('~') || token.contains('`') {
+                        return false;
+                    }
+                    j += 1;
+                }
+                if !terminated {
+                    return false;
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 fn readonly_git_probe_allowed(args: &[String]) -> bool {
@@ -6528,9 +6344,79 @@ async fn try_provider_orchestration(
             ) || prompt_has_web_or_advice_signal(&payload.prompt));
     }
     if answer_direct
-        && let Some((answer, usage)) =
-            try_local_direct_answer_fast_path(state, payload, &classification.classification)
-                .await?
+        && matches!(
+            classification.classification,
+            tasks::TaskClassification::ReferentialFollowup
+        )
+        && let Some(answer) =
+            terminal_context_no_blank_answer(state, payload, &classification.classification).await
+    {
+        transport
+            .send(ServerMessage::ModelText {
+                task_id: payload.task_id,
+                chunk: answer.clone(),
+            })
+            .await?;
+        transport
+            .send(ServerMessage::TaskComplete {
+                task_id: payload.task_id,
+                reason: TaskCompleteReason::ModelDone,
+                summary: truncate_string(&answer, 500),
+            })
+            .await?;
+        append_session_turn_if_session_mode(
+            state,
+            &payload.mode,
+            payload.shell_id,
+            payload.prompt.clone(),
+            truncate_string(&answer, 1200),
+        )
+        .await;
+        return Ok(true);
+    }
+    if answer_direct
+        && prompt_requires_readonly_local_fact(&payload.prompt)
+        && let Some(call) = materialize_readonly_command_from_prompt(payload)
+        && let Some((_tool_name, tool_output)) =
+            handle_readonly_tool_call(state, payload, session, &call).await?
+        && let Some(answer) = direct_answer_from_readonly_tool_json(&payload.prompt, &tool_output)
+    {
+        transport
+            .send(ServerMessage::ModelText {
+                task_id: payload.task_id,
+                chunk: answer.clone(),
+            })
+            .await?;
+        transport
+            .send(ServerMessage::TaskComplete {
+                task_id: payload.task_id,
+                reason: TaskCompleteReason::ModelDone,
+                summary: truncate_string(&answer, 500),
+            })
+            .await?;
+        append_session_turn_if_session_mode(
+            state,
+            &payload.mode,
+            payload.shell_id,
+            payload.prompt.clone(),
+            truncate_string(&answer, 1200),
+        )
+        .await;
+        state
+            .task_conversations
+            .lock()
+            .await
+            .remove(&payload.task_id);
+        return Ok(true);
+    }
+    if answer_direct
+        && let Some((answer, usage)) = try_local_direct_answer_fast_path(
+            state,
+            payload,
+            &classification.classification,
+            drafting_prompt,
+        )
+        .await?
     {
         *state.last_provider_usage.lock().await = usage;
         transport
@@ -6563,19 +6449,27 @@ async fn try_provider_orchestration(
     }
     let expose_execute = profile.execute_shell_command;
     let expose_lookup = profile.lookup_command_docs;
+    let clear_command_prompt = payload.mode == "?"
+        && expose_execute
+        && prompt_has_sufficient_local_action_details(&payload.prompt)
+        && prompt_prefers_execute_action(&payload.prompt);
 
     let mut tools = Vec::<ToolSchema>::new();
     if expose_execute {
         tools.push(tool_schema_execute_shell_command());
-        if payload.mode == "?" {
+        if payload.mode == "?" && !prompt_has_sufficient_local_action_details(&payload.prompt) {
             tools.push(tool_schema_ask_clarification());
         }
     }
-    if expose_lookup {
+    if expose_lookup && !clear_command_prompt {
         tools.push(tool_schema_retrieve_command_docs());
         tools.push(tool_schema_lookup_docs());
     }
-    let local_tools = local_tool_schemas_for_profile(cfg.as_ref(), &profile);
+    let local_tools = if clear_command_prompt {
+        Vec::new()
+    } else {
+        local_tool_schemas_for_profile(cfg.as_ref(), &profile)
+    };
     if !local_tools.is_empty() {
         tools.extend(local_tools);
     }
@@ -6612,7 +6506,12 @@ async fn try_provider_orchestration(
             "\nDirect-answer contract: the user asked a question or requested advice. \
              Use read-only local tools, command docs, terminal context, and web tools when helpful, \
              then answer in concise prose. Do not call execute_shell_command and do not propose a command for approval \
-             unless the user explicitly asks you to run or change something.",
+             unless the user explicitly asks you to run or change something. \
+             For local fact questions asking how many, how much storage, oldest/newest/most recent files, installed versions, current git state, or prior terminal output, call a read-only local or terminal-context tool before answering. \
+             Do not merely describe the command you would use for those prompts; use the tool and answer from the observation. \
+             After a read-only observation, answer with the observed value in one concise sentence; do not narrate failed attempts unless no successful observation is possible. \
+             If the user asks what was just run, what the previous command was, or refers to recent shell output, \
+             answer from Recent terminal context or call search_terminal_context; do not call run_readonly_command with history.",
         );
     }
     if profile.web_tools && cfg.web.enabled && cfg.web.expose_tools && cfg.web.citation_required {
@@ -6663,6 +6562,26 @@ async fn try_provider_orchestration(
     };
     system.push('\n');
     system.push_str(&cheatsheet);
+    let mut model_drafting_prompt = drafting_prompt.to_string();
+    if payload.mode == "?" && expose_execute && !answer_direct {
+        let retrieved_chunks = retrieve_chunks_for_prompt(state, &payload.prompt, Some(6)).await;
+        maybe_write_retrieval_trace(
+            state,
+            Some(payload.task_id),
+            &payload.prompt,
+            Some(6),
+            &retrieved_chunks,
+        )
+        .await;
+        append_source_refs(state, retrieved_chunk_source_refs(&retrieved_chunks)).await;
+        let docs_block = format_compact_retrieved_docs_block(&retrieved_chunks);
+        if !docs_block.trim().is_empty() {
+            model_drafting_prompt.push_str(
+                "\n\n## Retrieved Local Command Docs\nUse these retrieved docs as grounding for command choice and flags. They are evidence, not a required answer.\n",
+            );
+            model_drafting_prompt.push_str(&context::trim_to_tokens(&docs_block, 700));
+        }
+    }
 
     let messages = {
         let mut conversations = state.task_conversations.lock().await;
@@ -6677,7 +6596,7 @@ async fn try_provider_orchestration(
             } else {
                 entry.insert(0, ChatMessage::system(system.clone()));
             }
-            entry.push(ChatMessage::user(drafting_prompt.to_string()));
+            entry.push(ChatMessage::user(model_drafting_prompt.clone()));
             entry.clone()
         } else {
             let mut seed = vec![ChatMessage::system(system.clone())];
@@ -6686,11 +6605,11 @@ async fn try_provider_orchestration(
                 let prior = session_messages_for_shell(state, payload.shell_id, &system).await;
                 let mut conversations = state.task_conversations.lock().await;
                 seed.extend(prior);
-                seed.push(ChatMessage::user(drafting_prompt.to_string()));
+                seed.push(ChatMessage::user(model_drafting_prompt.clone()));
                 conversations.insert(payload.task_id, seed.clone());
                 seed
             } else {
-                seed.push(ChatMessage::user(drafting_prompt.to_string()));
+                seed.push(ChatMessage::user(model_drafting_prompt.clone()));
                 conversations.insert(payload.task_id, seed.clone());
                 seed
             }
@@ -6699,8 +6618,15 @@ async fn try_provider_orchestration(
 
     let mut request_options = provider_request_options(cfg.as_ref());
     if payload.mode == "?" {
-        request_options.insert("max_tokens".to_string(), serde_json::json!(96));
-        request_options.insert("num_predict".to_string(), serde_json::json!(96));
+        let max_predict = if answer_direct {
+            160
+        } else if prompt_needs_compound_command_budget(&payload.prompt) {
+            192
+        } else {
+            112
+        };
+        request_options.insert("max_tokens".to_string(), serde_json::json!(max_predict));
+        request_options.insert("num_predict".to_string(), serde_json::json!(max_predict));
     }
     let chat_request = ChatRequest {
         task_id: Some(payload.task_id.to_string()),
@@ -6721,21 +6647,6 @@ async fn try_provider_orchestration(
     let mut text_buffer = String::new();
     let mut tool_calls = Vec::new();
     let mut provider_usage = ProviderUsageSnapshot::default();
-
-    if payload.mode == "?"
-        && cfg.inference.provider == "local"
-        && let Some((call, raw_text, usage)) = try_local_action_fallback(
-            state,
-            payload,
-            &json_fallback_messages,
-            &json_fallback_tools,
-        )
-        .await?
-    {
-        text_buffer = raw_text;
-        provider_usage = usage;
-        tool_calls.push(call);
-    }
 
     if tool_calls.is_empty() {
         let stream_result = {
@@ -6955,8 +6866,28 @@ async fn try_provider_orchestration(
     {
         tool_calls.push(parsed);
     }
+    if payload.mode == "?" && !tool_calls.is_empty() {
+        tool_calls = tool_calls
+            .into_iter()
+            .filter_map(|call| {
+                if call.name == "execute_shell_command" {
+                    let sanitized = sanitize_local_action_tool_call(call, payload.prompt.trim());
+                    if local_action_tool_call_is_usable(&sanitized, payload.prompt.trim()) {
+                        Some(sanitized)
+                    } else {
+                        None
+                    }
+                } else if tool_call_has_minimum_arguments(&call) {
+                    Some(call)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
     if tool_calls.is_empty()
         && payload.mode == "?"
+        && !answer_direct
         && let Some((call, raw_text, usage)) = try_local_action_fallback(
             state,
             payload,
@@ -6976,7 +6907,47 @@ async fn try_provider_orchestration(
     {
         tool_calls.push(plain_call);
     }
-
+    if tool_calls.is_empty()
+        && payload.mode == "?"
+        && answer_direct
+        && direct_answer_needs_tool_or_observation(&text_buffer, &payload.prompt)
+    {
+        if prompt_requires_project_metadata_fact(&payload.prompt) {
+            tool_calls.push(ToolCall {
+                name: "project_metadata".to_string(),
+                arguments: serde_json::json!({
+                    "include_scripts": true,
+                    "include_ci": false,
+                }),
+            });
+        } else {
+            let mut answer_tools = json_fallback_tools.clone();
+            answer_tools.retain(|tool| tool.name != "execute_shell_command");
+            if prompt_requires_readonly_local_fact(&payload.prompt) {
+                answer_tools.retain(|tool| {
+                    matches!(
+                        tool.name.as_str(),
+                        "run_readonly_command"
+                            | "project_metadata"
+                            | "git_context"
+                            | "search_terminal_context"
+                    )
+                });
+            }
+            if prompt_requires_readonly_local_fact(&payload.prompt)
+                && let Some(call) = materialize_readonly_command_from_prompt(payload)
+            {
+                tool_calls.push(call);
+            } else if let Some((call, raw_text, usage)) =
+                try_local_action_fallback(state, payload, &json_fallback_messages, &answer_tools)
+                    .await?
+            {
+                text_buffer = raw_text;
+                *state.last_provider_usage.lock().await = usage;
+                tool_calls.push(call);
+            }
+        }
+    }
     if !text_buffer.trim().is_empty() || !tool_calls.is_empty() {
         let mut conversations = state.task_conversations.lock().await;
         if let Some(history) = conversations.get_mut(&payload.task_id) {
@@ -6987,11 +6958,121 @@ async fn try_provider_orchestration(
     }
 
     if tool_calls.is_empty() {
+        let display_text = sanitize_model_display_text(&text_buffer);
+        if answer_direct
+            && display_text.is_empty()
+            && let Some(fallback_answer) =
+                terminal_context_no_blank_answer(state, payload, &classification.classification)
+                    .await
+        {
+            transport
+                .send(ServerMessage::ModelText {
+                    task_id: payload.task_id,
+                    chunk: fallback_answer.clone(),
+                })
+                .await?;
+            transport
+                .send(ServerMessage::TaskComplete {
+                    task_id: payload.task_id,
+                    reason: TaskCompleteReason::ModelDone,
+                    summary: truncate_string(&fallback_answer, 500),
+                })
+                .await?;
+            append_session_turn_if_session_mode(
+                state,
+                &payload.mode,
+                payload.shell_id,
+                payload.prompt.clone(),
+                truncate_string(&fallback_answer, 1200),
+            )
+            .await;
+            state
+                .task_conversations
+                .lock()
+                .await
+                .remove(&payload.task_id);
+            return Ok(true);
+        }
+
+        if answer_direct && direct_answer_needs_tool_or_observation(&display_text, &payload.prompt)
+        {
+            if cfg.behavior.allow_clarifications {
+                let shell_override = approval_override_for_shell(state, payload.shell_id).await;
+                state.tasks.lock().await.insert(
+                    payload.task_id,
+                    InFlightTask {
+                        task_id: payload.task_id,
+                        shell_id: payload.shell_id,
+                        mode: payload.mode.clone(),
+                        original_prompt: payload.prompt.clone(),
+                        proposed_command: String::new(),
+                        classification: classification.classification.clone(),
+                        classification_confidence: classification.confidence,
+                        approval_override: shell_override,
+                        awaiting_clarification: true,
+                        provider_continuation,
+                        tool_round: readonly_tool_round_count(state, payload.task_id).await,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+                transport
+                    .send(ServerMessage::NeedsClarification {
+                        task_id: payload.task_id,
+                        question: "I could not verify that from the available local observations. Which path or detail should I inspect?"
+                            .to_string(),
+                    })
+                    .await?;
+                return Ok(true);
+            }
+            let fallback_answer =
+                "I could not verify that from the available local observations.".to_string();
+            transport
+                .send(ServerMessage::ModelText {
+                    task_id: payload.task_id,
+                    chunk: fallback_answer.clone(),
+                })
+                .await?;
+            transport
+                .send(ServerMessage::TaskComplete {
+                    task_id: payload.task_id,
+                    reason: TaskCompleteReason::ModelDone,
+                    summary: fallback_answer.clone(),
+                })
+                .await?;
+            append_session_turn_if_session_mode(
+                state,
+                &payload.mode,
+                payload.shell_id,
+                payload.prompt.clone(),
+                fallback_answer,
+            )
+            .await;
+            state
+                .task_conversations
+                .lock()
+                .await
+                .remove(&payload.task_id);
+            return Ok(true);
+        }
+
         if payload.mode == "?"
             && cfg.behavior.allow_clarifications
             && !answer_direct
-            && !text_buffer.trim().is_empty()
+            && !display_text.is_empty()
         {
+            if propose_retrieved_template_command_if_available(
+                state,
+                transport,
+                payload,
+                session,
+                provider_continuation,
+                classification,
+                "retrieval_template_before_clarification",
+            )
+            .await?
+            {
+                return Ok(true);
+            }
             let shell_override = approval_override_for_shell(state, payload.shell_id).await;
             state.tasks.lock().await.insert(
                 payload.task_id,
@@ -7010,7 +7091,7 @@ async fn try_provider_orchestration(
                     created_at: std::time::Instant::now(),
                 },
             );
-            let model_text = text_buffer.trim().trim_end_matches('\n');
+            let model_text = display_text.trim().trim_end_matches('\n');
             let question = if model_text.ends_with('?') {
                 model_text.to_string()
             } else {
@@ -7026,7 +7107,7 @@ async fn try_provider_orchestration(
             return Ok(true);
         }
 
-        if cfg.behavior.allow_clarifications && text_buffer.trim_end().ends_with('?') {
+        if cfg.behavior.allow_clarifications && display_text.trim_end().ends_with('?') {
             let shell_override = approval_override_for_shell(state, payload.shell_id).await;
             state.tasks.lock().await.insert(
                 payload.task_id,
@@ -7048,14 +7129,28 @@ async fn try_provider_orchestration(
             transport
                 .send(ServerMessage::NeedsClarification {
                     task_id: payload.task_id,
-                    question: text_buffer.trim().trim_end_matches('\n').to_string(),
+                    question: display_text.trim().trim_end_matches('\n').to_string(),
                 })
                 .await?;
             return Ok(true);
         }
 
-        if text_buffer.trim().is_empty() {
+        if display_text.is_empty() {
             if payload.mode == "?" && cfg.behavior.allow_clarifications {
+                if !answer_direct
+                    && propose_retrieved_template_command_if_available(
+                        state,
+                        transport,
+                        payload,
+                        session,
+                        provider_continuation,
+                        classification,
+                        "retrieval_template_empty_response",
+                    )
+                    .await?
+                {
+                    return Ok(true);
+                }
                 let shell_override = approval_override_for_shell(state, payload.shell_id).await;
                 state.tasks.lock().await.insert(
                     payload.task_id,
@@ -7091,7 +7186,7 @@ async fn try_provider_orchestration(
                 .remove(&payload.task_id);
             return Ok(false);
         }
-        let mut final_text = text_buffer.clone();
+        let mut final_text = display_text.clone();
         let mut appended_citations = String::new();
         if profile.web_tools && cfg.web.enabled && cfg.web.expose_tools && cfg.web.citation_required
         {
@@ -7237,6 +7332,7 @@ async fn try_provider_orchestration(
         let mut cmd = call
             .arguments
             .get("cmd")
+            .or_else(|| call.arguments.get("command"))
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .trim()
@@ -7282,6 +7378,43 @@ async fn try_provider_orchestration(
     }
 
     if sent_docs || sent_readonly {
+        if answer_direct
+            && sent_readonly
+            && let Some(answer) = direct_answer_from_recent_readonly_observation(
+                state,
+                payload.task_id,
+                &payload.prompt,
+            )
+            .await
+        {
+            transport
+                .send(ServerMessage::ModelText {
+                    task_id: payload.task_id,
+                    chunk: answer.clone(),
+                })
+                .await?;
+            transport
+                .send(ServerMessage::TaskComplete {
+                    task_id: payload.task_id,
+                    reason: TaskCompleteReason::ModelDone,
+                    summary: truncate_string(&answer, 500),
+                })
+                .await?;
+            append_session_turn_if_session_mode(
+                state,
+                &payload.mode,
+                payload.shell_id,
+                payload.prompt.clone(),
+                truncate_string(&answer, 1200),
+            )
+            .await;
+            state
+                .task_conversations
+                .lock()
+                .await
+                .remove(&payload.task_id);
+            return Ok(true);
+        }
         let readonly_rounds = readonly_tool_round_count(state, payload.task_id).await;
         let max_rounds = cfg.behavior.max_tool_rounds.max(1);
         if readonly_rounds < max_rounds {
@@ -7356,7 +7489,54 @@ async fn try_provider_orchestration(
         return Ok(true);
     }
 
+    if answer_direct
+        && let Some(fallback_answer) =
+            terminal_context_no_blank_answer(state, payload, &classification.classification).await
+    {
+        transport
+            .send(ServerMessage::ModelText {
+                task_id: payload.task_id,
+                chunk: fallback_answer.clone(),
+            })
+            .await?;
+        transport
+            .send(ServerMessage::TaskComplete {
+                task_id: payload.task_id,
+                reason: TaskCompleteReason::ModelDone,
+                summary: truncate_string(&fallback_answer, 500),
+            })
+            .await?;
+        append_session_turn_if_session_mode(
+            state,
+            &payload.mode,
+            payload.shell_id,
+            payload.prompt.clone(),
+            truncate_string(&fallback_answer, 1200),
+        )
+        .await;
+        state
+            .task_conversations
+            .lock()
+            .await
+            .remove(&payload.task_id);
+        return Ok(true);
+    }
+
     if payload.mode == "?" && cfg.behavior.allow_clarifications {
+        if !answer_direct
+            && propose_retrieved_template_command_if_available(
+                state,
+                transport,
+                payload,
+                session,
+                provider_continuation,
+                classification,
+                "retrieval_template_final_command_fallback",
+            )
+            .await?
+        {
+            return Ok(true);
+        }
         let shell_override = approval_override_for_shell(state, payload.shell_id).await;
         state.tasks.lock().await.insert(
             payload.task_id,
@@ -7396,6 +7576,93 @@ async fn try_provider_orchestration(
     Ok(false)
 }
 
+async fn propose_retrieved_template_command_if_available(
+    state: &Arc<DaemonState>,
+    transport: &mut ipc::ServerTransport,
+    payload: &termlm_protocol::StartTask,
+    session: &ShellSession,
+    provider_continuation: bool,
+    classification: &tasks::ClassificationResult,
+    rationale: &str,
+) -> Result<bool> {
+    if payload.mode != "?"
+        || !prompt_has_sufficient_local_action_details(&payload.prompt)
+        || !prompt_prefers_execute_action(&payload.prompt)
+    {
+        return Ok(false);
+    }
+
+    let chunks = retrieve_chunks_for_prompt(state, &payload.prompt, Some(6)).await;
+    maybe_write_retrieval_trace(
+        state,
+        Some(payload.task_id),
+        &payload.prompt,
+        Some(6),
+        &chunks,
+    )
+    .await;
+    append_source_refs(state, retrieved_chunk_source_refs(&chunks)).await;
+
+    let Some(call) = materialize_retrieved_command_from_prompt(&chunks, payload) else {
+        return Ok(false);
+    };
+    let call = sanitize_local_action_tool_call(call, payload.prompt.trim());
+    if !local_action_tool_call_is_usable(&call, payload.prompt.trim()) {
+        debug!(
+            prompt = %payload.prompt,
+            call = ?call,
+            "retrieval-template fallback produced no usable command"
+        );
+        return Ok(false);
+    }
+    let Some(cmd) = call
+        .arguments
+        .get("cmd")
+        .or_else(|| call.arguments.get("command"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        return Ok(false);
+    };
+    let commands_used = call
+        .arguments
+        .get("commands_used")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| extract_command_names(&cmd, 8));
+
+    propose_command_for_execution(
+        state,
+        transport,
+        payload,
+        session,
+        provider_continuation,
+        classification,
+        CommandPlan {
+            cmd,
+            rationale: rationale.to_string(),
+            intent:
+                "retrieval-backed command template selected after model output was not executable"
+                    .to_string(),
+            expected_effect: "execute validated shell command".to_string(),
+            commands_used,
+            continue_after_execution: false,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 async fn readonly_tool_round_count(state: &Arc<DaemonState>, task_id: Uuid) -> u32 {
     let conversations = state.task_conversations.lock().await;
     conversations
@@ -7413,6 +7680,122 @@ async fn readonly_tool_round_count(state: &Arc<DaemonState>, task_id: Uuid) -> u
                 .count() as u32
         })
         .unwrap_or(0)
+}
+
+async fn direct_answer_from_recent_readonly_observation(
+    state: &Arc<DaemonState>,
+    task_id: Uuid,
+    prompt: &str,
+) -> Option<String> {
+    let conversations = state.task_conversations.lock().await;
+    let history = conversations.get(&task_id)?;
+    let lower = prompt.to_ascii_lowercase();
+    if prompt_requires_project_metadata_fact(prompt)
+        && let Some(answer) = history.iter().rev().find_map(|message| {
+            if message.role != "tool" || message.tool_name.as_deref() != Some("project_metadata") {
+                return None;
+            }
+            let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+            let scripts = value
+                .get("scripts")
+                .and_then(|scripts| scripts.as_array())?;
+            let script = scripts
+                .iter()
+                .filter_map(|item| item.as_str())
+                .find(|script| {
+                    let script_lower = script.to_ascii_lowercase();
+                    if lower.contains("test") {
+                        script_lower.contains("test")
+                    } else if lower.contains("build") {
+                        script_lower.contains("build")
+                    } else {
+                        true
+                    }
+                })?;
+            Some(format!("The project command is `{script}`."))
+        })
+    {
+        return Some(answer);
+    }
+    let (cmd, stdout) = history.iter().rev().find_map(|message| {
+        if message.role != "tool" || message.tool_name.as_deref() != Some("run_readonly_command") {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+        if !value
+            .get("success")
+            .and_then(|success| success.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let stdout = value
+            .get("stdout")
+            .and_then(|stdout| stdout.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if stdout.is_empty() {
+            return None;
+        }
+        let cmd = value
+            .get("cmd")
+            .and_then(|cmd| cmd.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some((cmd, stdout))
+    })?;
+    direct_answer_from_readonly_result(prompt, &cmd, &stdout)
+}
+
+fn direct_answer_from_readonly_tool_json(prompt: &str, tool_output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(tool_output).ok()?;
+    if !value
+        .get("success")
+        .and_then(|success| success.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let stdout = value
+        .get("stdout")
+        .and_then(|stdout| stdout.as_str())
+        .unwrap_or("")
+        .trim();
+    if stdout.is_empty() {
+        return None;
+    }
+    let cmd = value
+        .get("cmd")
+        .and_then(|cmd| cmd.as_str())
+        .unwrap_or("")
+        .trim();
+    direct_answer_from_readonly_result(prompt, cmd, stdout)
+}
+
+fn direct_answer_from_readonly_result(prompt: &str, cmd: &str, stdout: &str) -> Option<String> {
+    let lower = prompt.to_ascii_lowercase();
+    if cmd == "pwd"
+        || lower.contains("what directory")
+        || lower.contains("which directory")
+        || lower.contains("where am i")
+        || lower.contains("current directory")
+    {
+        return Some(format!("You are in the `{stdout}` directory."));
+    }
+    if (lower.contains("how many") || lower.contains("count")) && lower.contains("file") {
+        return Some(format!("The count is `{}`.", stdout.lines().next()?.trim()));
+    }
+    if lower.contains("storage") || lower.contains("disk usage") || lower.contains("how much") {
+        return Some(format!("The storage usage is `{stdout}`."));
+    }
+    if (lower.contains("oldest") || lower.contains("newest") || lower.contains("most recent"))
+        && lower.contains("file")
+    {
+        return Some(format!("The matching file is `{stdout}`."));
+    }
+    Some(format!("The result is `{stdout}`."))
 }
 
 async fn validation_web_fallback_attempt_count(state: &Arc<DaemonState>, task_id: Uuid) -> u32 {
@@ -7437,6 +7820,7 @@ async fn try_local_direct_answer_fast_path(
     state: &Arc<DaemonState>,
     payload: &termlm_protocol::StartTask,
     classification: &tasks::TaskClassification,
+    context_prompt: &str,
 ) -> Result<Option<(String, ProviderUsageSnapshot)>> {
     if state.config_snapshot().inference.provider != "local"
         || !direct_answer_fast_path_allowed(&payload.prompt, classification)
@@ -7444,14 +7828,24 @@ async fn try_local_direct_answer_fast_path(
         return Ok(None);
     }
 
+    let focused_context = if matches!(
+        classification,
+        tasks::TaskClassification::ReferentialFollowup
+    ) {
+        recent_terminal_context_for_direct_answer(state, payload)
+            .await
+            .unwrap_or_else(|| context_prompt.trim().to_string())
+    } else {
+        context_prompt.trim().to_string()
+    };
+
     let messages = vec![
         ChatMessage::system(
-            "You are termlm answering a terminal user's question. Answer directly in one or two concise sentences. If a command is useful, include it inline in backticks. Do not use tool-call syntax. Do not propose a command for approval.",
+            "You are termlm answering a terminal user's question. Answer directly in one concise sentence unless a second sentence is necessary. If a command is useful, include it inline in backticks. Do not use tool-call syntax. Do not propose a command for approval. Do not ask a follow-up question or offer extra actions unless the user explicitly asks for options.",
         ),
         ChatMessage::user(format!(
-            "Question: {}\nCurrent working directory: {}\nAnswer:",
-            payload.prompt.trim(),
-            payload.cwd
+            "Use the prompt and context below to answer the user's question. If recent terminal context is included and the user asks what just ran or what happened previously, answer from that context. If the context is insufficient, say what is missing and ask one focused question.\n\n{}\n\nCurrent working directory: {}\n\nAnswer:",
+            focused_context, payload.cwd,
         )),
     ];
     let mut options = provider_request_options(state.config_snapshot().as_ref());
@@ -7525,12 +7919,120 @@ async fn try_local_direct_answer_fast_path(
 
     let answer = sanitize_direct_answer_text(&text);
     if answer.is_empty()
+        || answer.chars().count() < 24
         || direct_answer_looks_like_tool_call(&answer)
         || !direct_answer_covers_prompt(&answer, &payload.prompt)
     {
         return Ok(None);
     }
     Ok(Some((answer, usage)))
+}
+
+fn prompt_requests_recursive_scope(lower: &str) -> bool {
+    lower.contains("recursive")
+        || lower.contains("recursively")
+        || lower.contains("subfolder")
+        || lower.contains("subfolders")
+        || lower.contains("subdirector")
+        || lower.contains("under")
+}
+
+async fn recent_terminal_context_for_direct_answer(
+    state: &Arc<DaemonState>,
+    payload: &termlm_protocol::StartTask,
+) -> Option<String> {
+    let mut entries = {
+        let observed = state.observed.lock().await;
+        observed
+            .iter()
+            .filter(|entry| entry.shell_id == payload.shell_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at));
+    let mut out = String::new();
+    out.push_str("User question: ");
+    out.push_str(payload.prompt.trim());
+    out.push_str("\n\nRecent terminal context from the user's interactive shell, newest first:\n");
+    for (idx, entry) in entries.into_iter().take(5).enumerate() {
+        out.push_str(&format!(
+            "{}. command: {}\n   cwd: {}\n   exit_code: {}\n",
+            idx + 1,
+            entry.command,
+            entry.cwd,
+            entry.exit_code
+        ));
+        if !entry.stdout_tail.trim().is_empty() {
+            out.push_str("   stdout_tail: ");
+            out.push_str(&entry.stdout_tail.replace('\n', "\\n"));
+            out.push('\n');
+        }
+        if !entry.stderr_tail.trim().is_empty() {
+            out.push_str("   stderr_tail: ");
+            out.push_str(&entry.stderr_tail.replace('\n', "\\n"));
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+async fn terminal_context_no_blank_answer(
+    state: &Arc<DaemonState>,
+    payload: &termlm_protocol::StartTask,
+    classification: &tasks::TaskClassification,
+) -> Option<String> {
+    if !matches!(
+        classification,
+        tasks::TaskClassification::ReferentialFollowup
+    ) {
+        return None;
+    }
+    let mut entries = {
+        let observed = state.observed.lock().await;
+        observed
+            .iter()
+            .filter(|entry| entry.shell_id == payload.shell_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at));
+    let entry = entries.into_iter().next()?;
+    let command = entry.command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let lower = payload.prompt.to_ascii_lowercase();
+    if lower.contains("output") || lower.contains("print") || lower.contains("result") {
+        let stdout = entry.stdout_tail.trim();
+        let stderr = entry.stderr_tail.trim();
+        if !stdout.is_empty() {
+            return Some(format!(
+                "The most recent command output was:\n```text\n{}\n```",
+                truncate_string(stdout, 1200)
+            ));
+        }
+        if !stderr.is_empty() {
+            return Some(format!(
+                "The most recent command wrote this to stderr:\n```text\n{}\n```",
+                truncate_string(stderr, 1200)
+            ));
+        }
+        return Some(format!(
+            "The most recent command `{command}` completed without captured output."
+        ));
+    }
+    if lower.contains("exit") || lower.contains("status") {
+        return Some(format!(
+            "The most recent command `{command}` exited with status {}.",
+            entry.exit_code
+        ));
+    }
+    Some(format!(
+        "The most recent command I saw in this shell was `{command}`."
+    ))
 }
 
 fn direct_answer_fast_path_allowed(
@@ -7541,7 +8043,6 @@ fn direct_answer_fast_path_allowed(
         classification,
         tasks::TaskClassification::WebCurrentInfoQuestion
             | tasks::TaskClassification::DiagnosticDebugging
-            | tasks::TaskClassification::ReferentialFollowup
     ) {
         return false;
     }
@@ -7571,12 +8072,15 @@ fn direct_answer_fast_path_allowed(
         "homebrew",
         "do i have",
         "installed",
-        "my current",
         "current git branch",
-        "where am i",
-        "what directory",
+        "desktop",
+        "downloads",
+        "documents",
         "how many",
         "how much storage",
+        "oldest file",
+        "newest file",
+        "most recent file",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -7599,18 +8103,47 @@ fn direct_answer_stream_has_complete_candidate(text: &str, prompt: &str) -> bool
         .filter(|ch| matches!(ch, '.' | '!' | '?'))
         .count();
     sentence_count >= 2
-        || (answer.chars().count() >= 90
-            && answer
-                .trim_end()
-                .ends_with(|ch: char| matches!(ch, '.' | '!' | '?')))
+        || (answer.chars().count() >= 90 && answer.trim_end().ends_with(['.', '!', '?']))
 }
 
 fn sanitize_direct_answer_text(text: &str) -> String {
-    text.replace('\u{200b}', "")
-        .replace('\u{200c}', "")
-        .replace('\u{feff}', "")
+    sanitize_model_display_text(text)
+}
+
+fn sanitize_model_display_text(text: &str) -> String {
+    let stripped = strip_terminal_control_sequences(text);
+    let cleaned = stripped
+        .replace(['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'], "")
         .trim()
-        .to_string()
+        .to_string();
+    if cleaned.eq_ignore_ascii_case("[multimodal]") {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_terminal_control_sequences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_control() && !matches!(ch, '\n' | '\t') {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn direct_answer_has_balanced_backticks(answer: &str) -> bool {
@@ -7626,6 +8159,116 @@ fn direct_answer_looks_like_tool_call(answer: &str) -> bool {
         || lower.contains("web_search{")
         || lower.contains("<|tool_call|>")
         || lower.contains("call:execute_shell_command")
+}
+
+fn direct_answer_needs_tool_or_observation(answer: &str, prompt: &str) -> bool {
+    let answer = sanitize_direct_answer_text(answer);
+    if answer.is_empty() {
+        return true;
+    }
+    if direct_answer_looks_like_tool_call(&answer) {
+        return true;
+    }
+    let answer_lower = answer.to_ascii_lowercase();
+    if [
+        "i should use",
+        "i will use",
+        "i should run",
+        "i will run",
+        "i need to run",
+        "i would run",
+        "should use `",
+        "will use `",
+        "run this as a read-only",
+        "previous attempt",
+        "validation_failed",
+    ]
+    .iter()
+    .any(|needle| answer_lower.contains(needle))
+    {
+        return true;
+    }
+
+    let prompt_lower = prompt.to_ascii_lowercase();
+    if (prompt_lower.contains("how many") || prompt_lower.contains("count"))
+        && prompt_lower.contains("file")
+        && !answer.chars().any(|ch| ch.is_ascii_digit())
+        && ![
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ]
+        .iter()
+        .any(|word| answer_lower.contains(word))
+    {
+        return true;
+    }
+    if (prompt_lower.contains("storage")
+        || prompt_lower.contains("disk usage")
+        || prompt_lower.contains("how much"))
+        && (prompt_lower.contains("document")
+            || prompt_lower.contains("download")
+            || prompt_lower.contains("desktop")
+            || prompt_lower.contains("folder")
+            || prompt_lower.contains("directory"))
+        && !answer.chars().any(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+    if (prompt_lower.contains("oldest")
+        || prompt_lower.contains("newest")
+        || prompt_lower.contains("most recent"))
+        && prompt_lower.contains("file")
+        && !answer.contains('/')
+        && !answer.contains('.')
+    {
+        return true;
+    }
+    false
+}
+
+fn prompt_requires_readonly_local_fact(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    if [
+        "latest",
+        "current release",
+        "current version",
+        "online",
+        "internet",
+        "web",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    ((lower.contains("how many") || lower.contains("count")) && lower.contains("file"))
+        || (lower.contains("how much")
+            && (lower.contains("storage")
+                || lower.contains("space")
+                || lower.contains("disk")
+                || lower.contains("used")))
+        || lower.contains("disk usage")
+        || lower.contains("storage is being used")
+        || ((lower.contains("oldest") || lower.contains("newest") || lower.contains("most recent"))
+            && lower.contains("file"))
+        || lower.contains("what directory")
+        || lower.contains("which directory")
+        || lower.contains("where am i")
+        || lower.contains("current directory")
+        || lower.trim() == "pwd"
+        || (lower.contains("current") && lower.contains("git") && lower.contains("branch"))
+        || (lower.contains("installed") && lower.contains("version"))
+}
+
+fn prompt_requires_project_metadata_fact(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    (lower.contains("npm")
+        || lower.contains("package.json")
+        || lower.contains("package script")
+        || lower.contains("project"))
+        && (lower.contains("test")
+            || lower.contains("build")
+            || lower.contains("script")
+            || lower.contains("run"))
 }
 
 fn direct_answer_covers_prompt(answer: &str, prompt: &str) -> bool {
@@ -7653,16 +8296,16 @@ fn direct_answer_covers_prompt(answer: &str, prompt: &str) -> bool {
 fn readonly_tool_continuation_prompt(web_available: bool, can_execute: bool) -> &'static str {
     match (web_available, can_execute) {
         (true, true) => {
-            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, read-only local tools, or web_search/web_read if another observation is needed. If the evidence is sufficient and the user wants execution, emit exactly one execute_shell_command tool call for approval. If the user asked a question, answer concisely instead. Ask one focused clarification question only if no grounded command or answer is possible."
+            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, read-only local tools, or web_search/web_read if another observation is needed. If a prior observation says validation_failed, call a corrected read-only probe instead of describing what you would run. If the evidence is sufficient and the user wants execution, emit exactly one execute_shell_command tool call for approval. If the user asked a question, answer concisely instead. Ask one focused clarification question only if no grounded command or answer is possible."
         }
         (false, true) => {
-            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, or read-only local tools if another observation is needed. If the evidence is sufficient and the user wants execution, emit exactly one execute_shell_command tool call for approval. If the user asked a question, answer concisely instead. Ask one focused clarification question only if no grounded command or answer is possible."
+            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, or read-only local tools if another observation is needed. If a prior observation says validation_failed, call a corrected read-only probe instead of describing what you would run. If the evidence is sufficient and the user wants execution, emit exactly one execute_shell_command tool call for approval. If the user asked a question, answer concisely instead. Ask one focused clarification question only if no grounded command or answer is possible."
         }
         (true, false) => {
-            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, read-only local tools, or web_search/web_read if another observation is needed. If the evidence is sufficient, answer the user directly in concise prose. Do not emit execute_shell_command. Ask one focused clarification question only if no grounded answer is possible."
+            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, read-only local tools, or web_search/web_read if another observation is needed. If a prior observation says validation_failed, call a corrected read-only probe instead of describing what you would run. If the evidence is sufficient, answer the user directly in concise prose. Do not emit execute_shell_command. Ask one focused clarification question only if no grounded answer is possible."
         }
         (false, false) => {
-            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, or read-only local tools if another observation is needed. If the evidence is sufficient, answer the user directly in concise prose. Do not emit execute_shell_command. Ask one focused clarification question only if no grounded answer is possible."
+            "Use the tool observations above. Re-evaluate what is still missing. You may call retrieve_command_docs, lookup_command_docs, or read-only local tools if another observation is needed. If a prior observation says validation_failed, call a corrected read-only probe instead of describing what you would run. If the evidence is sufficient, answer the user directly in concise prose. Do not emit execute_shell_command. Ask one focused clarification question only if no grounded answer is possible."
         }
     }
 }
@@ -7677,32 +8320,101 @@ async fn try_local_action_fallback(
         return Ok(None);
     }
     let allowed_names = local_action_allowed_names(tools, &payload.prompt);
-    let action_list = local_action_list(&allowed_names);
     let filesystem_context = termlm_config::read_filesystem_context_snapshot()
         .map(|text| compact_filesystem_context_for_local_action(&text, &payload.prompt))
         .unwrap_or_else(|| "filesystem_context_unavailable: true".to_string());
     let tool_observations = recent_tool_observations_for_local_action(messages, 900);
-    let fallback_messages = vec![
-        ChatMessage::system(
-            "You are termlm's local action planner. Output exactly one action line and no prose.",
-        ),
-        ChatMessage::user(format!(
-            "Allowed actions:\n{action_list}\n\nRules: output one action line only. For ordinary shell tasks choose EXECUTE. Prefer the simplest exact zsh command; add find, grep, awk, sed, xargs, pipelines, or && only when filtering, recursion, counting, copying, opening, transformation, or dependent multi-step behavior is requested. A request to search in, under, or recursively through this/current directory is a local shell task; choose EXECUTE with grep, rg, or find, not web search. No prose, comments, sample output, guessed results, shell errors, or blank actions. Use . for the current directory and $HOME/Desktop, $HOME/Documents, and $HOME/Downloads for standard home folders. Use RETRIEVE/LOOKUP/READONLY/WEB_SEARCH only when needed; ASK only when ambiguous."
-        )),
-        ChatMessage::user(format!(
-            "Command idioms for common terminal requests:\n{}\n\nUser prompt: {}\nCurrent working directory: {}\nShell: {:?}\n\nFilesystem context:\n{}\n\nTool observations:\n{}\n\nAction:",
-            local_action_command_idioms(&payload.prompt),
-            payload.prompt.trim(),
-            payload.cwd,
-            payload.shell_kind,
-            filesystem_context,
-            tool_observations
-        )),
-    ];
+    let mut retrieved_chunks_for_planner = Vec::<RetrievedChunk>::new();
+    let retrieved_docs = if allowed_names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "execute_shell_command"
+                | "retrieve_command_docs"
+                | "lookup_command_docs"
+                | "run_readonly_command"
+        )
+    }) {
+        let chunks = retrieve_chunks_for_prompt(state, &payload.prompt, Some(5)).await;
+        maybe_write_retrieval_trace(
+            state,
+            Some(payload.task_id),
+            &payload.prompt,
+            Some(5),
+            &chunks,
+        )
+        .await;
+        append_source_refs(state, retrieved_chunk_source_refs(&chunks)).await;
+        let block = format_compact_retrieved_docs_block(&chunks);
+        retrieved_chunks_for_planner = chunks;
+        if block.trim().is_empty() {
+            "No local command docs were retrieved for this prompt.".to_string()
+        } else {
+            context::trim_to_tokens(&block, 500)
+        }
+    } else {
+        "Command-doc retrieval was not exposed for this prompt.".to_string()
+    };
+    let direct_command_mode = allowed_names
+        .iter()
+        .any(|name| name == "execute_shell_command")
+        && prompt_has_sufficient_local_action_details(&payload.prompt)
+        && prompt_prefers_execute_action(&payload.prompt);
+    let direct_readonly_mode = !direct_command_mode
+        && allowed_names
+            .iter()
+            .any(|name| name == "run_readonly_command")
+        && prompt_requires_readonly_local_fact(&payload.prompt);
+    let fallback_messages = if direct_command_mode {
+        vec![
+            ChatMessage::system(
+                "You are termlm's command-line fallback planner. Return exactly one zsh command line and no prose, no markdown, no commentary, and no tool-call syntax.",
+            ),
+            ChatMessage::user(format!(
+                "Choose the single zsh command that should satisfy the user's request. If the request says current directory, use `.`. Prefer the simplest command that exactly matches the requested effects; use pipelines, recursion, xargs, or && only when the prompt requires them.\n\nUser prompt: {}\nCurrent working directory: {}\nFilesystem context:\n{}\nRetrieved command docs:\n{}\nTool observations:\n{}\n\nOne zsh command:",
+                payload.prompt.trim(),
+                payload.cwd,
+                filesystem_context,
+                retrieved_docs,
+                tool_observations
+            )),
+        ]
+    } else if direct_readonly_mode {
+        vec![
+            ChatMessage::system(
+                "You are termlm's read-only command planner. Return exactly one safe read-only zsh command line and no prose, no markdown, no commentary, and no tool-call syntax.",
+            ),
+            ChatMessage::user(format!(
+                "Choose the single read-only zsh command whose stdout should answer the user's question. Prefer common shell commands you already know. Use the current working directory for relative paths. For standard home folders, use the absolute paths shown in Filesystem context; do not use ~ or $HOME because read-only probes do not expand shell variables. Prefer the simplest exact command that computes the requested fact. Return a complete command with the target path, predicates, and pipeline needed for the fact; a program name alone is invalid. For file counts, stdout should be a count. For oldest/newest file questions, use the retrieved find/stat/sort pattern when available so stdout is the matching path.\n\nUser prompt: {}\nCurrent working directory: {}\nFilesystem context:\n{}\nRetrieved command docs:\n{}\nTool observations:\n{}\n\nOne read-only zsh command:",
+                payload.prompt.trim(),
+                payload.cwd,
+                filesystem_context,
+                retrieved_docs,
+                tool_observations
+            )),
+        ]
+    } else {
+        let action_formats = local_action_list(&allowed_names);
+        vec![
+            ChatMessage::system(
+                "You are termlm's local action planner. Return exactly one ASCII action line and no prose.",
+            ),
+            ChatMessage::user(format!(
+                "Choose the next action for the user's terminal request.\n\nAvailable action line formats:\n{action_formats}\n\nPlanning rules:\n- Think silently about every requested effect, then output one complete action line.\n- Use execute when the user asks the shell to list, find, create, copy, move, open, transform, or inspect something and the command is grounded enough for approval.\n- Use retrieve or lookup when command docs are needed before choosing flags.\n- Use readonly for safe factual probes that answer a question without user approval.\n- Use web_search or web_read only for current or external information or missing external docs.\n- Do not ask for clarification when the action and target are already present.\n- Every action line must include a value after the action verb; never output only `execute`, `retrieve`, `lookup`, `readonly`, `web_search`, `web_read`, or `ask`.\n- A bare action word is invalid. If the next action is read-only probing, output `readonly: <complete safe command>` on one line and choose the command yourself.\n- Prefer the simplest exact zsh command; only add pipelines, recursion, xargs, or && when the request requires them.\n- Use common shell commands you already know when docs are unnecessary; for local observable facts, prefer a read-only probe over command-doc retrieval.\n- Compound requests must include every required step in order.\n- Use . for the current directory and $HOME/Desktop, $HOME/Documents, and $HOME/Downloads for standard home folders.\n- Let retrieved command docs and tool observations guide flags and command composition.\n\nUser prompt: {}\nCurrent working directory: {}\nShell: {:?}\nFilesystem context:\n{}\nRetrieved command docs:\n{}\nTool observations:\n{}\n\nOne action line:",
+                payload.prompt.trim(),
+                payload.cwd,
+                payload.shell_kind,
+                filesystem_context,
+                retrieved_docs,
+                tool_observations
+            )),
+        ]
+    };
 
     let mut options = provider_request_options(state.config_snapshot().as_ref());
     let prompt_lower = payload.prompt.to_ascii_lowercase();
-    let action_token_budget = if prompt_lower.contains("image")
+    let action_token_budget = if (prompt_lower.contains("image")
+        || prompt_lower.contains("markdown")
+        || prompt_lower.contains(".md"))
         && (prompt_lower.contains("copy") || prompt_lower.contains("move"))
     {
         160
@@ -7730,10 +8442,43 @@ async fn try_local_action_fallback(
         "num_predict".to_string(),
         serde_json::json!(action_token_budget),
     );
-    options.insert(
-        "stop_sequences".to_string(),
-        serde_json::json!(["\n", "#", "```", "<|turn>", "zsh:", "command not found"]),
-    );
+    let stop_sequences = if direct_command_mode || direct_readonly_mode {
+        serde_json::json!(["\n\n", "<|turn>", "User:", "Question:"])
+    } else {
+        serde_json::json!(["# ", "```", "<|turn>", "zsh:", "command not found"])
+    };
+    options.insert("stop_sequences".to_string(), stop_sequences);
+    options.insert("ascii_only".to_string(), serde_json::json!(true));
+    options.insert("temperature".to_string(), serde_json::json!(0.0));
+    options.insert("top_k".to_string(), serde_json::json!(0));
+    options.insert("top_p".to_string(), serde_json::json!(0.0));
+    options.insert("seed".to_string(), serde_json::json!(195936478));
+    if direct_command_mode {
+        let command_prefixes = local_action_command_prefixes(&retrieved_chunks_for_planner);
+        if !command_prefixes.is_empty() {
+            options.insert(
+                "first_token_prefixes".to_string(),
+                serde_json::json!(command_prefixes),
+            );
+        }
+    } else if direct_readonly_mode {
+        let prefixes = readonly_command_prefixes_for_prompt(&payload.prompt);
+        if !prefixes.is_empty() {
+            options.insert(
+                "first_token_prefixes".to_string(),
+                serde_json::json!(prefixes),
+            );
+        }
+    } else {
+        let first_token_prefixes = local_action_first_token_prefixes(&allowed_names);
+        if !first_token_prefixes.is_empty() {
+            options.insert(
+                "first_token_prefixes".to_string(),
+                serde_json::json!(first_token_prefixes),
+            );
+        }
+    }
+    options.insert("suppress_eog".to_string(), serde_json::json!(true));
     let request = ChatRequest {
         task_id: Some(payload.task_id.to_string()),
         model: active_model_name(state.config_snapshot().as_ref()),
@@ -7801,10 +8546,72 @@ async fn try_local_action_fallback(
         }
     }
 
-    if let Some(call) = parse_local_action_tool_call(&text, &allowed_names) {
+    if direct_readonly_mode
+        && let Some(call) = read_only_command_tool_call_from_plain_text(&text, payload)
+    {
+        tool_calls.push(call);
+    }
+    if direct_readonly_mode {
+        let has_usable_readonly = tool_calls
+            .iter()
+            .any(|call| readonly_tool_call_is_usable(call, payload.prompt.trim()));
+        if !has_usable_readonly {
+            let materialized = materialize_retrieved_readonly_command_from_prompt(
+                &retrieved_chunks_for_planner,
+                payload,
+            )
+            .or_else(|| materialize_readonly_command_from_prompt(payload));
+            if let Some(call) = materialized {
+                tool_calls.retain(|call| call.name != "run_readonly_command");
+                tool_calls.push(call);
+            }
+        }
+    }
+
+    if let Some(call) = materialize_retrieved_command_from_bare_model_output(
+        &text,
+        &retrieved_chunks_for_planner,
+        payload,
+    ) {
+        if local_action_tool_call_is_usable(&call, payload.prompt.trim()) {
+            tool_calls.push(call);
+        } else {
+            debug!(
+                prompt = %payload.prompt,
+                raw = %text,
+                call = ?call,
+                "retrieval-backed command materializer produced an unusable action"
+            );
+        }
+    }
+    if tool_calls.is_empty()
+        && let Some(call) =
+            materialize_retrieved_command_from_prompt(&retrieved_chunks_for_planner, payload)
+    {
+        if local_action_tool_call_is_usable(&call, payload.prompt.trim()) {
+            tool_calls.push(call);
+        } else {
+            debug!(
+                prompt = %payload.prompt,
+                call = ?call,
+                "retrieval-backed command materializer produced an unusable action from prompt"
+            );
+        }
+    }
+
+    if tool_calls.is_empty()
+        && let Some(call) = parse_local_action_tool_call(&text, &allowed_names)
+    {
         let call = sanitize_local_action_tool_call(call, payload.prompt.trim());
         if local_action_tool_call_is_usable(&call, payload.prompt.trim()) {
             tool_calls.push(call);
+        } else {
+            debug!(
+                prompt = %payload.prompt,
+                raw = %text,
+                call = ?call,
+                "local action fallback produced an unusable action"
+            );
         }
     }
     if tool_calls.is_empty()
@@ -7830,7 +8637,14 @@ async fn try_local_action_fallback(
     let call = tool_calls
         .into_iter()
         .find(|call| allowed_names.iter().any(|name| name == &call.name));
-    let call = call;
+    if call.is_none() {
+        debug!(
+            prompt = %payload.prompt,
+            raw = %text,
+            allowed = ?allowed_names,
+            "local action fallback produced no usable tool call"
+        );
+    }
     Ok(call.map(|call| (call, text, usage)))
 }
 
@@ -7840,20 +8654,70 @@ fn local_action_tool_call_is_usable(call: &ToolCall, prompt: &str) -> bool {
     }
     call.arguments
         .get("cmd")
+        .or_else(|| call.arguments.get("command"))
         .and_then(|v| v.as_str())
         .map(|cmd| local_execute_action_looks_complete(cmd, prompt))
         .unwrap_or(false)
+}
+
+fn readonly_tool_call_is_usable(call: &ToolCall, prompt: &str) -> bool {
+    if call.name != "run_readonly_command" {
+        return false;
+    }
+    call.arguments
+        .get("cmd")
+        .or_else(|| call.arguments.get("command"))
+        .and_then(|v| v.as_str())
+        .map(|cmd| {
+            readonly_command_candidate_is_complete(cmd, prompt)
+                && planning::validate_prompt_effects(cmd, prompt).is_empty()
+        })
+        .unwrap_or(false)
+}
+
+fn tool_call_has_minimum_arguments(call: &ToolCall) -> bool {
+    let nonempty = |name: &str| {
+        call.arguments
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    match call.name.as_str() {
+        "retrieve_command_docs" => nonempty("query"),
+        "lookup_command_docs" => nonempty("name"),
+        "run_readonly_command" => nonempty("cmd") || nonempty("command"),
+        "web_search" => nonempty("query"),
+        "web_read" => nonempty("url"),
+        "ask_clarification" => nonempty("question"),
+        "read_file" => nonempty("path"),
+        "search_files" => nonempty("query"),
+        "search_terminal_context" => nonempty("query"),
+        "list_workspace_files" | "project_metadata" | "git_context" => true,
+        _ => true,
+    }
 }
 
 fn sanitize_local_action_tool_call(mut call: ToolCall, prompt: &str) -> ToolCall {
     if call.name != "execute_shell_command" {
         return call;
     }
-    let Some(raw_cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) else {
+    let Some(raw_cmd) = call
+        .arguments
+        .get("cmd")
+        .or_else(|| call.arguments.get("command"))
+        .and_then(|v| v.as_str())
+    else {
         return call;
     };
     let cmd = sanitize_local_execute_command(raw_cmd, prompt);
     call.arguments["cmd"] = serde_json::Value::String(cmd.clone());
+    if call.arguments.get("command").is_some() {
+        call.arguments
+            .as_object_mut()
+            .map(|args| args.remove("command"));
+    }
     call.arguments["commands_used"] = serde_json::json!(extract_command_names(&cmd, 8));
     call
 }
@@ -7879,12 +8743,6 @@ fn sanitize_local_execute_command(command: &str, prompt: &str) -> String {
     cmd = strip_unbalanced_trailing_quote(&cmd);
     cmd = normalize_first_command_token_artifact(&cmd);
     cmd = normalize_standard_home_dir_artifacts(&cmd, prompt);
-    cmd = normalize_current_git_branch_artifact(&cmd, prompt);
-    cmd = normalize_lsof_port_artifact(&cmd, prompt);
-    cmd = normalize_ip_address_artifact(&cmd, prompt);
-    cmd = simplify_plain_ls_options(&cmd, prompt);
-    cmd = simplify_plain_find_listing(&cmd, prompt);
-    cmd = simplify_unneeded_ls_pipeline(&cmd, prompt);
     cmd = collapse_repeated_grep_v_slash(&cmd);
     cmd = strip_trailing_incomplete_grep(&cmd);
     cmd = strip_trailing_incomplete_sed(&cmd);
@@ -7892,24 +8750,12 @@ fn sanitize_local_execute_command(command: &str, prompt: &str) -> String {
     cmd = strip_repeated_echo_head_artifact(&cmd);
     cmd = truncate_repeated_file_selection_artifact(&cmd, prompt);
     cmd = truncate_open_command_tail_artifact(&cmd, prompt);
-    cmd = normalize_sort_by_size_listing_artifact(&cmd, prompt);
-    cmd = normalize_newest_files_count_artifact(&cmd, prompt);
-    cmd = normalize_markdown_phrase_search_artifact(&cmd, prompt);
-    cmd = normalize_du_top_level_artifact(&cmd, prompt);
-    cmd = normalize_replace_spaces_loop_artifact(&cmd, prompt);
     cmd = normalize_xargs_placeholder_binding(&cmd);
-    cmd = normalize_desktop_image_copy_artifact(&cmd, prompt);
-    cmd = normalize_desktop_image_find_artifact(&cmd, prompt);
-    cmd = normalize_markdown_open_artifact(&cmd, prompt);
     cmd = strip_grep_dot_filter_artifact(&cmd);
     cmd = normalize_grep_pattern_tail_artifacts(&cmd);
-    cmd = normalize_grep_find_predicate_artifacts(&cmd, prompt);
-    cmd = normalize_grep_directory_content_artifacts(&cmd, prompt);
-    cmd = normalize_recursive_search_missing_path(&cmd, prompt);
     cmd = normalize_unspecified_current_dir_path_args(&cmd, prompt);
     cmd = normalize_find_print_artifacts(&cmd);
     cmd = normalize_pipeline_wc_artifacts(&cmd, prompt);
-    cmd = normalize_count_files_artifact(&cmd, prompt);
     cmd = normalize_no_arg_program_artifacts(&cmd);
     cmd = normalize_mkdir_path_artifacts(&cmd, prompt);
 
@@ -7921,15 +8767,14 @@ fn sanitize_local_execute_command(command: &str, prompt: &str) -> String {
         return cmd;
     };
 
-    if program == "ls" {
-        if let Some(dot_idx) = tokens
+    if program == "ls"
+        && let Some(dot_idx) = tokens
             .iter()
             .position(|token| matches!(token.as_str(), "." | "./" | "./."))
-        {
-            tokens[dot_idx] = ".".to_string();
-            tokens.truncate(dot_idx + 1);
-            return tokens.join(" ");
-        }
+    {
+        tokens[dot_idx] = ".".to_string();
+        tokens.truncate(dot_idx + 1);
+        return tokens.join(" ");
     }
 
     if matches!(program, "tail" | "head" | "cat" | "less" | "more" | "wc") {
@@ -8011,220 +8856,6 @@ fn looks_like_zsh_glob_qualifier_artifact(token: &str) -> bool {
         || token.ends_with("(.)")
 }
 
-fn normalize_grep_find_predicate_artifacts(command: &str, prompt: &str) -> String {
-    let tokens = command
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let Some(program) = tokens.first().map(String::as_str) else {
-        return command.to_string();
-    };
-    if !matches!(program, "grep" | "rg") {
-        return command.to_string();
-    }
-    if !tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "-type"
-                | "-name"
-                | "-size"
-                | "-maxdepth"
-                | "-mindepth"
-                | "-mtime"
-                | "-mmin"
-                | "-empty"
-                | "-print"
-        )
-    }) {
-        return command.to_string();
-    }
-
-    let mut cleaned = Vec::with_capacity(tokens.len());
-    let mut changed = false;
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let token = tokens[i].as_str();
-        if matches!(
-            token,
-            "-type" | "-name" | "-size" | "-maxdepth" | "-mindepth" | "-mtime" | "-mmin"
-        ) {
-            i = (i + 2).min(tokens.len());
-            changed = true;
-            continue;
-        }
-        if matches!(token, "-empty" | "-print") {
-            i += 1;
-            changed = true;
-            continue;
-        }
-        cleaned.push(tokens[i].clone());
-        i += 1;
-    }
-
-    if !changed {
-        return command.to_string();
-    }
-
-    let mut seen_dot_arg = false;
-    cleaned.retain(|token| {
-        if matches!(token.as_str(), "." | "./") {
-            if seen_dot_arg {
-                return false;
-            }
-            seen_dot_arg = true;
-        }
-        true
-    });
-
-    if program == "grep"
-        && grep_tokens_have_flag(&cleaned, 'l', "--files-with-matches")
-        && !grep_tokens_have_flag(&cleaned, 'R', "--recursive")
-        && (seen_dot_arg || prompt_mentions_recursive_content_search(prompt))
-    {
-        ensure_short_flag_in_tokens(&mut cleaned, 'R');
-    }
-
-    cleaned.join(" ")
-}
-
-fn normalize_grep_directory_content_artifacts(command: &str, prompt: &str) -> String {
-    let mut tokens = command
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if !matches!(tokens.first().map(String::as_str), Some("grep")) {
-        return command.to_string();
-    }
-    if !prompt_mentions_recursive_content_search(prompt)
-        && !grep_tokens_have_flag(&tokens, 'l', "--files-with-matches")
-    {
-        return command.to_string();
-    }
-
-    let mut changed = false;
-    let mut seen_dot_arg = false;
-    tokens.retain(|token| {
-        if matches!(token.as_str(), "." | "./") {
-            if seen_dot_arg {
-                changed = true;
-                return false;
-            }
-            seen_dot_arg = true;
-        }
-        true
-    });
-
-    if seen_dot_arg
-        && grep_tokens_have_flag(&tokens, 'l', "--files-with-matches")
-        && !grep_tokens_have_flag(&tokens, 'R', "--recursive")
-    {
-        ensure_short_flag_in_tokens(&mut tokens, 'R');
-        changed = true;
-    }
-
-    if changed {
-        tokens.join(" ")
-    } else {
-        command.to_string()
-    }
-}
-
-fn simplify_plain_ls_options(command: &str, prompt: &str) -> String {
-    if !prompt_requests_plain_listing(prompt) {
-        return command.to_string();
-    }
-    let mut tokens = command
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if !matches!(tokens.first().map(String::as_str), Some("ls")) {
-        return command.to_string();
-    }
-
-    let mut changed = false;
-    for token in tokens.iter_mut().skip(1) {
-        if token == "--" {
-            break;
-        }
-        if !token.starts_with('-') || token == "-" {
-            continue;
-        }
-        if token.starts_with("--") {
-            if matches!(
-                token.as_str(),
-                "--sort" | "--time" | "--reverse" | "--width" | "--color"
-            ) || token.starts_with("--sort=")
-                || token.starts_with("--time=")
-                || token.starts_with("--color=")
-            {
-                token.clear();
-                changed = true;
-            }
-            continue;
-        }
-        let keep = token
-            .chars()
-            .skip(1)
-            .filter(|flag| !matches!(flag, 't' | 'S' | 'U' | 'r'))
-            .collect::<String>();
-        let next = if keep.is_empty() {
-            String::new()
-        } else {
-            format!("-{keep}")
-        };
-        if next != *token {
-            *token = next;
-            changed = true;
-        }
-    }
-
-    if changed {
-        tokens.retain(|token| !token.is_empty());
-        tokens.join(" ")
-    } else {
-        command.to_string()
-    }
-}
-
-fn simplify_unneeded_ls_pipeline(command: &str, prompt: &str) -> String {
-    if !prompt_requests_plain_listing(prompt) || !command.contains('|') {
-        return command.to_string();
-    }
-    let first_segment = command.split('|').next().unwrap_or(command).trim();
-    let first_program = first_segment.split_whitespace().next().unwrap_or_default();
-    if first_program != "ls" {
-        return command.to_string();
-    }
-    if command.split('|').skip(1).any(|segment| {
-        let program = segment.trim().split_whitespace().next().unwrap_or_default();
-        matches!(program, "grep" | "awk" | "sed" | "xargs")
-    }) {
-        first_segment.to_string()
-    } else {
-        command.to_string()
-    }
-}
-
-fn simplify_plain_find_listing(command: &str, prompt: &str) -> String {
-    if !prompt_requests_plain_listing(prompt) {
-        return command.to_string();
-    }
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
-    if tokens.first() != Some(&"find") {
-        return command.to_string();
-    }
-    if !command.contains("-maxdepth 1") || !command.contains("-type f") {
-        return command.to_string();
-    }
-    let Some(path) = tokens.get(1) else {
-        return command.to_string();
-    };
-    if !command_token_looks_like_path(path) {
-        return command.to_string();
-    }
-    format!("ls -A {path}")
-}
-
 fn prompt_requests_plain_listing(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
     if !(lower.contains("list") || lower.contains("show")) {
@@ -8239,9 +8870,16 @@ fn prompt_requests_plain_listing(prompt: &str) -> bool {
     }
     ![
         "not directories",
+        "not files",
         "no directories",
+        "no files",
         "exclude directories",
+        "exclude files",
         "without directories",
+        "without files",
+        "only directories",
+        "directories only",
+        "directory only",
         "files only",
         "only files",
         "recursive",
@@ -8259,6 +8897,8 @@ fn prompt_requests_plain_listing(prompt: &str) -> bool {
         "open",
         "copy",
         "move",
+        "largest",
+        "biggest",
         "larger",
         "smaller",
         "modified",
@@ -8268,44 +8908,6 @@ fn prompt_requests_plain_listing(prompt: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
-}
-
-fn prompt_mentions_recursive_content_search(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    (lower.contains("under here")
-        || lower.contains("in this directory")
-        || lower.contains("recursive"))
-        && (lower.contains("content") || lower.contains("contain") || lower.contains("match"))
-}
-
-fn grep_tokens_have_flag(tokens: &[String], short: char, long: &str) -> bool {
-    for token in tokens.iter().skip(1) {
-        if token == "--" {
-            break;
-        }
-        if token == long {
-            return true;
-        }
-        if token.starts_with('-') && !token.starts_with("--") && token[1..].contains(short) {
-            return true;
-        }
-    }
-    false
-}
-
-fn ensure_short_flag_in_tokens(tokens: &mut Vec<String>, flag: char) {
-    for token in tokens.iter_mut().skip(1) {
-        if token == "--" {
-            break;
-        }
-        if token.starts_with('-') && !token.starts_with("--") && token.len() > 1 {
-            if !token[1..].contains(flag) {
-                token.push(flag);
-            }
-            return;
-        }
-    }
-    tokens.insert(1, format!("-{flag}"));
 }
 
 fn collapse_repeated_grep_v_slash(command: &str) -> String {
@@ -8373,13 +8975,13 @@ fn truncate_repeated_file_selection_artifact(command: &str, prompt: &str) -> Str
     };
     let end = pos + marker.len();
     let after = command[end..].trim_start();
-    if !after.is_empty()
+    if (!after.is_empty()
         && !lower.contains("open")
         && !lower.contains("code")
-        && !lower.contains("vs code")
-    {
-        command[..end].trim_end().to_string()
-    } else if after.starts_with('.') || after.starts_with("-maxdepth") || after.contains("stat -f")
+        && !lower.contains("vs code"))
+        || after.starts_with('.')
+        || after.starts_with("-maxdepth")
+        || after.contains("stat -f")
     {
         command[..end].trim_end().to_string()
     } else {
@@ -8408,134 +9010,6 @@ fn truncate_open_command_tail_artifact(command: &str, prompt: &str) -> String {
     command.to_string()
 }
 
-fn normalize_desktop_image_copy_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("desktop") && lower.contains("image") && lower.contains("copy")) {
-        return command.to_string();
-    }
-    if !command.contains("$HOME/Desktop")
-        || !command.contains("find")
-        || !command.contains("cp")
-        || !(command.contains("-print0") || command.contains("xargs -0"))
-    {
-        return command.to_string();
-    }
-    canonical_desktop_image_copy_command(prompt)
-}
-
-fn canonical_desktop_image_copy_command(prompt: &str) -> String {
-    let target = requested_desktop_image_target_path(prompt);
-    format!(
-        "mkdir -p {target} && find -E $HOME/Desktop -path {target} -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{{}} cp -p {{}} {target}/"
-    )
-}
-
-fn requested_desktop_image_target_path(prompt: &str) -> String {
-    let folder = requested_desktop_folder_name(prompt).unwrap_or_else(|| "images".to_string());
-    if folder
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    {
-        format!("$HOME/Desktop/{folder}")
-    } else {
-        format!("\"$HOME/Desktop/{}\"", folder.replace('"', ""))
-    }
-}
-
-fn requested_desktop_folder_name(prompt: &str) -> Option<String> {
-    let lower = prompt.to_ascii_lowercase();
-    for marker in [" named ", " called ", " folder "] {
-        let Some(pos) = lower.find(marker) else {
-            continue;
-        };
-        let rest = prompt[pos + marker.len()..].trim_start();
-        let raw = if let Some(stripped) = rest.strip_prefix('"') {
-            stripped.split('"').next().unwrap_or_default()
-        } else if let Some(stripped) = rest.strip_prefix('\'') {
-            stripped.split('\'').next().unwrap_or_default()
-        } else {
-            rest.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';'))
-        };
-        let cleaned = raw
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '-' | '_' | '.' | ' '))
-            .collect::<String>()
-            .trim()
-            .to_string();
-        if !cleaned.is_empty()
-            && !matches!(
-                cleaned.to_ascii_lowercase().as_str(),
-                "on" | "in" | "named" | "called" | "desktop"
-            )
-        {
-            return Some(cleaned);
-        }
-    }
-    None
-}
-
-fn normalize_desktop_image_find_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("desktop") && lower.contains("image"))
-        || lower.contains("copy")
-        || lower.contains("move")
-    {
-        return command.to_string();
-    }
-    if !command.contains("$HOME/Desktop") || !command.contains("-iregex") {
-        return command.to_string();
-    }
-    "find -E $HOME/Desktop -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print"
-        .to_string()
-}
-
-fn normalize_current_git_branch_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("current")
-        && lower.contains("git")
-        && (lower.contains("branch") || lower.contains("branches")))
-    {
-        return command.to_string();
-    }
-    if command.trim() == "git branch" {
-        "git branch --show-current".to_string()
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_lsof_port_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("port") && (lower.contains("process") || lower.contains("using"))) {
-        return command.to_string();
-    }
-    let Some(port) = first_decimal_number(prompt) else {
-        return command.to_string();
-    };
-    let trimmed = command.trim();
-    if trimmed == "lsof -i" || trimmed == "lsof -iTCP" || trimmed == "lsof -nP -i" {
-        format!("lsof -i :{port}")
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_ip_address_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("ip address") || lower == "show my ip") {
-        return command.to_string();
-    }
-    let trimmed = command.trim();
-    if matches!(trimmed, "curl if" | "curl ifconfig" | "curl ifconfig.") {
-        "curl ifconfig.me".to_string()
-    } else {
-        command.to_string()
-    }
-}
-
 fn normalize_xargs_placeholder_binding(command: &str) -> String {
     if !command.contains("{}")
         || command.contains("xargs -0 -I{}")
@@ -8548,243 +9022,12 @@ fn normalize_xargs_placeholder_binding(command: &str) -> String {
         .replace("| xargs cp ", "| xargs -I{} cp ")
 }
 
-fn normalize_sort_by_size_listing_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("sort")
-        && lower.contains("size")
-        && (lower.contains("files") || lower.contains("file")))
-    {
-        return command.to_string();
-    }
-    if command.contains("stat -f '%z %N'")
-        && command.contains("sort -nr")
-        && command.contains("head -n 1")
-    {
-        "find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr".to_string()
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_newest_files_count_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("newest") || lower.contains("most recent")) || !lower.contains("files") {
-        return command.to_string();
-    }
-    let Some(count) = first_decimal_number(prompt) else {
-        return command.to_string();
-    };
-    if command.contains("stat -f '%m %N'") && command.contains("sort -nr") {
-        let mut normalized = if command.contains("head -n 1") {
-            command.replace("head -n 1", &format!("head -n {count}"))
-        } else {
-            command.to_string()
-        };
-        if lower.contains("under")
-            || lower.contains("subdirectories")
-            || lower.contains("recursive")
-        {
-            normalized = normalized.replace(" -maxdepth 1", "");
-        }
-        normalized
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_markdown_phrase_search_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("search")
-        && (lower.contains("markdown") || lower.contains(".md"))
-        && (lower.contains("recursive") || lower.contains("recursively")))
-    {
-        return command.to_string();
-    }
-    let trimmed = command.trim();
-    let Some(pattern) = recursive_search_pattern_from_prompt(prompt) else {
-        return command.to_string();
-    };
-    if trimmed.starts_with("find ")
-        && (command.contains(".md") || command.contains("*.md") || command.contains("-iname"))
-        && !command.contains("grep")
-    {
-        return format!(
-            "find . -type f -iname '*.md' -print0 | xargs -0 grep -n {}",
-            shell_quote_for_command(&pattern)
-        );
-    }
-    if !trimmed.starts_with("grep ") || command.contains(".md") || command.contains("*.md") {
-        return command.to_string();
-    }
-    format!(
-        "find . -type f -iname '*.md' -print0 | xargs -0 grep -n {}",
-        shell_quote_for_command(&pattern)
-    )
-}
-
-fn normalize_du_top_level_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("document")
-        && (lower.contains("disk usage") || lower.contains("storage") || lower.contains("usage"))
-        && (lower.contains("each") || lower.contains("top-level") || lower.contains("top level")))
-    {
-        return command.to_string();
-    }
-    if command.trim() == "du -sh $HOME/Documents"
-        || (command.starts_with("find $HOME/Documents") && command.contains("-exec du"))
-    {
-        "find $HOME/Documents -mindepth 1 -maxdepth 1 -type d -exec du -sh {} +".to_string()
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_replace_spaces_loop_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("replace")
-        && lower.contains("spaces")
-        && lower.contains("underscores")
-        && (lower.contains("filename") || lower.contains("file name")))
-    {
-        return command.to_string();
-    }
-    if command.trim_start().starts_with("for ") && command.contains("mv ") {
-        r#"for f in *\ *(.N); do mv -- "$f" "${f// /_}"; done"#.to_string()
-    } else {
-        command.to_string()
-    }
-}
-
 fn first_decimal_number(text: &str) -> Option<u32> {
     static NUMBER_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = NUMBER_RE.get_or_init(|| regex::Regex::new(r"\b(\d{1,5})\b").expect("number regex"));
     re.captures(text)
         .and_then(|caps| caps.get(1))
         .and_then(|m| m.as_str().parse::<u32>().ok())
-}
-
-fn normalize_count_files_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("how many") || lower.contains("count")) || !lower.contains("file") {
-        return command.to_string();
-    }
-    let trimmed = command.trim();
-    if trimmed.starts_with("find ")
-        && trimmed.contains("-type f")
-        && trimmed.contains("-print")
-        && !trimmed.contains("wc -l")
-    {
-        format!("{trimmed} | wc -l")
-    } else {
-        command.to_string()
-    }
-}
-
-fn normalize_recursive_search_missing_path(command: &str, prompt: &str) -> String {
-    if !prompt_is_local_text_search(prompt) {
-        return command.to_string();
-    }
-    let mut out = command.to_string();
-    let mut tokens = out.split_whitespace().collect::<Vec<_>>();
-    let Some(program) = tokens.first().copied() else {
-        return command.to_string();
-    };
-    if !matches!(program, "grep" | "rg") {
-        return command.to_string();
-    }
-    let has_pattern = tokens
-        .iter()
-        .skip(1)
-        .any(|token| !token.starts_with('-') && !command_token_looks_like_path(token));
-    if !has_pattern && let Some(pattern) = recursive_search_pattern_from_prompt(prompt) {
-        out = format!("{} {}", out.trim_end(), shell_quote_for_command(&pattern));
-        tokens = out.split_whitespace().collect::<Vec<_>>();
-    }
-    if tokens
-        .iter()
-        .skip(1)
-        .any(|token| command_token_looks_like_path(token))
-    {
-        return out;
-    }
-    format!("{} .", out.trim_end())
-}
-
-fn recursive_search_pattern_from_prompt(prompt: &str) -> Option<String> {
-    let lower = prompt.to_ascii_lowercase();
-    let marker = " for ";
-    let start = lower
-        .find(marker)
-        .map(|idx| idx + marker.len())
-        .or_else(|| {
-            lower
-                .strip_prefix("search for ")
-                .map(|_| "search for ".len())
-        })?;
-    let rest = prompt.get(start..)?.trim();
-    let lower_rest = rest.to_ascii_lowercase();
-    let end = [
-        " in this directory",
-        " in markdown files",
-        " in .md files",
-        " in md files",
-        " under here",
-        " recursively",
-        " recursive",
-    ]
-    .iter()
-    .filter_map(|marker| lower_rest.find(marker))
-    .min()
-    .unwrap_or(rest.len());
-    let mut pattern = rest[..end]
-        .trim()
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | ';' | ':'));
-    for prefix in [
-        "the exact phrase ",
-        "exact phrase ",
-        "the phrase ",
-        "phrase ",
-    ] {
-        if pattern.to_ascii_lowercase().starts_with(prefix) {
-            pattern = pattern[prefix.len()..].trim();
-            break;
-        }
-    }
-    if pattern.is_empty() {
-        None
-    } else {
-        Some(pattern.to_string())
-    }
-}
-
-fn shell_quote_for_command(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':'))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn normalize_markdown_open_artifact(command: &str, prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    if !(lower.contains("markdown")
-        && lower.contains("open")
-        && (lower.contains("code") || lower.contains("vs code"))
-        && (lower.contains("recent") || lower.contains("newest") || lower.contains("most recent")))
-    {
-        return command.to_string();
-    }
-    let trimmed = command.trim();
-    if trimmed.starts_with("find $HOME/Desktop")
-        && trimmed.contains("-iname '*.md'")
-        && !trimmed.contains("code")
-    {
-        "find $HOME/Desktop -maxdepth 1 -type f -iname '*.md' -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}".to_string()
-    } else {
-        command.to_string()
-    }
 }
 
 fn strip_unbalanced_trailing_quote(command: &str) -> String {
@@ -8807,9 +9050,7 @@ fn normalize_first_command_token_artifact(command: &str) -> String {
     let Some(first) = tokens.first_mut() else {
         return command.to_string();
     };
-    let stripped = first
-        .trim_end_matches(|c| matches!(c, '.' | ':'))
-        .to_string();
+    let stripped = first.trim_end_matches(['.', ':']).to_string();
     if stripped != *first && is_plain_command_token(&stripped) {
         *first = stripped;
         tokens.join(" ")
@@ -8857,7 +9098,7 @@ fn normalize_standard_home_dir_token(token: &str, home_dir_name: &str) -> String
         .filter(|c| matches!(c, '"' | '\''))
         .unwrap_or('\0');
     let unquoted = token.trim_matches(|c| matches!(c, '"' | '\''));
-    let trimmed = unquoted.trim_end_matches(|c| matches!(c, ',' | ':' | ';'));
+    let trimmed = unquoted.trim_end_matches([',', ':', ';']);
     let Some(normalized) = normalize_standard_home_dir_path(trimmed, home_dir_name) else {
         return token.to_string();
     };
@@ -8971,10 +9212,7 @@ fn normalize_find_print_artifacts(command: &str) -> String {
     if !matches!(tokens.first().map(String::as_str), Some("find")) {
         return command.to_string();
     }
-    if let Some(print_idx) = tokens
-        .iter()
-        .position(|token| token == "-print" || token.starts_with("-print:"))
-    {
+    if let Some(print_idx) = tokens.iter().position(|token| token.starts_with("-print:")) {
         tokens[print_idx] = "-print".to_string();
         tokens.truncate(print_idx + 1);
         return tokens.join(" ");
@@ -9086,36 +9324,135 @@ fn local_action_list(allowed_names: &[String]) -> String {
         .iter()
         .any(|name| name == "execute_shell_command")
     {
-        out.push("EXECUTE: one zsh command");
+        out.push("execute: one zsh command");
     }
     if allowed_names
         .iter()
         .any(|name| name == "retrieve_command_docs")
     {
-        out.push("RETRIEVE: command docs search query");
+        out.push("retrieve: command docs search query");
     }
     if allowed_names
         .iter()
         .any(|name| name == "lookup_command_docs")
     {
-        out.push("LOOKUP: exact command name");
+        out.push("lookup: exact command name");
     }
     if allowed_names
         .iter()
         .any(|name| name == "run_readonly_command")
     {
-        out.push("READONLY: safe read-only command");
+        out.push("readonly: safe read-only command");
     }
     if allowed_names.iter().any(|name| name == "web_search") {
-        out.push("WEB_SEARCH: web search query");
+        out.push("web_search: web search query");
     }
     if allowed_names.iter().any(|name| name == "web_read") {
-        out.push("WEB_READ: url");
+        out.push("web_read: url");
     }
     if allowed_names.iter().any(|name| name == "ask_clarification") {
-        out.push("ASK: one focused question");
+        out.push("ask: one focused question");
     }
     out.join("\n")
+}
+
+fn local_action_first_token_prefixes(allowed_names: &[String]) -> Vec<&'static str> {
+    let mut prefixes = Vec::new();
+    if allowed_names
+        .iter()
+        .any(|name| name == "execute_shell_command")
+    {
+        prefixes.push("execute");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "run_readonly_command")
+    {
+        prefixes.push("readonly");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "retrieve_command_docs")
+    {
+        prefixes.push("retrieve");
+    }
+    if allowed_names
+        .iter()
+        .any(|name| name == "lookup_command_docs")
+    {
+        prefixes.push("lookup");
+    }
+    if allowed_names.iter().any(|name| name == "web_search") {
+        prefixes.push("web_search");
+    }
+    if allowed_names.iter().any(|name| name == "web_read") {
+        prefixes.push("web_read");
+    }
+    if allowed_names.iter().any(|name| name == "ask_clarification") {
+        prefixes.push("ask");
+    }
+    prefixes
+}
+
+fn local_action_command_prefixes(chunks: &[RetrievedChunk]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut prefixes = Vec::new();
+    for chunk in chunks {
+        let name = chunk.command_name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            continue;
+        }
+        let normalized = name.to_ascii_lowercase();
+        if seen.insert(normalized.clone()) {
+            prefixes.push(normalized);
+        }
+        if prefixes.len() >= 6 {
+            break;
+        }
+    }
+    prefixes
+}
+
+fn readonly_command_prefixes_for_prompt(prompt: &str) -> Vec<String> {
+    let lower = prompt.to_ascii_lowercase();
+    let mut prefixes = Vec::new();
+    let mut push = |name: &str| {
+        if !prefixes.iter().any(|existing| existing == name) {
+            prefixes.push(name.to_string());
+        }
+    };
+    if lower.contains("what directory")
+        || lower.contains("which directory")
+        || lower.contains("where am i")
+        || lower.contains("current directory")
+        || lower.trim() == "pwd"
+    {
+        push("pwd");
+    }
+    if (lower.contains("how many") || lower.contains("count")) && lower.contains("file") {
+        push("find");
+    }
+    if lower.contains("storage") || lower.contains("disk usage") || lower.contains("how much") {
+        push("du");
+    }
+    if (lower.contains("oldest") || lower.contains("newest") || lower.contains("most recent"))
+        && lower.contains("file")
+    {
+        push("find");
+    }
+    if lower.contains("git") && lower.contains("branch") {
+        push("git");
+    }
+    if lower.contains("installed") && lower.contains("version") {
+        push("which");
+    }
+    prefixes
 }
 
 fn local_action_allowed_names(tools: &[ToolSchema], prompt: &str) -> Vec<String> {
@@ -9126,7 +9463,97 @@ fn local_action_allowed_names(tools: &[ToolSchema], prompt: &str) -> Vec<String>
     if prompt_is_local_text_search(prompt) {
         names.retain(|name| matches!(name.as_str(), "execute_shell_command" | "ask_clarification"));
     }
+    if prompt_has_sufficient_local_action_details(prompt) {
+        names.retain(|name| name != "ask_clarification");
+        if prompt_prefers_execute_action(prompt) {
+            names.retain(|name| {
+                matches!(
+                    name.as_str(),
+                    "execute_shell_command"
+                        | "retrieve_command_docs"
+                        | "lookup_command_docs"
+                        | "web_search"
+                        | "web_read"
+                )
+            });
+        }
+    }
     names
+}
+
+fn prompt_prefers_execute_action(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let action_signal = [
+        "list", "show", "find", "search", "grep", "create", "make", "copy", "move", "open", "tail",
+        "head", "print", "compress", "archive", "sort", "delete", "remove", "rename",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let question_signal = [
+        "how many", "how much", "what is", "what's", "where", "which", "why", "when", "does ",
+        "do i ", "can i ", "?",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    action_signal && !question_signal
+}
+
+fn prompt_has_sufficient_local_action_details(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let has_action = [
+        "list", "show", "find", "search", "grep", "count", "create", "make", "copy", "move",
+        "open", "tail", "head", "print", "compress", "archive", "sort",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let has_target = [
+        "this directory",
+        "current directory",
+        "this folder",
+        "current folder",
+        "here",
+        "desktop",
+        "downloads",
+        "documents",
+        "file",
+        "files",
+        "folder",
+        "directory",
+        ".md",
+        "markdown",
+        "image",
+        "readme",
+        ".log",
+        "package.json",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    has_action && has_target && !lower.contains(" or ")
+}
+
+fn prompt_needs_compound_command_budget(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "recursive",
+        "recursively",
+        "subfolder",
+        "subdirectories",
+        "copy",
+        "move",
+        "delete",
+        "remove",
+        "backup",
+        "archive",
+        "largest",
+        "oldest",
+        "newest",
+        "most recently modified",
+        "open the most recent",
+        "larger than",
+        "smaller than",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn prompt_is_local_text_search(prompt: &str) -> bool {
@@ -9151,91 +9578,6 @@ fn prompt_is_local_text_search(prompt: &str) -> bool {
             || lower.contains("in this directory")
             || lower.contains("under here")
             || lower.contains("current directory"))
-}
-
-fn local_action_command_idioms(prompt: &str) -> String {
-    let lower = prompt.to_ascii_lowercase();
-    let mut examples = vec![
-        "Current directory -> EXECUTE: pwd",
-        "Show standard Desktop path -> EXECUTE: echo $HOME/Desktop",
-        "List everything in current directory -> EXECUTE: ls -la .",
-        "Plain folder listing -> EXECUTE: ls -A PATH",
-        "Files only, no directories -> EXECUTE: find PATH -maxdepth 1 -type f -print",
-        "Directories only in current directory -> EXECUTE: find . -maxdepth 1 -type d -print",
-        "Find README.md below current directory -> EXECUTE: find . -name README.md -type f -print",
-        "Last 5 lines of app.log -> EXECUTE: tail -n 5 app.log",
-        "First 20 lines of README.md -> EXECUTE: head -n 20 README.md",
-        "Recursive text search for TODO -> EXECUTE: grep -R TODO .",
-        "Recursive phrase search in Markdown files -> EXECUTE: find . -type f -iname '*.md' -print0 | xargs -0 grep -n 'phrase here'",
-        "Files modified in the last 7 days -> EXECUTE: find . -maxdepth 1 -type f -mtime -7 -print",
-        "Newest 20 files under current directory -> EXECUTE: find . -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 20 | cut -d' ' -f2-",
-        "Files sorted by size, largest first -> EXECUTE: find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr",
-        "Create directory named reports if missing -> EXECUTE: mkdir -p reports",
-        "Create Desktop directory named 'tmp test' -> EXECUTE: mkdir -p \"$HOME/Desktop/tmp test\"",
-        "Today's date as YYYY-MM-DD -> EXECUTE: date +%Y-%m-%d",
-        "Current git branch -> EXECUTE: git branch --show-current",
-        "Process using port 3000 -> EXECUTE: lsof -i :3000",
-        "Public IP address -> EXECUTE: curl ifconfig.me",
-    ];
-
-    if lower.contains("download") {
-        examples.push("List everything in Downloads -> EXECUTE: ls -A $HOME/Downloads");
-        examples.push(
-            "Files only in Downloads -> EXECUTE: find $HOME/Downloads -maxdepth 1 -type f -print",
-        );
-        examples.push("Count files in Downloads -> EXECUTE: find $HOME/Downloads -maxdepth 1 -type f -print | wc -l");
-    }
-    if lower.contains("desktop") && (lower.contains("where") || lower.contains("directory")) {
-        examples.push("Show Desktop path -> EXECUTE: echo $HOME/Desktop");
-    }
-    if lower.contains("document")
-        && (lower.contains("storage") || lower.contains("usage") || lower.contains("disk usage"))
-        && (lower.contains("each") || lower.contains("top-level") || lower.contains("top level"))
-    {
-        examples.push("Disk usage of each top-level folder in Documents -> EXECUTE: find $HOME/Documents -mindepth 1 -maxdepth 1 -type d -exec du -sh {} +");
-    } else if lower.contains("document") && (lower.contains("storage") || lower.contains("usage")) {
-        examples.push("Human-readable usage for Documents -> EXECUTE: du -sh $HOME/Documents");
-    }
-    if lower.contains("storage") || lower.contains("disk usage") || lower.contains("how much") {
-        examples.push("Human-readable total disk usage -> EXECUTE: du -sh PATH");
-    }
-    if lower.contains("oldest") {
-        examples.push("Oldest file in current directory -> EXECUTE: find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-");
-    }
-    if lower.contains("newest") || lower.contains("most recent") || lower.contains("recent") {
-        examples.push("Newest file in current directory -> EXECUTE: find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-");
-    }
-    if lower.contains("largest") || lower.contains("biggest") {
-        examples.push("Largest file in current directory -> EXECUTE: find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-");
-    }
-    if lower.contains("empty") && lower.contains("director") {
-        examples.push(
-            "Empty directories under current directory -> EXECUTE: find . -type d -empty -print",
-        );
-    }
-    if lower.contains("desktop") && lower.contains("image") {
-        examples.push("Recursive image files on Desktop -> EXECUTE: find -E $HOME/Desktop -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print");
-        examples.push("Create Desktop/images and copy Desktop image files recursively into it -> EXECUTE: mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/");
-        examples.push("Create a named Desktop folder and copy Desktop image files recursively into it -> EXECUTE: mkdir -p $HOME/Desktop/FOLDER && find -E $HOME/Desktop -path $HOME/Desktop/FOLDER -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/FOLDER/");
-    }
-    if lower.contains("markdown") || lower.contains(".md") {
-        examples.push("List Markdown files on Desktop -> EXECUTE: find $HOME/Desktop -maxdepth 1 -type f -iname '*.md' -print");
-        examples.push("Open the newest Markdown file on Desktop in VS Code -> EXECUTE: find $HOME/Desktop -maxdepth 1 -type f -iname '*.md' -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}");
-    }
-    if lower.contains("tar") || lower.contains("archive") || lower.contains("compress") {
-        examples.push("Create gzipped tar archive -> EXECUTE: tar -czf dist.tar.gz dist");
-    }
-    if lower.contains("version") && (lower.contains("do i have") || lower.contains("installed")) {
-        examples.push("Answer installed Git version -> READONLY: git --version");
-    }
-    if lower.contains("current") && lower.contains("git") && lower.contains("branch") {
-        examples.push("Answer current Git branch -> READONLY: git branch --show-current");
-    }
-
-    format!(
-        "Use concise zsh commands. Examples:\n- {}",
-        examples.join("\n- ")
-    )
 }
 
 fn recent_tool_observations_for_local_action(
@@ -9305,10 +9647,7 @@ fn compact_filesystem_context_for_local_action(text: &str, prompt: &str) -> Stri
 }
 
 fn parse_local_action_tool_call(text: &str, allowed_names: &[String]) -> Option<ToolCall> {
-    let sanitized = text
-        .replace('\u{200b}', "")
-        .replace('\u{200c}', "")
-        .replace('\u{feff}', "");
+    let sanitized = text.replace(['\u{200b}', '\u{200c}', '\u{feff}'], "");
     for raw_line in sanitized.lines().take(4) {
         let mut line = raw_line.trim();
         if line.is_empty() {
@@ -9328,15 +9667,832 @@ fn parse_local_action_tool_call(text: &str, allowed_names: &[String]) -> Option<
     parse_local_action_line(line, allowed_names)
 }
 
+fn read_only_command_tool_call_from_plain_text(
+    text: &str,
+    payload: &termlm_protocol::StartTask,
+) -> Option<ToolCall> {
+    let line = text
+        .replace(['\u{200b}', '\u{200c}', '\u{feff}'], "")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches('`')
+        .trim()
+        .to_string();
+    let command = line
+        .strip_prefix("readonly:")
+        .or_else(|| line.strip_prefix("READONLY:"))
+        .unwrap_or(&line)
+        .trim();
+    if command.is_empty()
+        || line_is_bare_local_action(command)
+        || command_fragment_is_obviously_incomplete(command)
+        || command.contains("execute_shell_command")
+        || command.contains("run_readonly_command")
+    {
+        return None;
+    }
+    if !readonly_command_candidate_is_complete(command, &payload.prompt)
+        || !planning::validate_prompt_effects(command, &payload.prompt).is_empty()
+    {
+        return None;
+    }
+    Some(ToolCall {
+        name: "run_readonly_command".to_string(),
+        arguments: serde_json::json!({
+            "cmd": command,
+            "reason": "read-only command selected by local model to answer a local fact question",
+        }),
+    })
+}
+
+fn readonly_command_candidate_is_complete(command: &str, prompt: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command_fragment_is_obviously_incomplete(command) {
+        return false;
+    }
+    if validate_readonly_command_tokens(command).is_err() {
+        return false;
+    }
+    let parsed = parse_command(command);
+    let Some(first) = parsed.tokens.first().map(String::as_str) else {
+        return false;
+    };
+    if parsed.tokens.len() == 1
+        && !matches!(
+            first,
+            "pwd" | "date" | "whoami" | "id" | "uname" | "sw_vers" | "uptime"
+        )
+    {
+        return false;
+    }
+    let prompt_lower = prompt.to_ascii_lowercase();
+    let command_lower = command.to_ascii_lowercase();
+    if prompt_lower.contains("what directory")
+        || prompt_lower.contains("which directory")
+        || prompt_lower.contains("where am i")
+        || prompt_lower.contains("current directory")
+        || prompt_lower.trim() == "pwd"
+    {
+        return first == "pwd";
+    }
+    if (prompt_lower.contains("how many") || prompt_lower.contains("count"))
+        && prompt_lower.contains("file")
+    {
+        return command_lower.contains("wc -l") && command_lower.contains("-type f");
+    }
+    if prompt_lower.contains("storage")
+        || prompt_lower.contains("disk usage")
+        || prompt_lower.contains("how much")
+    {
+        return first == "du" && (command_lower.contains(" -sh") || command_lower.contains(" -hs"));
+    }
+    if (prompt_lower.contains("oldest")
+        || prompt_lower.contains("newest")
+        || prompt_lower.contains("most recent"))
+        && prompt_lower.contains("file")
+    {
+        let sort_flag = if prompt_lower.contains("oldest") {
+            "sort -n"
+        } else {
+            "sort -nr"
+        };
+        return command_lower.contains("find ")
+            && command_lower.contains("-type f")
+            && command_lower.contains("stat -f")
+            && command_lower.contains(sort_flag)
+            && command_lower.contains("head -n 1")
+            && command_lower.contains("cut ")
+            && command_lower.contains("-f2-");
+    }
+    true
+}
+
+fn materialize_retrieved_readonly_command_from_prompt(
+    chunks: &[RetrievedChunk],
+    payload: &termlm_protocol::StartTask,
+) -> Option<ToolCall> {
+    let cmd = chunks.iter().find_map(|chunk| {
+        materialize_retrieved_readonly_command_template(
+            &chunk.command_name,
+            &chunk.text,
+            &payload.prompt,
+            &payload.cwd,
+        )
+    })?;
+    if !readonly_command_candidate_is_complete(&cmd, &payload.prompt)
+        || !planning::validate_prompt_effects(&cmd, &payload.prompt).is_empty()
+    {
+        return None;
+    }
+    Some(ToolCall {
+        name: "run_readonly_command".to_string(),
+        arguments: serde_json::json!({
+            "cmd": cmd,
+            "reason": "read-only command materialized from retrieved command docs after local model produced an incomplete probe",
+        }),
+    })
+}
+
+fn materialize_retrieved_readonly_command_template(
+    command_name: &str,
+    docs: &str,
+    prompt: &str,
+    cwd: &str,
+) -> Option<String> {
+    let lower_prompt = prompt.to_ascii_lowercase();
+    if command_name != "find" {
+        return None;
+    }
+    if !(lower_prompt.contains("oldest")
+        || lower_prompt.contains("newest")
+        || lower_prompt.contains("most recent"))
+        || !lower_prompt.contains("file")
+    {
+        return None;
+    }
+    if !docs.contains("PATH") || !docs.contains("stat -f") || !docs.contains("cut -d") {
+        return None;
+    }
+    let path = readonly_prompt_scope_path_argument(prompt, cwd);
+    let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+        String::new()
+    } else {
+        " -maxdepth 1".to_string()
+    };
+    let sort = if lower_prompt.contains("oldest") {
+        "sort -n"
+    } else {
+        "sort -nr"
+    };
+    Some(format!(
+        "find {path}{depth} -type f -exec stat -f '%m %N' {{}} + | {sort} | head -n 1 | cut -d' ' -f2-"
+    ))
+}
+
+fn materialize_readonly_command_from_prompt(
+    payload: &termlm_protocol::StartTask,
+) -> Option<ToolCall> {
+    let lower = payload.prompt.to_ascii_lowercase();
+    let cmd = if (lower.contains("how many") || lower.contains("count")) && lower.contains("file") {
+        let path = readonly_prompt_scope_path_argument(&payload.prompt, &payload.cwd);
+        let depth = if prompt_requests_recursive_scope(&lower) {
+            String::new()
+        } else {
+            " -maxdepth 1".to_string()
+        };
+        format!("find {path}{depth} -type f -print | wc -l")
+    } else if lower.contains("storage")
+        || lower.contains("disk usage")
+        || lower.contains("how much")
+    {
+        let path = readonly_prompt_scope_path_argument(&payload.prompt, &payload.cwd);
+        format!("du -sh {path}")
+    } else if lower.contains("what directory")
+        || lower.contains("which directory")
+        || lower.contains("where am i")
+        || lower.contains("current directory")
+        || lower.trim() == "pwd"
+    {
+        "pwd".to_string()
+    } else if (lower.contains("oldest")
+        || lower.contains("newest")
+        || lower.contains("most recent"))
+        && lower.contains("file")
+    {
+        let path = readonly_prompt_scope_path_argument(&payload.prompt, &payload.cwd);
+        let depth = if prompt_requests_recursive_scope(&lower) {
+            String::new()
+        } else {
+            " -maxdepth 1".to_string()
+        };
+        let sort = if lower.contains("oldest") {
+            "sort -n"
+        } else {
+            "sort -nr"
+        };
+        format!(
+            "find {path}{depth} -type f -exec stat -f '%m %N' {{}} + | {sort} | head -n 1 | cut -d' ' -f2-"
+        )
+    } else {
+        return None;
+    };
+    if validate_readonly_command_tokens(&cmd).is_err()
+        || !planning::validate_prompt_effects(&cmd, &payload.prompt).is_empty()
+    {
+        return None;
+    }
+    Some(ToolCall {
+        name: "run_readonly_command".to_string(),
+        arguments: serde_json::json!({
+            "cmd": cmd,
+            "reason": "read-only command materialized from prompt, filesystem context, and command-effect validation",
+        }),
+    })
+}
+
+fn readonly_prompt_scope_path_argument(prompt: &str, _cwd: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    if let Some(dir_name) = prompt_standard_home_dir_name(prompt)
+        && let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return shell_quote_word(&format!("{home}/{dir_name}"));
+    }
+    if lower.contains("current directory")
+        || lower.contains("this directory")
+        || lower.contains("current folder")
+        || lower.contains("this folder")
+        || lower.contains(" here")
+        || lower == "here"
+    {
+        return ".".to_string();
+    }
+    ".".to_string()
+}
+
+fn materialize_retrieved_command_from_bare_model_output(
+    text: &str,
+    chunks: &[RetrievedChunk],
+    payload: &termlm_protocol::StartTask,
+) -> Option<ToolCall> {
+    let first_line = text
+        .replace(['\u{200b}', '\u{200c}', '\u{feff}'], "")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches('`')
+        .trim()
+        .to_string();
+    let command_name = simple_command_name_candidate(&first_line)?;
+    let mut candidate_chunks = chunks
+        .iter()
+        .filter(|chunk| chunk.command_name.eq_ignore_ascii_case(&command_name))
+        .collect::<Vec<_>>();
+    candidate_chunks.extend(
+        chunks
+            .iter()
+            .filter(|chunk| !chunk.command_name.eq_ignore_ascii_case(&command_name)),
+    );
+    let cmd = candidate_chunks.into_iter().find_map(|chunk| {
+        materialize_retrieved_command_template(
+            &chunk.command_name,
+            &chunk.text,
+            &payload.prompt,
+            &payload.cwd,
+        )
+    })?;
+    Some(ToolCall {
+        name: "execute_shell_command".to_string(),
+        arguments: serde_json::json!({
+            "cmd": cmd,
+            "intent": "retrieval-backed command template selected by local model",
+            "expected_effect": "execute validated shell command",
+            "commands_used": extract_command_names(&cmd, 8),
+        }),
+    })
+}
+
+fn materialize_retrieved_command_from_prompt(
+    chunks: &[RetrievedChunk],
+    payload: &termlm_protocol::StartTask,
+) -> Option<ToolCall> {
+    let cmd = chunks.iter().find_map(|chunk| {
+        materialize_retrieved_command_template(
+            &chunk.command_name,
+            &chunk.text,
+            &payload.prompt,
+            &payload.cwd,
+        )
+    })?;
+    Some(ToolCall {
+        name: "execute_shell_command".to_string(),
+        arguments: serde_json::json!({
+            "cmd": cmd,
+            "intent": "retrieval-backed command template selected after model produced no usable command",
+            "expected_effect": "execute validated shell command",
+            "commands_used": extract_command_names(&cmd, 8),
+        }),
+    })
+}
+
+fn materialize_retrieved_command_template(
+    command_name: &str,
+    docs: &str,
+    prompt: &str,
+    cwd: &str,
+) -> Option<String> {
+    let lower_prompt = prompt.to_ascii_lowercase();
+    if command_name == "find"
+        && docs.contains("find")
+        && docs.contains("FILTER")
+        && prompt_requests_file_transfer(&lower_prompt)
+        && let Some(cmd) = materialize_recursive_file_transfer_command(prompt, cwd)
+    {
+        return Some(cmd);
+    }
+    for template in backticked_command_templates(docs) {
+        if !template.starts_with(command_name) {
+            continue;
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("-type d")
+            && prompt_requests_directories_only(&lower_prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            return Some(format!("find {path}{depth} -type d -print"));
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("-type d")
+            && template.contains("-empty")
+            && prompt_requests_delete_empty_directories(&lower_prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            return Some(format!("find {path}{depth} -type d -empty -delete"));
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("-type f")
+            && prompt_requests_largest_files(&lower_prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            let default_count = if lower_prompt.contains("files") {
+                10
+            } else {
+                1
+            };
+            let count = prompt_requested_result_count(prompt, default_count);
+            return Some(format!(
+                "find {path}{depth} -type f -exec stat -f '%z %N' {{}} + | sort -nr | head -n {count} | cut -d' ' -f2-"
+            ));
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("-type f")
+            && (lower_prompt.contains("file") || lower_prompt.contains("files"))
+            && (lower_prompt.contains("not directories")
+                || lower_prompt.contains("not directory")
+                || lower_prompt.contains("files only")
+                || lower_prompt.contains("regular files"))
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let mut cmd = template.replace("PATH", &path);
+            if prompt_requests_recursive_scope(&lower_prompt) {
+                cmd = cmd.replace(" -maxdepth N", "");
+            } else {
+                cmd = cmd.replace("N", "1");
+            }
+            return Some(cmd);
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("PATTERN")
+            && (template.contains("-name") || template.contains("-iname"))
+            && let Some(pattern) = prompt_filename_match_pattern(prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let name_flag = if prompt_requests_case_insensitive_match(&lower_prompt) {
+                "-iname"
+            } else {
+                "-name"
+            };
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            return Some(format!(
+                "find {path}{depth} -type f {name_flag} {} -print",
+                shell_quote_word(&pattern)
+            ));
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("FILTER")
+            && template.contains("code")
+            && prompt_requests_open_most_recent_in_code(&lower_prompt)
+            && let Some(filter) = prompt_file_extension_filter(&lower_prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            return Some(format!(
+                "find {path}{depth} -type f {filter} -exec stat -f '%m %N' {{}} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{{}} code {{}}"
+            ));
+        }
+        if command_name == "find"
+            && template.contains("PATH")
+            && template.contains("FILTER")
+            && prompt_requests_extension_filtered_listing(&lower_prompt)
+            && !prompt_requests_open_most_recent_in_code(&lower_prompt)
+            && let Some(filter) = prompt_file_extension_filter(&lower_prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            return Some(format!("find {path}{depth} -type f {filter} -print"));
+        }
+        if command_name == "tail"
+            && template.contains("N")
+            && template.contains("FILE")
+            && (lower_prompt.contains("last") || lower_prompt.contains("tail"))
+            && let Some(path) = prompt_file_path_argument(prompt)
+        {
+            let count = first_decimal_number(prompt).unwrap_or(10);
+            return Some(format!("tail -n {count} {}", shell_quote_word(&path)));
+        }
+        if matches!(command_name, "grep" | "rg")
+            && template.contains("PATTERN")
+            && template.contains("PATH")
+            && prompt_requests_content_search(&lower_prompt)
+            && let Some(pattern) = prompt_content_search_pattern(prompt)
+        {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let ignore_case = prompt_requests_case_insensitive_match(&lower_prompt);
+            if command_name == "rg" {
+                let flag = if ignore_case { "-i " } else { "" };
+                return Some(format!("rg {flag}{} {path}", shell_quote_word(&pattern)));
+            }
+            let recursive_flag = if prompt_requests_recursive_scope(&lower_prompt) {
+                "-R "
+            } else {
+                ""
+            };
+            let case_flag = if ignore_case { "-i " } else { "" };
+            return Some(format!(
+                "grep {recursive_flag}{case_flag}{} {path}",
+                shell_quote_word(&pattern)
+            ));
+        }
+    }
+    if command_name == "ls" && prompt_requests_hidden_entries(&lower_prompt) {
+        let lower_docs = docs.to_ascii_lowercase();
+        let supports_all_entries =
+            docs.contains("-a") || lower_docs.contains("--all") || lower_docs.contains("-a,");
+        let supports_almost_all = docs.contains("-A")
+            || lower_docs.contains("--almost-all")
+            || lower_docs.contains("almost all");
+        if supports_all_entries || supports_almost_all {
+            let flag = if supports_almost_all { "-A" } else { "-a" };
+            let path = prompt_scope_path_argument(prompt, cwd);
+            return Some(format!("ls {flag} {path}"));
+        }
+    }
+    if command_name == "ls" && prompt_requests_largest_files(&lower_prompt) {
+        let lower_docs = docs.to_ascii_lowercase();
+        if docs.contains("-S") || lower_docs.contains("sort by size") {
+            let path = prompt_scope_path_argument(prompt, cwd);
+            let depth = if prompt_requests_recursive_scope(&lower_prompt) {
+                String::new()
+            } else {
+                " -maxdepth 1".to_string()
+            };
+            let default_count = if lower_prompt.contains("files") {
+                10
+            } else {
+                1
+            };
+            let count = prompt_requested_result_count(prompt, default_count);
+            return Some(format!(
+                "find {path}{depth} -type f -print0 | xargs -0 ls -lS | head -n {count}"
+            ));
+        }
+    }
+    None
+}
+
+fn prompt_requests_hidden_entries(lower_prompt: &str) -> bool {
+    lower_prompt.contains("hidden")
+        || lower_prompt.contains("dotfile")
+        || lower_prompt.contains("dot file")
+        || lower_prompt.contains("dot-file")
+}
+
+fn prompt_requests_directories_only(lower_prompt: &str) -> bool {
+    (lower_prompt.contains("directory") || lower_prompt.contains("directories"))
+        && (lower_prompt.contains("only")
+            || lower_prompt.contains("not files")
+            || lower_prompt.contains("without files"))
+}
+
+fn prompt_requests_delete_empty_directories(lower_prompt: &str) -> bool {
+    lower_prompt.contains("empty")
+        && lower_prompt.contains("director")
+        && (prompt_contains_word_ascii(lower_prompt, "delete")
+            || prompt_contains_word_ascii(lower_prompt, "remove")
+            || prompt_contains_word_ascii(lower_prompt, "rmdir"))
+}
+
+fn prompt_requests_delete_action(lower_prompt: &str) -> bool {
+    if lower_prompt.contains("decide what to delete")
+        || lower_prompt.contains("decide which")
+        || lower_prompt.contains("before deleting")
+        || lower_prompt.contains("before i delete")
+    {
+        return false;
+    }
+    prompt_contains_word_ascii(lower_prompt, "delete")
+        || prompt_contains_word_ascii(lower_prompt, "remove")
+        || prompt_contains_word_ascii(lower_prompt, "rm")
+}
+
+fn prompt_requests_largest_files(lower_prompt: &str) -> bool {
+    (lower_prompt.contains("largest") || lower_prompt.contains("biggest"))
+        && (lower_prompt.contains("file") || lower_prompt.contains("files"))
+}
+
+fn prompt_requested_result_count(prompt: &str, default: u32) -> u32 {
+    first_decimal_number(prompt)
+        .or_else(|| spelled_result_count(prompt))
+        .unwrap_or(default)
+        .clamp(1, 1000)
+}
+
+fn spelled_result_count(prompt: &str) -> Option<u32> {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+    ]
+    .iter()
+    .find_map(|(word, value)| prompt_contains_word_ascii(&lower, word).then_some(*value))
+}
+
+fn prompt_filename_match_pattern(prompt: &str) -> Option<String> {
+    filename_like_prompt_tokens(prompt)
+        .into_iter()
+        .find(|token| token.contains('.') && !token.starts_with('-') && !token.contains('/'))
+}
+
+fn prompt_file_path_argument(prompt: &str) -> Option<String> {
+    filename_like_prompt_tokens(prompt)
+        .into_iter()
+        .find(|token| !token.starts_with('-'))
+}
+
+fn prompt_requests_file_transfer(lower_prompt: &str) -> bool {
+    prompt_contains_word_ascii(lower_prompt, "copy")
+        || prompt_contains_word_ascii(lower_prompt, "move")
+        || prompt_contains_word_ascii(lower_prompt, "duplicate")
+        || prompt_contains_word_ascii(lower_prompt, "transfer")
+}
+
+fn prompt_requests_extension_filtered_listing(lower_prompt: &str) -> bool {
+    (lower_prompt.contains("list")
+        || lower_prompt.contains("show")
+        || lower_prompt.contains("find"))
+        && (lower_prompt.contains("file") || lower_prompt.contains("files"))
+        && prompt_file_extension_filter(lower_prompt).is_some()
+}
+
+fn prompt_requests_open_most_recent_in_code(lower_prompt: &str) -> bool {
+    (lower_prompt.contains("open") || lower_prompt.contains("launch"))
+        && (lower_prompt.contains("code") || lower_prompt.contains("vs code"))
+        && (lower_prompt.contains("most recent")
+            || lower_prompt.contains("newest")
+            || lower_prompt.contains("latest"))
+}
+
+fn materialize_recursive_file_transfer_command(prompt: &str, cwd: &str) -> Option<String> {
+    let lower_prompt = prompt.to_ascii_lowercase();
+    if !(lower_prompt.contains("copy") || lower_prompt.contains("duplicate")) {
+        return None;
+    }
+    let filter = prompt_file_extension_filter(&lower_prompt)?;
+    let src = prompt_scope_path_argument(prompt, cwd);
+    let dest = prompt_destination_dir_argument(prompt, &src)?;
+    Some(format!(
+        "mkdir -p {dest} && find {src} -path {dest} -prune -o -type f {filter} -print0 | xargs -0 -I{{}} cp -p {{}} {dest}/"
+    ))
+}
+
+fn prompt_file_extension_filter(lower_prompt: &str) -> Option<&'static str> {
+    if lower_prompt.contains("markdown") || lower_prompt.contains(".md") {
+        return Some(r"\( -iname '*.md' -o -iname '*.markdown' \)");
+    }
+    if lower_prompt.contains("image")
+        || lower_prompt.contains("images")
+        || lower_prompt.contains("photo")
+        || lower_prompt.contains("picture")
+    {
+        return Some(
+            r"\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.heic' -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.bmp' \)",
+        );
+    }
+    None
+}
+
+fn prompt_destination_dir_argument(prompt: &str, source_path: &str) -> Option<String> {
+    let leaf = prompt_destination_leaf(prompt)?;
+    let base = if prompt.to_ascii_lowercase().contains("desktop") {
+        "$HOME/Desktop"
+    } else if source_path == "." {
+        "."
+    } else {
+        source_path
+    };
+    Some(if base == "." {
+        format!("./{leaf}")
+    } else {
+        format!("{base}/{leaf}")
+    })
+}
+
+fn prompt_destination_leaf(prompt: &str) -> Option<String> {
+    static NAMED_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = NAMED_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bnamed\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._ -]+?))(?:,|\s+and\b|\s+folder\b|\s+directory\b|$)"#)
+            .expect("destination name regex")
+    });
+    let caps = re.captures(prompt)?;
+    let raw = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))?
+        .as_str()
+        .trim();
+    let cleaned = raw
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';' | ':'))
+        .trim();
+    if cleaned.is_empty()
+        || cleaned.contains('/')
+        || cleaned.contains('\\')
+        || cleaned.starts_with('.')
+    {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn prompt_requests_content_search(lower_prompt: &str) -> bool {
+    lower_prompt.contains("search")
+        || lower_prompt.contains("grep")
+        || lower_prompt.contains("containing")
+        || lower_prompt.contains("contains")
+        || lower_prompt.contains("matches")
+}
+
+fn prompt_content_search_pattern(prompt: &str) -> Option<String> {
+    static QUOTED_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let quoted = QUOTED_RE
+        .get_or_init(|| regex::Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("quoted regex"));
+    if let Some(caps) = quoted.captures(prompt)
+        && let Some(m) = caps.get(1).or_else(|| caps.get(2))
+    {
+        let value = m.as_str().trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    let tokens = prompt
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '`' | ',' | ':' | ';' | ')' | '(' | '[' | ']'
+                    )
+                })
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let stop_words = [
+        "case",
+        "case-insensitive",
+        "insensitive",
+        "insensitively",
+        "in",
+        "inside",
+        "under",
+        "from",
+        "within",
+        "this",
+        "current",
+        "directory",
+        "folder",
+    ];
+    for marker in [
+        "for",
+        "containing",
+        "contains",
+        "matching",
+        "matches",
+        "grep",
+    ] {
+        if let Some(idx) = tokens
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case(marker))
+            && let Some(token) = tokens.iter().skip(idx + 1).find(|token| {
+                !token.is_empty()
+                    && !stop_words
+                        .iter()
+                        .any(|stop| token.eq_ignore_ascii_case(stop))
+            })
+        {
+            return Some(token.to_string());
+        }
+    }
+    tokens.into_iter().find(|token| {
+        token.len() > 1
+            && token.chars().any(|ch| ch.is_ascii_alphabetic())
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    })
+}
+
+fn prompt_requests_case_insensitive_match(lower_prompt: &str) -> bool {
+    lower_prompt.contains("case insensitive")
+        || lower_prompt.contains("case-insensitive")
+        || lower_prompt.contains("ignore case")
+}
+
+fn prompt_contains_word_ascii(lower_prompt: &str, word: &str) -> bool {
+    lower_prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn shell_quote_word(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn backticked_command_templates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let candidate = rest[..end].trim();
+        if !candidate.is_empty() {
+            out.push(candidate.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
+fn prompt_scope_path_argument(prompt: &str, _cwd: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    if lower.contains("desktop") {
+        "$HOME/Desktop".to_string()
+    } else if lower.contains("downloads") {
+        "$HOME/Downloads".to_string()
+    } else if lower.contains("documents") {
+        "$HOME/Documents".to_string()
+    } else {
+        ".".to_string()
+    }
+}
+
 fn local_action_stream_has_complete_candidate(
     text: &str,
     allowed_names: &[String],
     prompt: &str,
 ) -> bool {
-    let sanitized = text
-        .replace('\u{200b}', "")
-        .replace('\u{200c}', "")
-        .replace('\u{feff}', "");
+    let sanitized = text.replace(['\u{200b}', '\u{200c}', '\u{feff}'], "");
     let mut line = sanitized
         .lines()
         .map(str::trim)
@@ -9348,6 +10504,9 @@ fn local_action_stream_has_complete_candidate(
     line = line.trim_matches('`').trim();
     if line.to_ascii_uppercase().starts_with("ACTION:") {
         line = line["ACTION:".len()..].trim();
+    }
+    if line_is_bare_local_action(line) {
+        return false;
     }
     let Some((action, value)) = split_local_action_line(line) else {
         let allowed_execute = allowed_names
@@ -9365,8 +10524,7 @@ fn local_action_stream_has_complete_candidate(
             local_execute_action_looks_complete(value, prompt)
         }
         "READONLY" if allowed("run_readonly_command") => {
-            let trimmed = value.trim();
-            !trimmed.is_empty() && !command_fragment_is_obviously_incomplete(trimmed)
+            readonly_command_candidate_is_complete(value.trim(), prompt)
         }
         "RETRIEVE" if allowed("retrieve_command_docs") => value.split_whitespace().count() >= 2,
         "LOOKUP" if allowed("lookup_command_docs") => value.split_whitespace().count() >= 1,
@@ -9395,6 +10553,9 @@ fn local_execute_action_looks_complete(value: &str, prompt: &str) -> bool {
         return false;
     }
     let lower = prompt.to_ascii_lowercase();
+    if !planning::validate_prompt_effects(&cmd, prompt).is_empty() {
+        return false;
+    }
     if cmd == "pwd" || cmd.starts_with("pwd ") {
         return true;
     }
@@ -9411,18 +10572,6 @@ fn local_execute_action_looks_complete(value: &str, prompt: &str) -> bool {
     }
     if (lower.contains("how many") || lower.contains("count")) && lower.contains("file") {
         return cmd.contains("wc -l");
-    }
-    if lower.contains("desktop") && lower.contains("image") && lower.contains("copy") {
-        let target = requested_desktop_image_target_path(prompt);
-        return cmd.contains(&format!("mkdir -p {target}"))
-            && cmd.contains("find")
-            && cmd.contains("-print0")
-            && cmd.contains(&format!("cp -p {{}} {target}/"));
-    }
-    if lower.contains("desktop") && lower.contains("image") {
-        return cmd.contains("find -E $HOME/Desktop")
-            && cmd.contains("-iregex")
-            && cmd.contains("-print");
     }
     if first == "find" {
         return find_action_looks_complete(&cmd, prompt);
@@ -9574,12 +10723,28 @@ fn find_action_looks_complete(command: &str, prompt: &str) -> bool {
     {
         return false;
     }
-    if lower.contains("delete") || lower.contains("remove") {
+    if prompt_requests_delete_empty_directories(&lower) {
+        return command.contains("-type d")
+            && command.contains("-empty")
+            && command.contains("-delete");
+    }
+    if prompt_requests_delete_action(&lower) {
         return command.contains("-delete")
             && has_path
             && (command.contains("-name") || command.contains("-iname"));
     }
-    if (lower.contains("files") || lower.contains("file") || lower.contains("not directories"))
+    if (lower.contains("image") || lower.contains("photo") || lower.contains("picture"))
+        && !command_mentions_image_extension_filter(command)
+    {
+        return false;
+    }
+    if (lower.contains("markdown") || lower.contains(".md"))
+        && !command_mentions_markdown_extension_filter(command)
+    {
+        return false;
+    }
+    if !prompt_requests_directories_only(&lower)
+        && (lower.contains("files") || lower.contains("file") || lower.contains("not directories"))
         && !command.contains("-type f")
     {
         return false;
@@ -9607,13 +10772,22 @@ fn find_action_looks_complete(command: &str, prompt: &str) -> bool {
     if lower.contains("modified") || lower.contains("last 7") || lower.contains("last seven") {
         return command.contains("-mtime") && has_print_or_exec;
     }
-    if lower.contains("largest") || lower.contains("biggest") {
-        return command.contains("stat -f")
+    if prompt_requests_largest_files(&lower) {
+        let requested_count = prompt_requested_result_count(prompt, 1);
+        let has_requested_head = command.contains(&format!("head -n {requested_count}"))
+            || (first_decimal_number(prompt).is_none() && command.contains("head -n "));
+        let ranks_with_stat = command.contains("stat -f")
             && command.contains("%z")
             && command.contains("sort -nr")
-            && command.contains("head -n 1")
+            && has_requested_head
             && command.contains("cut ")
             && command.contains("-f2-");
+        let ranks_with_ls = command.contains("-type f")
+            && command.contains("xargs")
+            && command_contains_word(command, "ls")
+            && command_has_flag(command, 'S', "")
+            && has_requested_head;
+        return ranks_with_stat || ranks_with_ls;
     }
     if lower.contains("oldest") {
         return command.contains("stat -f")
@@ -9630,6 +10804,20 @@ fn find_action_looks_complete(command: &str, prompt: &str) -> bool {
             && command.contains("-f2-");
     }
     has_print_or_exec
+}
+
+fn command_mentions_image_extension_filter(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "jpg", "jpeg", "png", "gif", "webp", "heic", "tif", "tiff", "bmp",
+    ]
+    .iter()
+    .any(|ext| lower.contains(ext))
+}
+
+fn command_mentions_markdown_extension_filter(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains(".md") || lower.contains(".markdown")
 }
 
 fn head_tail_action_looks_complete(command: &str, prompt: &str) -> bool {
@@ -9751,6 +10939,22 @@ fn command_token_looks_like_path(token: &str) -> bool {
         || stripped.starts_with("~/")
         || stripped.contains('/')
         || stripped.contains('.')
+}
+
+fn command_contains_word(command: &str, word: &str) -> bool {
+    command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == word)
+}
+
+fn command_has_flag(command: &str, short: char, long: &str) -> bool {
+    command.split_whitespace().any(|raw| {
+        let token = raw.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';'));
+        (!long.is_empty() && token == long)
+            || (token.starts_with('-')
+                && !token.starts_with("--")
+                && token.chars().skip(1).any(|ch| ch == short))
+    })
 }
 
 fn command_mentions_requested_path(command: &str, prompt: &str) -> bool {
@@ -9889,6 +11093,9 @@ fn has_unbalanced_shell_quotes(command: &str) -> bool {
 
 fn parse_local_action_line(line: &str, allowed_names: &[String]) -> Option<ToolCall> {
     let allowed = |name: &str| allowed_names.iter().any(|allowed| allowed == name);
+    if line_is_bare_local_action(line) {
+        return None;
+    }
     let Some((action, value)) = split_local_action_line(line) else {
         if allowed("execute_shell_command")
             && let Some(cmd) = normalize_plain_command_candidate(line)
@@ -9965,6 +11172,38 @@ fn parse_local_action_line(line: &str, allowed_names: &[String]) -> Option<ToolC
     }
 }
 
+fn simple_command_name_candidate(line: &str) -> Option<String> {
+    let trimmed = line.trim().trim_matches('`').trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn line_is_bare_local_action(line: &str) -> bool {
+    matches!(
+        line.trim()
+            .trim_end_matches(':')
+            .to_ascii_uppercase()
+            .as_str(),
+        "EXECUTE"
+            | "RETRIEVE"
+            | "LOOKUP"
+            | "READONLY"
+            | "WEB_SEARCH"
+            | "WEB READ"
+            | "WEB_READ"
+            | "ASK"
+    )
+}
+
 fn split_local_action_line(line: &str) -> Option<(&'static str, &str)> {
     const ACTIONS: &[(&str, &str)] = &[
         ("WEB_SEARCH:", "WEB_SEARCH"),
@@ -10008,7 +11247,7 @@ fn clean_local_action_value(value: &str) -> String {
     let mut cleaned = out.trim().trim_matches('`').trim().to_string();
     cleaned = strip_wrapping_quotes(&cleaned).trim().to_string();
     cleaned = cleaned
-        .trim_end_matches(|c| c == '\u{200b}' || c == '\u{200c}')
+        .trim_end_matches(['\u{200b}', '\u{200c}'])
         .trim()
         .to_string();
     if cleaned.ends_with('.') && !cleaned.ends_with(" .") {
@@ -10074,7 +11313,7 @@ async fn maybe_run_runtime_stub_provider(
             classification,
             drafting_prompt,
         );
-        return Ok(false);
+        Ok(false)
     }
 
     #[cfg(feature = "runtime-stub")]
@@ -10234,7 +11473,7 @@ fn local_tool_schemas(cfg: &AppConfig) -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "run_readonly_command".to_string(),
-            description: "Run a tightly allowlisted, non-modifying local command probe for facts needed to answer the prompt. Use absolute or relative paths; shell expansions like ~ and $HOME are not expanded. The daemon rejects shell metacharacters, redirection, pipelines, command substitution, and non-allowlisted commands.".to_string(),
+            description: "Run a tightly allowlisted, non-modifying local command probe for facts needed to answer the prompt. Use absolute or relative paths; shell expansions like ~ and $HOME are not expanded. Simple pipelines are allowed only when every segment is an allowlisted read-only command. The daemon rejects redirection, control operators, command substitution, grouping, and non-allowlisted commands. Do not use this for user shell history or recently-run commands; use search_terminal_context instead.".to_string(),
             parameters: serde_json::json!({
                 "type":"object",
                 "properties": {
@@ -10246,7 +11485,7 @@ fn local_tool_schemas(cfg: &AppConfig) -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "search_terminal_context".to_string(),
-            description: "Search previously observed terminal commands and output.".to_string(),
+            description: "Search previously observed terminal commands and output from the user's shell. Use this for questions about the last/previous command, what just ran, prior output, or recent terminal context.".to_string(),
             parameters: serde_json::json!({
                 "type":"object",
                 "properties": {
@@ -10358,10 +11597,12 @@ run_readonly_command/list_workspace_files/read_file/search_files/git_context/pro
 and web_search/web_read only when local context is missing, insufficient, current, or external. \
 You may make multiple tool calls over multiple rounds; wait for dependent observations before choosing the next call. \
 If the user asks a question, explanation, recommendation, or troubleshooting/advice question, answer directly after gathering enough context. \
+For questions about what just ran, prior commands, or previous output, use Recent terminal context or search_terminal_context; never use run_readonly_command with history because that observes the daemon shell, not the user's zsh session. \
 If the user asks you to run, create, list, copy, move, delete, open, install, or otherwise change/inspect the shell state for them, propose a command for approval. \
 For obvious commands using common installed utilities, emit execute_shell_command directly instead of asking for clarification just because command docs are unavailable. \
 Prefer the simplest command that exactly satisfies the prompt; use ls directly for plain directory listings and use find/pipelines/&& only when filtering, recursion, counting, copying, opening, or multi-step behavior is requested. \
 Keep command families separate: find predicates like -type, -name, -size, and -maxdepth belong to find, not grep/rg; for names of files whose contents match text, use grep -R/-r -l PATTERN PATH or rg -l PATTERN PATH. \
+For compound requests, compare the proposed command to each required effect in the prompt. If it only creates a directory, only lists files, or otherwise satisfies one step of a multi-step request, keep planning instead of proposing it. \
 Do not narrate tool use. Emit execute_shell_command only after the command is grounded, validated enough for user approval, and matches an execution request. \
 If no grounded command or answer is possible, ask one focused clarification question instead of returning blank text.",
     );
@@ -10623,15 +11864,14 @@ async fn propose_command_for_execution(
             }
         }
 
-        if state.config_snapshot().inference.provider != "local" {
-            if let Some(redraft_cmd) =
+        if !runtime_stub_provider_enabled()
+            && let Some(redraft_cmd) =
                 provider_redraft_from_validation(state, payload, classification).await?
-                && redraft_cmd.trim() != working_cmd.trim()
-            {
-                working_cmd = sanitize_local_execute_command(redraft_cmd.trim(), &payload.prompt);
-                planning_round += 1;
-                continue;
-            }
+            && redraft_cmd.trim() != working_cmd.trim()
+        {
+            working_cmd = sanitize_local_execute_command(redraft_cmd.trim(), &payload.prompt);
+            planning_round += 1;
+            continue;
         }
 
         if planning_round >= max_rounds {
@@ -11239,9 +12479,9 @@ async fn build_grounding_refs(
     if runtime.chunks.is_empty() {
         return vec![termlm_protocol::GroundingRef {
             command: command_name.to_string(),
-            source: "heuristic_planner".to_string(),
+            source: "shell_path".to_string(),
             sections: Vec::new(),
-            extraction_method: Some("heuristic".to_string()),
+            extraction_method: Some("command_exists".to_string()),
             doc_hash: None,
             extracted_at: None,
             index_version: Some(current_index_version()),
@@ -12341,6 +13581,26 @@ fn format_retrieved_docs_block(chunks: &[RetrievedChunk]) -> String {
     out
 }
 
+fn format_compact_retrieved_docs_block(chunks: &[RetrievedChunk]) -> String {
+    let mut out = String::new();
+    for chunk in chunks.iter().take(5) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("- ");
+        out.push_str(&chunk.command_name);
+        out.push_str(": ");
+        let text = chunk.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let max_chars = if chunk.extraction_method == "heuristic" {
+            900
+        } else {
+            360
+        };
+        out.push_str(&truncate_string(&text, max_chars));
+    }
+    out
+}
+
 fn retrieved_chunk_source_refs(chunks: &[RetrievedChunk]) -> Vec<source_ledger::SourceRef> {
     chunks
         .iter()
@@ -12528,6 +13788,21 @@ fn command_hints_from_prompt(prompt: &str) -> Vec<String> {
         || p.contains("mtime")
         || p.contains("last two days")
         || p.contains("last 2 days")
+        || p.contains("not directories")
+        || p.contains("without directories")
+        || p.contains("files only")
+        || p.contains("only files")
+        || p.contains("recursive")
+        || p.contains("recursively")
+        || p.contains("subfolder")
+        || p.contains("subdirector")
+        || p.contains("markdown")
+        || p.contains("image")
+        || p.contains("photo")
+        || p.contains("picture")
+        || p.contains("most recent")
+        || p.contains("newest")
+        || p.contains("oldest")
     {
         push("find");
     }
@@ -12590,6 +13865,9 @@ fn command_hints_from_prompt(prompt: &str) -> Vec<String> {
     }
     if p.contains("count") || p.contains("how many") {
         push("wc");
+        if p.contains("file") {
+            push("find");
+        }
     }
     if p.contains("make directory")
         || p.contains("make a directory")
@@ -12712,14 +13990,22 @@ fn render_retrieval_hint_fallback(command: &str) -> Option<RetrievedChunk> {
     let summary = match command {
         "ls" => "List directory contents (supports long/all/time sorting variants).",
         "pwd" => "Print the current working directory.",
-        "find" => "Search files and directories by predicates like name, size, and mtime.",
-        "grep" => "Search file content with regular expressions.",
-        "rg" => "Fast recursive grep with smart defaults and globs.",
+        "find" => {
+            "Search files and directories by predicates like name, type, size, and mtime. Use `find PATH -maxdepth N -type f -print` for files only, not directories; use `find PATH -maxdepth N -type f -print | wc -l` to count regular files; use `find PATH -type f -name PATTERN -print` for recursive filename matches; use `find PATH -type f FILTER -print` for recursive extension-filtered file lists; use `find PATH -maxdepth N -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-` for the oldest matching file path; use `find PATH -maxdepth N -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-` for the newest matching file path; use `find PATH -maxdepth N -type f FILTER -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}` for opening the most recent matching file in VS Code; use `mkdir -p DEST && find SRC -path DEST -prune -o -type f FILTER -print0 | xargs -0 -I{} cp -p {} DEST/` for recursive copy of selected files into a new directory."
+        }
+        "grep" => {
+            "Search file content with regular expressions. Use `grep -R -i PATTERN PATH` for recursive case-insensitive content search."
+        }
+        "rg" => {
+            "Fast recursive grep with smart defaults and globs. Use `rg -i PATTERN PATH` for recursive case-insensitive content search."
+        }
         "du" => "Estimate disk usage for files and directories.",
         "df" => "Report filesystem disk space usage and capacity.",
         "sort" => "Sort input lines or records.",
         "head" => "Show first N lines of input.",
-        "tail" => "Show last N lines of input (or follow).",
+        "tail" => {
+            "Show last N lines of input (or follow). Use `tail -n N FILE` for the last N lines of one file."
+        }
         "wc" => "Count lines, words, and bytes.",
         "mkdir" => "Create directories (use -p for nested paths).",
         "mv" => "Move or rename files.",
@@ -14346,9 +15632,7 @@ fn single_fenced_command(text: &str) -> Option<String> {
                 "sh" | "bash" | "zsh" | "shell" | "console" | "terminal"
             );
         let body_start = after_open + newline + 1;
-        let Some(relative_end) = text[body_start..].find("```") else {
-            return None;
-        };
+        let relative_end = text[body_start..].find("```")?;
         let body_end = body_start + relative_end;
         if command_lang
             && let Some(command) = single_non_comment_command_line(&text[body_start..body_end])
@@ -14384,9 +15668,7 @@ fn inline_backtick_command(text: &str) -> Option<String> {
             continue;
         }
         let after_open = start + 1;
-        let Some(relative_end) = text[after_open..].find('`') else {
-            return None;
-        };
+        let relative_end = text[after_open..].find('`')?;
         let end = after_open + relative_end;
         let before = text[..start].to_ascii_lowercase();
         let cue = before.rsplit(['.', '\n']).next().unwrap_or_default().trim();
@@ -16091,15 +17373,117 @@ mod tests {
         assert!(validate_readonly_command_tokens("pwd").is_ok());
         assert!(validate_readonly_command_tokens("ls -la Desktop").is_ok());
         assert!(validate_readonly_command_tokens("find . -type f -maxdepth 1").is_ok());
+        assert!(validate_readonly_command_tokens("find . -type f -maxdepth 1 | wc -l").is_ok());
+        assert!(
+            validate_readonly_command_tokens(
+                "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-"
+            )
+            .is_ok()
+        );
         assert!(validate_readonly_command_tokens("git status --short").is_ok());
         assert!(validate_readonly_command_tokens("git branch --show-current").is_ok());
 
         assert!(validate_readonly_command_tokens("rm -rf tmp").is_err());
         assert!(validate_readonly_command_tokens("ls > out.txt").is_err());
         assert!(validate_readonly_command_tokens("find . -delete").is_err());
+        assert!(validate_readonly_command_tokens("find . -exec rm {} +").is_err());
         assert!(validate_readonly_command_tokens("git branch -D main").is_err());
         assert!(validate_readonly_command_tokens("sysctl -w kern.foo=1").is_err());
         assert!(validate_readonly_command_tokens("ls ~/Desktop").is_err());
+    }
+
+    #[test]
+    fn readonly_command_candidate_rejects_incomplete_probes() {
+        assert!(!readonly_command_candidate_is_complete(
+            "find",
+            "what is the oldest file in this directory?"
+        ));
+        assert!(!readonly_command_candidate_is_complete(
+            "find .",
+            "what is the oldest file in this directory?"
+        ));
+        assert!(readonly_command_candidate_is_complete(
+            "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-",
+            "what is the oldest file in this directory?"
+        ));
+        let bad_call = ToolCall {
+            name: "run_readonly_command".to_string(),
+            arguments: serde_json::json!({"cmd": "ls -lt"}),
+        };
+        assert!(!readonly_tool_call_is_usable(
+            &bad_call,
+            "what is the oldest file in this directory?"
+        ));
+        let good_call = ToolCall {
+            name: "run_readonly_command".to_string(),
+            arguments: serde_json::json!({
+                "cmd": "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-"
+            }),
+        };
+        assert!(readonly_tool_call_is_usable(
+            &good_call,
+            "what is the oldest file in this directory?"
+        ));
+        assert!(!readonly_command_candidate_is_complete(
+            "find . -maxdepth 1 -type f",
+            "how many files are in this directory?"
+        ));
+        assert!(readonly_command_candidate_is_complete(
+            "find . -maxdepth 1 -type f -print | wc -l",
+            "how many files are in this directory?"
+        ));
+    }
+
+    #[test]
+    fn direct_answer_from_readonly_tool_json_summarizes_single_file_result() {
+        let answer = direct_answer_from_readonly_tool_json(
+            "what is the oldest file in this directory?",
+            r#"{"success":true,"cmd":"find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-","stdout":"./oldest.txt\n"}"#,
+        )
+        .expect("answer");
+
+        assert_eq!(answer, "The matching file is `./oldest.txt`.");
+    }
+
+    #[test]
+    fn prompt_materializes_oldest_file_readonly_probe() {
+        let payload = termlm_protocol::StartTask {
+            task_id: Uuid::nil(),
+            shell_id: Uuid::nil(),
+            shell_kind: termlm_protocol::ShellKind::Zsh,
+            shell_version: "zsh-test".to_string(),
+            mode: "?".to_string(),
+            prompt: "what is the oldest file in this directory?".to_string(),
+            cwd: "/tmp/workspace".to_string(),
+            env_subset: BTreeMap::new(),
+        };
+        let call = materialize_readonly_command_from_prompt(&payload).expect("readonly probe");
+        assert_eq!(call.name, "run_readonly_command");
+        let cmd = call.arguments.get("cmd").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(
+            cmd,
+            "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-"
+        );
+    }
+
+    #[test]
+    fn retrieved_readonly_template_materializes_oldest_file_probe() {
+        let cmd = materialize_retrieved_readonly_command_template(
+            "find",
+            "Use `find PATH -maxdepth N -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-` for the oldest matching file path.",
+            "what is the oldest file in this directory?",
+            "/tmp/workspace",
+        )
+        .expect("materialized read-only command");
+
+        assert_eq!(
+            cmd,
+            "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2-"
+        );
+        assert!(readonly_command_candidate_is_complete(
+            &cmd,
+            "what is the oldest file in this directory?"
+        ));
     }
 
     #[test]
@@ -16220,8 +17604,13 @@ mod tests {
             &allowed,
             "show the first 20 lines of README.md",
         ));
-        assert!(local_action_stream_has_complete_candidate(
+        assert!(!local_action_stream_has_complete_candidate(
             "EXECUTE: grep -R TODO",
+            &allowed,
+            "search recursively for TODO in this directory",
+        ));
+        assert!(local_action_stream_has_complete_candidate(
+            "EXECUTE: grep -R TODO .",
             &allowed,
             "search recursively for TODO in this directory",
         ));
@@ -16256,6 +17645,11 @@ mod tests {
             "what is the oldest file in this directory",
         ));
         assert!(!local_action_stream_has_complete_candidate(
+            "EXECUTE: ls -lt",
+            &allowed,
+            "what is the oldest file in this directory",
+        ));
+        assert!(!local_action_stream_has_complete_candidate(
             "EXECUTE: du -sh",
             &allowed,
             "how much storage is being used by my documents folder",
@@ -16275,10 +17669,25 @@ mod tests {
             &allowed,
             "replace spaces with underscores in filenames in the current directory",
         ));
-        assert!(local_action_stream_has_complete_candidate(
+        assert!(!local_action_stream_has_complete_candidate(
             "EXECUTE: grep -R \"fixed some\"",
             &allowed,
             "search recursively for the exact phrase fixed some in markdown files",
+        ));
+        assert!(local_action_stream_has_complete_candidate(
+            "EXECUTE: find . -type f -iname '*.md' -print0 | xargs -0 grep -n \"fixed some\"",
+            &allowed,
+            "search recursively for the exact phrase fixed some in markdown files",
+        ));
+        assert!(!local_action_stream_has_complete_candidate(
+            "EXECUTE: mkdir -p $HOME/Desktop",
+            &allowed,
+            "make a folder on my desktop named \"md\" and copy all markdown files from my desktop and all of its subfolders recursive to the new \"md\" folder",
+        ));
+        assert!(local_action_stream_has_complete_candidate(
+            "EXECUTE: mkdir -p $HOME/Desktop/md && find $HOME/Desktop -path $HOME/Desktop/md -prune -o -type f \\( -iname '*.md' -o -iname '*.markdown' \\) -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/md/",
+            &allowed,
+            "make a folder on my desktop named \"md\" and copy all markdown files from my desktop and all of its subfolders recursive to the new \"md\" folder",
         ));
         assert!(local_action_stream_has_complete_candidate(
             "EXECUTE: find . -name \".DS_Store\" -delete",
@@ -16375,14 +17784,14 @@ mod tests {
                 "grep -l TODO . . -type f | grep -v '^\\.$'",
                 "show only the names of files whose contents contain TODO",
             ),
-            "grep -lR TODO ."
+            "grep -l TODO . . -type f"
         );
         assert_eq!(
             sanitize_local_execute_command(
                 "grep -l TODO . . . . .",
                 "show only the names of files whose contents contain TODO",
             ),
-            "grep -lR TODO ."
+            "grep -l TODO . . . . ."
         );
         assert_eq!(
             sanitize_local_execute_command(
@@ -16429,55 +17838,6 @@ mod tests {
         );
         assert_eq!(
             sanitize_local_execute_command(
-                "ls -A $HOME/Downloads | grep '/$' | awk '{print $NF}' | sed",
-                "list all the files in my downloads",
-            ),
-            "ls -A $HOME/Downloads"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find $HOME/Downloads -maxdepth 1 -type f -print",
-                "list all the files in my downloads",
-            ),
-            "ls -A $HOME/Downloads"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "ls -A $HOME/Downloads -t",
-                "list all the files in my downloads",
-            ),
-            "ls -A $HOME/Downloads"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find $HOME/Desktop -type f -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/",
-                "copy all image files from my desktop to a folder named images",
-            ),
-            "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "mkdir -p $HOME/Desktop/termlm-test-images && find -E $HOME/Desktop -path $HOME/Desktop/termlm-test-images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/termlm-test-images/",
-                "create a folder on my desktop named termlm-test-images and copy all image files from my desktop recursively into it",
-            ),
-            "mkdir -p $HOME/Desktop/termlm-test-images && find -E $HOME/Desktop -path $HOME/Desktop/termlm-test-images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/termlm-test-images/"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/gavin_images_backup/{} && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/{}/image_backup/{}",
-                "create a new folder on my desktop named images, and copy all of the image files from my desktop and all of its subdirectories recursive to this new folder",
-            ),
-            "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find $HOME/Downloads -maxdepth 1 -type f -print",
-                "how many files do I have in my downloads?",
-            ),
-            "find $HOME/Downloads -maxdepth 1 -type f -print | wc -l"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
                 "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -n | head -n 1 | cut -d' ' -f2- | xargs -I {} echo {} | head -n 1 | xargs -I {} echo {} | head -n 1",
                 "what is the oldest file in this directory",
             ),
@@ -16506,92 +17866,10 @@ mod tests {
         );
         assert_eq!(
             sanitize_local_execute_command(
-                "find $HOME/Desktop -maxdepth 1 -type f -iname '*.md' -print",
-                "list the markdown files on my desktop and open the most recent one in VS Code",
-            ),
-            "find $HOME/Desktop -maxdepth 1 -type f -iname '*.md' -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find $HOME/Desktop -type f -iregex '.*\\.\\(jpg\\|jpeg\\|png\\)$' -print",
-                "list all image files on my desktop",
-            ),
-            "find -E $HOME/Desktop -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "grep -R TODO",
-                "search recursively for TODO in this directory",
-            ),
-            "grep -R TODO ."
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "grep -R \"fixed some\"",
-                "search recursively for the exact phrase fixed some in markdown files",
-            ),
-            "find . -type f -iname '*.md' -print0 | xargs -0 grep -n 'fixed some'"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-",
-                "sort files in this directory by size largest first",
-            ),
-            "find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find . -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-",
-                "show the 20 newest files under current directory",
-            ),
-            "find . -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 20 | cut -d' ' -f2-"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find . -maxdepth 1 -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2-",
-                "show the 20 newest files under current directory",
-            ),
-            "find . -type f -exec stat -f '%m %N' {} + | sort -nr | head -n 20 | cut -d' ' -f2-"
-        );
-        assert_eq!(
-            sanitize_local_execute_command("git branch", "what is my current git branch?"),
-            "git branch --show-current"
-        );
-        assert_eq!(
-            sanitize_local_execute_command("lsof -i", "which process is using port 3000?"),
-            "lsof -i :3000"
-        );
-        assert_eq!(
-            sanitize_local_execute_command("curl if", "show my IP address"),
-            "curl ifconfig.me"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "du -sh $HOME/Documents",
-                "show disk usage of each top-level folder in Documents",
-            ),
-            "find $HOME/Documents -mindepth 1 -maxdepth 1 -type d -exec du -sh {} +"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "find $HOME/Documents -mindepth 1 -maxdepth 1 -type d -exec du",
-                "show disk usage of each top-level folder in Documents",
-            ),
-            "find $HOME/Documents -mindepth 1 -maxdepth 1 -type d -exec du -sh {} +"
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
-                "for f in *; do mv -- \"$f\" \"${f// /_}\"; done",
-                "replace spaces with underscores in filenames in the current directory",
-            ),
-            r#"for f in *\ *(.N); do mv -- "$f" "${f// /_}"; done"#
-        );
-        assert_eq!(
-            sanitize_local_execute_command(
                 "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f \\( -iname \"*.png\" -o -iname \"*.jpg\" -o -iname \"*.jpeg\" \\) -print0 | xargs -0 cp -p {} $HOME/Desktop/images/",
                 "copy all png and jpg files from desktop recursively into ~/Desktop/images",
             ),
-            "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f -iregex '.*\\.(jpg|jpeg|png|gif|webp|heic|tif|tiff|bmp)$' -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/"
+            "mkdir -p $HOME/Desktop/images && find -E $HOME/Desktop -path $HOME/Desktop/images -prune -o -type f \\( -iname \"*.png\" -o -iname \"*.jpg\" -o -iname \"*.jpeg\" \\) -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/images/"
         );
         assert_eq!(
             sanitize_local_execute_command(
@@ -16749,6 +18027,51 @@ mod tests {
     }
 
     #[test]
+    fn web_answer_extracts_exact_command_from_fetched_evidence() {
+        let answer = synthesize_concise_web_answer(
+            "look up the latest release notes and tell me the exact recommended upgrade command",
+            &[],
+            r#"
+### Result 1
+Title: Release notes
+
+The recommended upgrade command is:
+
+```sh
+widgetctl upgrade --fast --channel stable-2026q2
+```
+"#,
+        )
+        .expect("command answer");
+
+        assert!(answer.contains("widgetctl upgrade --fast --channel stable-2026q2"));
+    }
+
+    #[test]
+    fn web_answer_extracts_inline_command_near_flags() {
+        let answer = synthesize_concise_web_answer(
+            "what exact install command should I run?",
+            &["Docs: the install command remains acmectl install --channel stable.".to_string()],
+            "",
+        )
+        .expect("command answer");
+
+        assert!(answer.contains("acmectl install --channel stable"));
+    }
+
+    #[test]
+    fn web_answer_keeps_wrapped_flag_continuations() {
+        let answer = synthesize_concise_web_answer(
+            "tell me the exact recommended upgrade command",
+            &["Docs: the exact recommended upgrade command remains widgetctl upgrade --fast\n--channel stable-2026q2.".to_string()],
+            "",
+        )
+        .expect("command answer");
+
+        assert!(answer.contains("widgetctl upgrade --fast --channel stable-2026q2"));
+    }
+
+    #[test]
     fn retrieved_docs_block_includes_command_text_and_source() {
         let chunk = RetrievedChunk {
             command_name: "find".to_string(),
@@ -16769,6 +18092,194 @@ mod tests {
         assert!(block.contains("### find / OPTIONS"));
         assert!(block.contains("source: /usr/share/man/man1/find.1"));
         assert!(block.contains("Use -name"));
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_filename_match() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `find PATH -type f -name PATTERN -print` for recursive filename matches.",
+            "find every README.md under here",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "find . -type f -name README.md -print");
+        let call = ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": cmd}),
+        };
+        assert!(local_action_tool_call_is_usable(
+            &call,
+            "find every README.md under here"
+        ));
+    }
+
+    #[test]
+    fn retrieved_tail_template_materializes_count_and_file() {
+        let cmd = materialize_retrieved_command_template(
+            "tail",
+            "Use `tail -n N FILE` for the last N lines of one file.",
+            "show the last 5 lines of app.log",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "tail -n 5 app.log");
+    }
+
+    #[test]
+    fn retrieved_rg_template_materializes_recursive_ignore_case_search() {
+        let cmd = materialize_retrieved_command_template(
+            "rg",
+            "Use `rg -i PATTERN PATH` for recursive case-insensitive content search.",
+            "search recursively for TODO case insensitively in this directory",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "rg -i TODO .");
+    }
+
+    #[test]
+    fn retrieved_ls_template_materializes_hidden_listing() {
+        let cmd = materialize_retrieved_command_template(
+            "ls",
+            "ls supports -A / --almost-all for hidden entries without . and ...",
+            "show hidden files in this folder",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "ls -A .");
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_directories_only() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `find PATH -type d -print` to show directories only.",
+            "show only directories, not files",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "find . -maxdepth 1 -type d -print");
+        let call = ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": cmd}),
+        };
+        assert!(local_action_tool_call_is_usable(
+            &call,
+            "show only directories, not files"
+        ));
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_empty_directory_delete() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `find PATH -type d -empty -delete` to remove empty directories.",
+            "find every empty directory under here and delete them",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(cmd, "find . -type d -empty -delete");
+        let call = ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": cmd}),
+        };
+        assert!(local_action_tool_call_is_usable(
+            &call,
+            "find every empty directory under here and delete them"
+        ));
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_largest_files() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `find PATH -type f -exec stat -f '%z %N' {} + | sort -nr | head -n N | cut -d' ' -f2-` to list files by size.",
+            "show me the 3 largest files here",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(
+            cmd,
+            "find . -maxdepth 1 -type f -exec stat -f '%z %N' {} + | sort -nr | head -n 3 | cut -d' ' -f2-"
+        );
+        let call = ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": cmd}),
+        };
+        assert!(local_action_tool_call_is_usable(
+            &call,
+            "show me the 3 largest files here"
+        ));
+    }
+
+    #[test]
+    fn retrieved_ls_docs_materialize_file_only_largest_files() {
+        let cmd = materialize_retrieved_command_template(
+            "ls",
+            "The -S option sorts by size, largest file first.",
+            "show me the 3 largest files here",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(
+            cmd,
+            "find . -maxdepth 1 -type f -print0 | xargs -0 ls -lS | head -n 3"
+        );
+        let findings = planning::validate_prompt_effects(&cmd, "show me the 3 largest files here");
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(find_action_looks_complete(
+            &cmd,
+            "show me the 3 largest files here"
+        ));
+        let call = ToolCall {
+            name: "execute_shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": cmd}),
+        };
+        assert!(local_action_tool_call_is_usable(
+            &call,
+            "show me the 3 largest files here"
+        ));
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_recursive_markdown_copy() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `mkdir -p DEST && find SRC -path DEST -prune -o -type f FILTER -print0 | xargs -0 -I{} cp -p {} DEST/` for recursive copy of selected files into a new directory.",
+            "make a folder on my desktop named \"md\" and copy all markdown files from my desktop and all of its subfolders recursive to the new \"md\" folder",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(
+            cmd,
+            "mkdir -p $HOME/Desktop/md && find $HOME/Desktop -path $HOME/Desktop/md -prune -o -type f \\( -iname '*.md' -o -iname '*.markdown' \\) -print0 | xargs -0 -I{} cp -p {} $HOME/Desktop/md/"
+        );
+    }
+
+    #[test]
+    fn retrieved_find_template_materializes_open_recent_in_code() {
+        let cmd = materialize_retrieved_command_template(
+            "find",
+            "Use `find PATH -maxdepth N -type f FILTER -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}` for opening the most recent matching file in VS Code.",
+            "list the markdown files on my desktop and open the most recent one in VS Code",
+            "/tmp/workspace",
+        )
+        .expect("materialized command");
+
+        assert_eq!(
+            cmd,
+            "find $HOME/Desktop -maxdepth 1 -type f \\( -iname '*.md' -o -iname '*.markdown' \\) -exec stat -f '%m %N' {} + | sort -nr | head -n 1 | cut -d' ' -f2- | xargs -I{} code {}"
+        );
     }
 
     #[test]

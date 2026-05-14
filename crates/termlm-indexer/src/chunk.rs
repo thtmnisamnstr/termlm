@@ -437,18 +437,14 @@ fn command_option_combinations(command_name: &str, options: &[OptionHint]) -> Ve
                 out.push("`ls -lt PATH`: list entries sorted by modification time.".to_string());
             }
         }
-        "du" => {
-            if has("-s") && (has("-h") || has("--human-readable")) {
-                out.push(
-                    "`du -sh PATH`: show total disk usage for a path in human-readable form."
-                        .to_string(),
-                );
-            }
+        "du" if has("-s") && (has("-h") || has("--human-readable")) => {
+            out.push(
+                "`du -sh PATH`: show total disk usage for a path in human-readable form."
+                    .to_string(),
+            );
         }
-        "mkdir" => {
-            if has("-p") || has("--parents") {
-                out.push("`mkdir -p PATH`: create a directory and any missing parent directories without error if it already exists.".to_string());
-            }
+        "mkdir" if has("-p") || has("--parents") => {
+            out.push("`mkdir -p PATH`: create a directory and any missing parent directories without error if it already exists.".to_string());
         }
         "tail" => {
             if has("-n") {

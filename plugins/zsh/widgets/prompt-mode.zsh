@@ -158,4 +158,9 @@ termlm-line-pre-redraw() {
 
 termlm-line-init() {
   termlm-line-pre-redraw
+  if [[ -n "${_TERMLM_DEFERRED_PROMPT:-}" ]]; then
+    local deferred_prompt="$_TERMLM_DEFERRED_PROMPT"
+    _TERMLM_DEFERRED_PROMPT=""
+    termlm-start-task "$deferred_prompt"
+  fi
 }

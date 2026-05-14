@@ -80,6 +80,7 @@ struct RetrievalScore {
 #[derive(Debug, serde::Serialize)]
 struct TestReport {
     id: String,
+    prompt: String,
     mode: String,
     category: String,
     passed: bool,
@@ -491,6 +492,7 @@ async fn main() -> Result<()> {
         .await
         .unwrap_or_else(|e| TestReport {
             id: test.id.clone(),
+            prompt: test.prompt.clone(),
             mode: test.mode.clone(),
             category: test.category.clone(),
             passed: false,
@@ -1301,6 +1303,7 @@ fn local_integration_cases() -> Vec<TestCase> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_test(
     transport: &mut ClientTransport,
     shell_id: Uuid,
@@ -1420,6 +1423,7 @@ async fn run_one_test(
 
     Ok(TestReport {
         id: test.id.clone(),
+        prompt: test.prompt.clone(),
         mode: test.mode.clone(),
         category: test.category.clone(),
         passed: failure.is_none(),
@@ -3313,6 +3317,7 @@ mod tests {
     fn perf_gate_passes_within_thresholds() {
         let report = TestReport {
             id: "t".to_string(),
+            prompt: "test prompt".to_string(),
             mode: "execute".to_string(),
             category: "cat".to_string(),
             passed: true,

@@ -137,6 +137,7 @@ run_zsh_check "source \"$WIDGET_SAFETY\"; termlm-safety-floor-match 'rm -rf /' >
 run_zsh_check "source \"$LIB_CAPTURE\"; tmp=\$(mktemp -d); termlm-start-output-capture \"\$tmp/out\" \"\$tmp/err\"; print -r -- ok; termlm-stop-output-capture; rg -q '^ok$' \"\$tmp/out\"; rm -rf \"\$tmp\""
 run_zsh_check "source \"$LIB_OBSERVER\"; [[ \"\$(termlm-epoch-to-ms 1.234)\" == '1234' ]]"
 run_zsh_check "source \"$LIB_OBSERVER\"; _TERMLM_OBS_CAPTURE_ALL=0; _TERMLM_SHELL_ID='shell'; _TERMLM_PENDING_TASK_ID=''; _TERMLM_RUN_DIR='/tmp/termlm-contract'; mkdir -p \"\$_TERMLM_RUN_DIR\"; termlm-preexec 'll /tmp' 'ls -l /tmp'; [[ \"\$_TERMLM_LAST_PREEXEC_CMD\" == 'll /tmp' && \"\$_TERMLM_LAST_PREEXEC_EXPANDED\" == 'ls -l /tmp' ]]"
+run_zsh_check "source \"$WIDGET_APPROVAL\"; out=\$(termlm-approval-prompt 'mkdir -p \$HOME/Desktop/md && find \$HOME/Desktop -path \$HOME/Desktop/md -prune -o -type f \\( -iname '\''*.md'\'' -o -iname '\''*.markdown'\'' \\) -print0 | xargs -0 -I{} cp -p {} \$HOME/Desktop/md/'); [[ \"\$out\" == *'cp -p {} \$HOME/Desktop/md/'* ]]"
 
 echo "checking automated runtime behavior flows..."
 runtime_log="$(mktemp "${TMPDIR:-/tmp}/termlm-runtime-contract.XXXXXX")"

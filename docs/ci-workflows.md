@@ -23,6 +23,7 @@ Lanes:
   - `cargo fmt --check`
   - `cargo clippy --workspace --locked -- -D warnings`
   - `cargo test --workspace --locked`
+  - response accuracy gate (`scripts/ci/run_accuracy_gate.sh --level commit`) with artifact upload
 - `rust-macos-quick`
   - `cargo test --workspace --locked --no-run`
   - `bash tests/compatibility/macos_profile.sh`
@@ -50,6 +51,7 @@ Lanes:
   - release-profile tests
   - adapter contract + terminal/plugin/SSH compatibility matrix
   - release smoke
+  - response accuracy gate (`--level full`) with tuning report artifact upload
   - perf hardware matrix (`local_stub_all`) with artifact upload (`tests/fixtures/termlm-perf-suite.toml`, `tests/perf/perf-gates.toml`)
   - perf gate file includes 50K retrieval metrics and hardware-class strict override profiles (`apple_m2_pro_max_local`, `apple_m3_pro_local`, `apple_m3_max_local`)
   - optional local real-runtime E2E when model file exists on runner, validated with `tests/perf/real-runtime-gates.toml`
@@ -61,7 +63,7 @@ Lanes:
 - `.github/workflows/release.yml`
   - runs on `v*` tag push and manual dispatch
   - rejects placeholder release tags
-  - performs release-grade validation + packaging, uploads `dist/*` as workflow artifacts, and publishes/clobbers those files on the GitHub Release for the tag
+  - performs release-grade validation + response accuracy reporting + packaging, uploads `dist/*` as workflow artifacts, and publishes/clobbers those files on the GitHub Release for the tag
 - `.github/workflows/ollama-parity.yml`
   - manual Ollama parity evidence lane (`ollama_integration`)
 - `.github/workflows/reliability.yml`

@@ -77,9 +77,19 @@ termlm-accept-line() {
 
     local prompt="$BUFFER"
     BUFFER=""
+    LBUFFER=""
+    RBUFFER=""
+    CURSOR=0
+    zle -R 2>/dev/null || true
+    zle -I 2>/dev/null || true
 
     if [[ -n "$prompt" ]]; then
-      termlm-start-task "$prompt"
+      if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+        _TERMLM_DEFERRED_PROMPT="$prompt"
+        zle .accept-line
+      else
+        termlm-start-task "$prompt"
+      fi
     else
       zle reset-prompt
     fi

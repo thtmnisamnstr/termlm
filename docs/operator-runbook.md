@@ -62,6 +62,7 @@ Behavior:
 - installs binaries + zsh plugin
 - preserves local models
 - deletes temporary upgrade artifacts
+- current zsh sessions clear stale bridge state automatically after successful upgrade; if upgrading from an older alpha adapter, `exec zsh -l` may be needed once
 
 ## 5) Failure Triage
 
@@ -155,6 +156,7 @@ bash tests/adapter-contract/zsh_adapter_contract.sh
 bash tests/compatibility/terminal_matrix.sh
 bash tests/compatibility/ssh_env_smoke.sh
 bash tests/compatibility/plugin_manager_matrix.sh
+bash scripts/ci/run_accuracy_gate.sh --level full
 cargo run -p termlm-test --release --locked -- --suite tests/fixtures/termlm-test-suite.toml --mode all --provider local --perf-gates tests/perf/perf-gates.toml
 ```
 

@@ -91,6 +91,8 @@ Upgrade:
 termlm upgrade
 ```
 
+Current zsh sessions refresh stale `termlm` helper state automatically after upgrade. If you are upgrading from an older alpha and the next prompt cannot reach the daemon, run `exec zsh -l` once.
+
 Uninstall:
 
 ```bash

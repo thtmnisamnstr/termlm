@@ -197,6 +197,7 @@ termlm-helper-send() {
         return 0
       fi
     fi
+    termlm-stop-helper >/dev/null 2>&1 || true
     termlm-start-helper >/dev/null 2>&1 || true
     sleep 0.1
     (( attempt += 1 ))
@@ -248,6 +249,25 @@ termlm-stop-helper() {
   _TERMLM_HELPER_FIFO_OUT=""
   _TERMLM_HELPER_FIFO_GUARD_IN_FD=""
   _TERMLM_HELPER_FIFO_GUARD_OUT_FD=""
+}
+
+termlm-refresh-after-upgrade() {
+  termlm-stop-helper >/dev/null 2>&1 || true
+  _TERMLM_SHELL_ID=""
+  _TERMLM_LAST_CONTEXT_HASH=""
+  _TERMLM_NO_LLM_WARNING_SHOWN=0
+  _TERMLM_TASK_ID=""
+  _TERMLM_CLOSED_TASK_ID=""
+  _TERMLM_ACKED_PENDING_TASK_ID=""
+  _TERMLM_PENDING_TASK_ID=""
+  _TERMLM_PENDING_CMD=""
+  _TERMLM_PENDING_CWD_BEFORE=""
+  _TERMLM_PENDING_STARTED_AT=0
+  _TERMLM_PENDING_STDOUT_FILE=""
+  _TERMLM_PENDING_STDERR_FILE=""
+  _TERMLM_WAITING_MODEL=0
+  rehash 2>/dev/null || hash -r 2>/dev/null || true
+  termlm-refresh-filesystem-context
 }
 
 termlm-start-helper() {
@@ -514,6 +534,7 @@ termlm-ensure-daemon() {
     fi
 
     if (( waited_ms >= 1000 && announced == 0 )); then
+      zle -I 2>/dev/null || true
       print -r -- "termlm: starting termlm-core..."
       announced=1
     fi
@@ -580,6 +601,7 @@ termlm-mark-task-closed() {
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  _TERMLM_PROMPT_TRANSCRIPT_PRINTED=0
 }
 
 termlm-is-closed-task-event() {
@@ -613,6 +635,14 @@ termlm-should-ignore-task-event() {
   return 0
 }
 
+termlm-should-suppress-approved-command-text() {
+  local task_id="$1"
+  [[ -z "$task_id" ]] && return 1
+  [[ -n "${_TERMLM_PENDING_TASK_ID:-}" && "$task_id" == "$_TERMLM_PENDING_TASK_ID" ]] && return 0
+  [[ -n "${_TERMLM_ACKED_PENDING_TASK_ID:-}" && "$task_id" == "$_TERMLM_ACKED_PENDING_TASK_ID" ]] && return 0
+  return 1
+}
+
 termlm-abandon-active-task() {
   local preserve_session="${1:-0}"
   local task_id="${_TERMLM_TASK_ID:-}"
@@ -642,8 +672,18 @@ termlm-start-task() {
     mode="/p"
   fi
 
+  if [[ $_TERMLM_SESSION_MODE -eq 0 ]]; then
+    termlm-preserve-one-shot-prompt-transcript "$prompt"
+  else
+    _TERMLM_PROMPT_TRANSCRIPT_PRINTED=0
+  fi
+
   if [[ -z "$_TERMLM_SHELL_ID" ]] || ! termlm-helper-is-alive; then
-    termlm-register-shell || return 1
+    termlm-register-shell || {
+      _TERMLM_WAITING_MODEL=0
+      [[ $_TERMLM_SESSION_MODE -eq 0 ]] && termlm-exit-prompt-mode || zle reset-prompt
+      return 1
+    }
   fi
   termlm-send-shell-context
 
@@ -667,11 +707,22 @@ termlm-start-task() {
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
   _TERMLM_EDITING_APPROVAL_TASK_ID=""
+  _TERMLM_ACKED_PENDING_TASK_ID=""
   _TERMLM_CLOSED_TASK_ID=""
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
   termlm-show-task-status "termlm: thinking..."
   zle reset-prompt
+}
+
+termlm-preserve-one-shot-prompt-transcript() {
+  local prompt="$1"
+  local indicator
+  indicator="$(termlm-current-prompt-indicator)"
+  termlm-clear-task-status
+  zle -I 2>/dev/null || true
+  print -rP -- "${indicator}${prompt//\%/%%}"
+  _TERMLM_PROMPT_TRANSCRIPT_PRINTED=1
 }
 
 termlm-show-task-status() {
@@ -691,9 +742,12 @@ termlm-begin-async-output() {
   termlm-clear-task-status
   zle -I 2>/dev/null || true
   if [[ "${_TERMLM_OUTPUT_STARTED:-0}" -eq 0 ]]; then
-    print -r -- ""
+    if [[ "${_TERMLM_PROMPT_TRANSCRIPT_PRINTED:-0}" -eq 0 ]]; then
+      print -r -- ""
+    fi
     _TERMLM_OUTPUT_STARTED=1
     _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+    _TERMLM_PROMPT_TRANSCRIPT_PRINTED=0
   fi
 }
 
@@ -746,6 +800,9 @@ termlm-handle-run-task-stream() {
 
 termlm-handle-run-task-line() {
   local line="$1"
+  if [[ -n "${TERMLM_IPC_DEBUG_LOG:-}" ]]; then
+    print -r -- "$line" >> "${TERMLM_IPC_DEBUG_LOG}" 2>/dev/null || true
+  fi
   local kind
   kind="$(termlm-json-event-kind "$line")"
 
@@ -764,11 +821,14 @@ termlm-handle-run-task-line() {
       if termlm-should-ignore-task-event "$task_id"; then
         return
       fi
+      if termlm-should-suppress-approved-command-text "$task_id"; then
+        return
+      fi
       if [[ -z "$_TERMLM_TASK_ID" ]]; then
         _TERMLM_TASK_ID="$task_id"
       fi
       termlm-begin-async-output
-      print -rn -u 2 -- "$chunk"
+      print -rn -- "$chunk"
       termlm-note-output-chunk "$chunk"
       ;;
     needs_clarification)
@@ -818,6 +878,7 @@ termlm-handle-run-task-line() {
         suppress_prompt_reset=1
       fi
       if [[ "${_TERMLM_OUTPUT_NEEDS_NEWLINE:-0}" -eq 1 ]]; then
+        zle -I 2>/dev/null || true
         print -r -- ""
       fi
       termlm-mark-task-closed

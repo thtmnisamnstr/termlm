@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${TERMLM_SKIP_ACCURACY_GATE:-0}" == "1" ]]; then
+  echo "termlm accuracy gate skipped because TERMLM_SKIP_ACCURACY_GATE=1"
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+while IFS= read -r name; do
+  [[ -n "$name" ]] && unset "$name"
+done < <(git rev-parse --local-env-vars)
+cd "$repo_root"
+
+level="${TERMLM_ACCURACY_LEVEL:-commit}"
+exec bash scripts/ci/run_accuracy_gate.sh --level "${level}"

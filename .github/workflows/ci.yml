@@ -37,3 +37,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Response accuracy gate
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/termlm-accuracy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TERMLM_ACCURACY_OUT=${OUT_DIR}" >> "${GITHUB_ENV}"
+          bash scripts/ci/run_accuracy_gate.sh --level commit --artifacts-dir "${OUT_DIR}"
+      - name: Upload response accuracy artifacts
+        if: ${{ always() && env.TERMLM_ACCURACY_OUT != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: response-accuracy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TERMLM_ACCURACY_OUT }}
+          if-no-files-found: error

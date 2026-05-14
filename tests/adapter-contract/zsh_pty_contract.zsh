@@ -13,6 +13,7 @@ MOCK_LOG="${TMP_ROOT}/mock-bridge.log"
 EXPECT_LOG="${TMP_ROOT}/expect.log"
 ZDOTDIR_PATH="${TMP_ROOT}/zdotdir"
 STDOUT_CAPTURE="${TMP_ROOT}/stdout.decoded"
+FAKE_BIN_DIR="${TMP_ROOT}/path-bin"
 
 cleanup() {
   rm -rf -- "${TMP_ROOT}"
@@ -31,6 +32,19 @@ fail() {
 mkdir -p -- "${ZDOTDIR_PATH}"
 : > "${MOCK_LOG}"
 mkdir -p -- "${TMP_ROOT}/xdg-config"
+mkdir -p -- "${FAKE_BIN_DIR}"
+
+cat > "${FAKE_BIN_DIR}/termlm" <<'EOF'
+#!/usr/bin/env zsh
+set -euo pipefail
+
+if [[ "${1:-}" == "upgrade" ]]; then
+  print -r -- "fake-upgrade-ok"
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "${FAKE_BIN_DIR}/termlm"
 
 cat > "${MOCK_CLIENT}" <<'EOF'
 #!/usr/bin/env zsh
@@ -76,6 +90,11 @@ case "$cmd" in
           chunk_b64="$(encode_b64 "session-mode-ok")"
           print -r -- "{\"event\":\"model_text\",\"task_id\":\"${task_id}\",\"chunk_b64\":\"${chunk_b64}\"}"
           print -r -- "{\"event\":\"task_complete\",\"task_id\":\"${task_id}\"}"
+        elif [[ "$prompt" == "long command contract" ]]; then
+          cmd_text="mkdir -p \\$HOME/Desktop/md && find \\$HOME/Desktop -path \\$HOME/Desktop/md -prune -o -type f \\( -iname '*.md' -o -iname '*.markdown' \\) -print0 | xargs -0 -I{} cp -p {} \\$HOME/Desktop/md/"
+          cmd_b64="$(encode_b64 "${cmd_text}")"
+          print -r -- "{\"event\":\"proposed_command\",\"task_id\":\"${task_id}\",\"cmd_b64\":\"${cmd_b64}\",\"requires_approval\":true}"
+          pending_task="${task_id}"
         else
           cmd_text='echo pty-contract'
           cmd_b64="$(encode_b64 "${cmd_text}")"
@@ -119,6 +138,7 @@ export TERMLM_CAPTURE_ENABLED=1
 export TERMLM_CAPTURE_MAX_BYTES=16384
 export TERMLM_PROMPT_INDICATOR='TERMLM_PROMPT> '
 export TERMLM_SESSION_INDICATOR='TERMLM_SESSION> '
+export PATH="${FAKE_BIN_DIR}:$PATH"
 export PS1='TERMLM_NORMAL> '
 bindkey -e
 source "${ROOT_DIR}/plugins/zsh/termlm.plugin.zsh"
@@ -159,42 +179,58 @@ set term $env(TERMLM_EXPECT_TERM)
 set send_slow {1 0.02}
 
 spawn env TERM=$term ZDOTDIR=$zdotdir zsh -i
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "echo before-termlm\r"
 expect -re {before-termlm}
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "?"
-expect -re {TERMLM_PROMPT> }
+expect -re {TERMLM_PROMPT>}
 send -- "\033"
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "?"
-expect -re {TERMLM_PROMPT> }
+expect -re {TERMLM_PROMPT>}
 send -s -- "cancel me\r"
-expect -re {TERMLM_PROMPT> }
+expect -re {TERMLM_PROMPT>}
 send -- "\033"
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "?"
-expect -re {TERMLM_PROMPT> }
+expect -re {TERMLM_PROMPT>}
 send -s -- "run pty contract\r"
 expect -re {proposed command}
 expect -re {y accept.*n/Enter reject.*e edit.*a accept all.*Esc cancel}
 send -s -- "y"
 expect -re {echo pty-contract}
 expect -re {pty-contract}
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
+send -s -- "?"
+expect -re {TERMLM_PROMPT>}
+send -s -- "long command contract\r"
+expect -re {proposed command}
+expect -re {cp -p .*Desktop/md/}
+send -s -- "n"
+expect -re {TERMLM_NORMAL>}
 send -s -- "echo normal-command\r"
 expect -re {normal-command}
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
+send -s -- "termlm upgrade\r"
+expect -re {fake-upgrade-ok}
+expect -re {TERMLM_NORMAL>}
+send -s -- "?"
+expect -re {TERMLM_PROMPT>}
+send -s -- "run pty contract after upgrade\r"
+expect -re {proposed command}
+send -s -- "n"
+expect -re {TERMLM_NORMAL>}
 # Trigger a prompt-cycle so precmd emits pending ack deterministically in PTY automation.
 send -- "\r"
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "/p\r"
-expect -re {TERMLM_SESSION> }
+expect -re {TERMLM_SESSION>}
 send -s -- "session followup\r"
-expect -re {TERMLM_SESSION> }
+expect -re {TERMLM_SESSION>}
 # Escape should leave interactive session mode, then exit shell. Ctrl-D behavior can vary by TERM/keymap.
 send -- "\033"
-expect -re {TERMLM_NORMAL> }
+expect -re {TERMLM_NORMAL>}
 send -s -- "exit\r"
 expect eof
 EOF
@@ -208,6 +244,10 @@ unset TERMLM_EXPECT_ZDOTDIR
 unset TERMLM_EXPECT_TERM
 
 wait_for_log_pattern "event:shell_registered" 8 || fail "shell did not register through bridge"
+shell_register_count="$(rg -c --fixed-strings -- "event:shell_registered" "${MOCK_LOG}" || true)"
+if (( shell_register_count < 2 )); then
+  fail "expected bridge to re-register after termlm upgrade in the same zsh session"
+fi
 wait_for_log_pattern "event:shell_context" 8 || fail "shell context event not observed"
 if rg -q --fixed-strings -- "before-termlm" "${MOCK_LOG}"; then
   fail "normal command before first termlm use should not start helper or enter terminal context"

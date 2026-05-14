@@ -224,13 +224,29 @@ pub fn classify_prompt_with_freshness_terms(
     }
 
     if [
+        "did i just run",
+        "what command did i just run",
+        "what did i just run",
+        "last command",
+        "previous command",
+        "recent command",
+        "just ran",
+    ]
+    .iter()
+    .any(|k| p.contains(k))
+    {
+        *scores.get_mut("referential").expect("referential score") += 2.2;
+    }
+
+    if [
         "that",
         "those",
         "it",
         "again",
         "previous",
         "before",
-        "last command",
+        "just run",
+        "last thing",
     ]
     .iter()
     .any(|k| p.contains(k))
@@ -1852,6 +1868,15 @@ mod tests {
         assert!(matches!(
             result.classification,
             TaskClassification::DocumentationQuestion
+        ));
+    }
+
+    #[test]
+    fn classify_recent_command_questions_as_referential() {
+        let result = classify_prompt("what command did I just run?");
+        assert!(matches!(
+            result.classification,
+            TaskClassification::ReferentialFollowup
         ));
     }
 

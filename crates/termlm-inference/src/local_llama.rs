@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 #[cfg(feature = "local-runtime")]
+use llama_cpp_2::context::LlamaContext;
+#[cfg(feature = "local-runtime")]
 use llama_cpp_2::context::params::LlamaContextParams;
 #[cfg(feature = "local-runtime")]
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -57,6 +59,8 @@ struct LoadedRuntime {
     threads: i32,
     model: LlamaModel,
     chat_template: Option<LlamaChatTemplate>,
+    ascii_token_biases: Vec<LlamaLogitBias>,
+    newline_token_biases: Vec<LlamaLogitBias>,
     backend: LlamaBackend,
 }
 
@@ -110,6 +114,39 @@ struct ParsedToolFunction {
     #[serde(default)]
     arguments: serde_json::Value,
 }
+
+#[cfg(feature = "local-runtime")]
+const GEMMA4_MINIMAL_CHAT_TEMPLATE: &str = r#"
+{{- '<bos>' -}}
+{%- set loop_messages = messages -%}
+{%- if tools or messages[0]['role'] in ['system', 'developer'] -%}
+    {{- '<|turn>system\n' -}}
+    {%- if messages[0]['role'] in ['system', 'developer'] -%}
+        {{- messages[0]['content'] | trim -}}
+        {%- set loop_messages = messages[1:] -%}
+    {%- endif -%}
+    {%- if tools -%}
+        {{- '\n\nAvailable tools. When a tool is needed, emit exactly one call as <|tool_call>call:name{arg:<|"|>value<|"|>}<tool_call|>.' -}}
+        {%- for tool in tools -%}
+            {{- '<|tool>declaration:' + tool['function']['name'] + '{description:<|"|>' + tool['function']['description'] + '<|"|>}<tool|>' -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '<turn|>\n' -}}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- if message['role'] == 'tool' -%}
+        {{- '<|tool_response>response:' + (message.get('name') | default(message.get('tool_call_id') | default('tool'))) + '{value:<|"|>' + (message['content'] | trim) + '<|"|>}<tool_response|>' -}}
+    {%- else -%}
+        {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+        {{- '<|turn>' + role + '\n' -}}
+        {{- message['content'] | trim -}}
+        {{- '<turn|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n' -}}
+{%- endif -%}
+"#;
 
 impl LocalLlamaProvider {
     pub fn new(
@@ -198,6 +235,49 @@ impl LocalLlamaProvider {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    fn string_option(request: &ChatRequest, key: &str) -> Option<String> {
+        request
+            .options
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn bool_option(request: &ChatRequest, key: &str) -> bool {
+        request
+            .options
+            .get(key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn f32_option(request: &ChatRequest, key: &str) -> Option<f32> {
+        request
+            .options
+            .get(key)
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32)
+    }
+
+    fn i32_option(request: &ChatRequest, key: &str) -> Option<i32> {
+        request.options.get(key).and_then(|value| {
+            value
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .or_else(|| value.as_u64().and_then(|n| i32::try_from(n).ok()))
+        })
+    }
+
+    fn u32_option(request: &ChatRequest, key: &str) -> Option<u32> {
+        request.options.get(key).and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .or_else(|| value.as_i64().and_then(|n| u32::try_from(n).ok()))
+        })
     }
 
     fn first_stop_match(text: &str, stops: &[String]) -> Option<usize> {
@@ -317,10 +397,10 @@ impl LocalLlamaProvider {
             let model = LlamaModel::load_from_file(&backend, Path::new(&model_path), &model_params)
                 .with_context(|| format!("failed to load local model {}", model_path))?;
 
-            let chat_template = model
-                .chat_template(None)
-                .ok()
-                .or_else(|| LlamaChatTemplate::new("chatml").ok());
+            let lower_model_path = model_path.to_ascii_lowercase();
+            let chat_template = Self::select_chat_template(&model, &lower_model_path);
+            let ascii_token_biases = Self::ascii_only_token_biases(&model);
+            let newline_token_biases = Self::newline_token_biases(&model);
 
             Ok::<Arc<LoadedRuntime>, anyhow::Error>(Arc::new(LoadedRuntime {
                 model_path,
@@ -329,6 +409,8 @@ impl LocalLlamaProvider {
                 threads,
                 model,
                 chat_template,
+                ascii_token_biases,
+                newline_token_biases,
                 backend,
             }))
         })
@@ -341,6 +423,46 @@ impl LocalLlamaProvider {
         }
         *guard = Some(loaded.clone());
         Ok(loaded)
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn select_chat_template(
+        model: &LlamaModel,
+        lower_model_path: &str,
+    ) -> Option<LlamaChatTemplate> {
+        if lower_model_path.contains("gemma4") || lower_model_path.contains("gemma-4") {
+            return LlamaChatTemplate::new(GEMMA4_MINIMAL_CHAT_TEMPLATE).ok();
+        }
+
+        if let Ok(template) = model.chat_template(None)
+            && Self::chat_template_looks_renderable(&template)
+        {
+            return Some(template);
+        }
+
+        LlamaChatTemplate::new("chatml").ok()
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn chat_template_looks_renderable(template: &LlamaChatTemplate) -> bool {
+        let Ok(src) = template.to_str() else {
+            return false;
+        };
+        let trimmed = src.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if matches!(
+            trimmed,
+            "gemma4" | "gemma-4" | "gemma" | "llama3" | "chatml"
+        ) {
+            return false;
+        }
+        trimmed.contains("{{")
+            || trimmed.contains("{%")
+            || trimmed.contains("<|turn>")
+            || trimmed.contains("<start_of_turn>")
+            || trimmed.contains("<|im_start|>")
     }
 
     #[cfg(feature = "local-runtime")]
@@ -442,11 +564,16 @@ impl LocalLlamaProvider {
     }
 
     #[cfg(feature = "local-runtime")]
-    fn build_context_params(runtime: &LoadedRuntime, n_ctx: u32) -> LlamaContextParams {
+    fn build_context_params(
+        runtime: &LoadedRuntime,
+        n_ctx: u32,
+        prompt_batch_tokens: u32,
+    ) -> LlamaContextParams {
+        let prompt_batch_tokens = prompt_batch_tokens.max(1).min(n_ctx.max(1));
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx.min(1024))
-            .with_n_ubatch(n_ctx.min(1024));
+            .with_n_batch(prompt_batch_tokens)
+            .with_n_ubatch(prompt_batch_tokens);
         if runtime.threads > 0 {
             params = params
                 .with_n_threads(runtime.threads)
@@ -456,30 +583,75 @@ impl LocalLlamaProvider {
     }
 
     #[cfg(feature = "local-runtime")]
+    fn decode_prompt_tokens(
+        ctx: &mut LlamaContext<'_>,
+        prompt_tokens: &[LlamaToken],
+        prompt_batch_tokens: usize,
+    ) -> Result<()> {
+        let prompt_batch_tokens = prompt_batch_tokens.max(1);
+        let mut batch = LlamaBatch::new(prompt_batch_tokens, 1);
+        let prompt_len = prompt_tokens.len();
+        for chunk_start in (0..prompt_len).step_by(prompt_batch_tokens) {
+            batch.clear();
+            let chunk_end = (chunk_start + prompt_batch_tokens).min(prompt_len);
+            for (offset, token) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
+                let absolute_idx = chunk_start + offset;
+                let pos = i32::try_from(absolute_idx).unwrap_or(i32::MAX);
+                batch
+                    .add(*token, pos, &[0], absolute_idx + 1 == prompt_len)
+                    .with_context(|| {
+                        format!(
+                            "fill local prompt batch token={} pos={} batch_tokens={}",
+                            token.0, pos, prompt_batch_tokens
+                        )
+                    })?;
+            }
+            ctx.decode(&mut batch).with_context(|| {
+                format!(
+                    "local prompt decode chunk_start={} chunk_len={} prompt_len={} batch_tokens={}",
+                    chunk_start,
+                    chunk_end.saturating_sub(chunk_start),
+                    prompt_len,
+                    prompt_batch_tokens
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "local-runtime")]
     fn invalid_generation_token_biases(
         model: &LlamaModel,
         include_eog: bool,
     ) -> Vec<LlamaLogitBias> {
         let mut biases = Vec::new();
-        let n_vocab = model.n_vocab().max(0).min(512);
+        let n_vocab = model.n_vocab().max(0);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         for id in 0..n_vocab {
             let token = LlamaToken(id);
-            let invalid = (include_eog && model.is_eog_token(token))
-                || match model.token_to_piece(token, &mut decoder, true, None) {
-                    Ok(piece) => {
-                        let normalized = piece.trim().to_ascii_lowercase();
-                        normalized.is_empty()
-                            || piece
-                                .chars()
-                                .any(|c| c.is_control() && c != '\n' && c != '\t')
-                            || normalized.starts_with("<unused")
-                            || (normalized.starts_with('<') && normalized.ends_with('>'))
-                            || normalized == "<unk>"
-                            || normalized == "<pad>"
-                    }
-                    Err(_) => true,
-                };
+            if include_eog && model.is_eog_token(token) {
+                biases.push(LlamaLogitBias::new(token, -1.0e9));
+                continue;
+            }
+            if id >= 512 {
+                continue;
+            }
+            let invalid = match model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => {
+                    let normalized = piece.trim().to_ascii_lowercase();
+                    normalized.is_empty()
+                        || piece
+                            .chars()
+                            .any(|c| c.is_control() && c != '\n' && c != '\t')
+                        || normalized.starts_with("<unused")
+                        || normalized == "<unk>"
+                        || normalized == "<pad>"
+                        || normalized == "<bos>"
+                        || normalized == "<eos>"
+                        || normalized == "<mask>"
+                }
+                Err(_) => true,
+            };
             if invalid {
                 biases.push(LlamaLogitBias::new(token, -1.0e9));
             }
@@ -488,26 +660,158 @@ impl LocalLlamaProvider {
     }
 
     #[cfg(feature = "local-runtime")]
+    fn ascii_only_token_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
+        let mut biases = Vec::new();
+        let n_vocab = model.n_vocab().max(0);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        for id in 0..n_vocab {
+            let token = LlamaToken(id);
+            let non_ascii = match model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => piece
+                    .chars()
+                    .any(|ch| !ch.is_ascii() && !matches!(ch, '▁' | 'Ġ')),
+                Err(_) => false,
+            };
+            if non_ascii {
+                biases.push(LlamaLogitBias::new(token, -1.0e9));
+            }
+        }
+        biases
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn newline_token_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
+        let mut biases = Vec::new();
+        let n_vocab = model.n_vocab().max(0);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        for id in 0..n_vocab {
+            let token = LlamaToken(id);
+            let has_newline = match model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => piece.contains('\n') || piece.contains('\r'),
+                Err(_) => false,
+            };
+            if has_newline {
+                biases.push(LlamaLogitBias::new(token, -1.0e9));
+            }
+        }
+        biases
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn first_token_prefix_biases(model: &LlamaModel, prefixes: &[String]) -> Vec<LlamaLogitBias> {
+        let normalized_prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.trim().to_ascii_lowercase())
+            .filter(|prefix| !prefix.is_empty())
+            .collect::<Vec<_>>();
+        if normalized_prefixes.is_empty() {
+            return Vec::new();
+        }
+        let mut biases = Vec::new();
+        let n_vocab = model.n_vocab().max(0);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        for id in 0..n_vocab {
+            let token = LlamaToken(id);
+            if model.is_eog_token(token) {
+                continue;
+            }
+            let allowed = match model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => {
+                    let normalized = Self::normalize_first_token_piece(&piece);
+                    !normalized.is_empty() && normalized_prefixes.contains(&normalized)
+                }
+                Err(_) => false,
+            };
+            if !allowed {
+                biases.push(LlamaLogitBias::new(token, -1.0e9));
+            }
+        }
+        biases
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn single_token_string_biases(model: &LlamaModel, values: &[String]) -> Vec<LlamaLogitBias> {
+        let mut biases = Vec::new();
+        let mut seen = HashSet::new();
+        for value in values {
+            if value.trim().is_empty() {
+                continue;
+            }
+            if let Ok(tokens) = model.str_to_token(value, AddBos::Never)
+                && tokens.len() == 1
+                && seen.insert(tokens[0])
+            {
+                biases.push(LlamaLogitBias::new(tokens[0], -1.0e9));
+            }
+        }
+        biases
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn eog_token_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
+        let n_vocab = model.n_vocab().max(0);
+        (0..n_vocab)
+            .map(LlamaToken)
+            .filter(|token| model.is_eog_token(*token))
+            .map(|token| LlamaLogitBias::new(token, -1.0e9))
+            .collect()
+    }
+
+    #[cfg(feature = "local-runtime")]
+    fn normalize_first_token_piece(piece: &str) -> String {
+        let normalized = piece
+            .trim()
+            .trim_start_matches(['▁', 'Ġ'])
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '$'));
+        if normalized
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+        {
+            String::new()
+        } else {
+            normalized.to_ascii_lowercase()
+        }
+    }
+
+    #[cfg(feature = "local-runtime")]
     fn build_generation_sampler(
         model: &LlamaModel,
         grammar: Option<&str>,
         biases: &[LlamaLogitBias],
+        request: &ChatRequest,
     ) -> LlamaSampler {
         let invalid_token_filter = || LlamaSampler::logit_bias(model.n_vocab(), biases);
-        if let Some(grammar) = grammar {
-            match LlamaSampler::grammar(model, grammar, "root") {
-                Ok(grammar_sampler) => LlamaSampler::chain_simple([
-                    invalid_token_filter(),
-                    grammar_sampler,
-                    LlamaSampler::greedy(),
-                ]),
-                Err(_) => {
-                    LlamaSampler::chain_simple([invalid_token_filter(), LlamaSampler::greedy()])
-                }
-            }
-        } else {
-            LlamaSampler::chain_simple([invalid_token_filter(), LlamaSampler::greedy()])
+        let temperature = Self::f32_option(request, "temperature").unwrap_or(0.0);
+        let top_k = Self::i32_option(request, "top_k").unwrap_or(0);
+        let top_p = Self::f32_option(request, "top_p").unwrap_or(0.0);
+        let min_p = Self::f32_option(request, "min_p").unwrap_or(0.0);
+        let seed = Self::u32_option(request, "seed").unwrap_or(0x5445_524d);
+        let mut samplers = Vec::new();
+        samplers.push(invalid_token_filter());
+        if let Some(grammar) = grammar
+            && let Ok(grammar_sampler) = LlamaSampler::grammar(model, grammar, "root")
+        {
+            samplers.push(grammar_sampler);
         }
+        if temperature > 0.0 {
+            if top_k > 0 {
+                samplers.push(LlamaSampler::top_k(top_k));
+            }
+            if top_p > 0.0 && top_p < 1.0 {
+                samplers.push(LlamaSampler::top_p(top_p, 1));
+            }
+            if min_p > 0.0 {
+                samplers.push(LlamaSampler::min_p(min_p, 1));
+            }
+            samplers.push(LlamaSampler::temp(temperature));
+            samplers.push(LlamaSampler::dist(seed));
+        } else {
+            samplers.push(LlamaSampler::greedy());
+        }
+        LlamaSampler::chain_simple(samplers)
     }
 
     #[cfg(feature = "local-runtime")]
@@ -675,21 +979,50 @@ impl LocalLlamaProvider {
                 },
             )
             .context("apply local chat template")?;
-        let mut prompt_tokens = runtime
-            .model
-            .str_to_token(&template_result.prompt, AddBos::Always)
-            .or_else(|_| {
+        if let Some(path) = std::env::var_os("TERMLM_DEBUG_LOCAL_PROMPT_PATH") {
+            let _ = std::fs::write(path, &template_result.prompt);
+        }
+        let lower_runtime_model_path = runtime.model_path.to_ascii_lowercase();
+        let rendered_prompt_has_bos = template_result.prompt.trim_start().starts_with("<bos>");
+        let mut prompt_tokens =
+            if lower_runtime_model_path.contains("gemma") && !rendered_prompt_has_bos {
+                runtime
+                    .model
+                    .str_to_token(&template_result.prompt, AddBos::Always)
+                    .or_else(|_| {
+                        runtime
+                            .model
+                            .str_to_token(&template_result.prompt, AddBos::Never)
+                    })
+            } else if lower_runtime_model_path.contains("gemma") {
                 runtime
                     .model
                     .str_to_token(&template_result.prompt, AddBos::Never)
-            })
+                    .or_else(|_| {
+                        runtime
+                            .model
+                            .str_to_token(&template_result.prompt, AddBos::Always)
+                    })
+            } else {
+                runtime
+                    .model
+                    .str_to_token(&template_result.prompt, AddBos::Never)
+                    .or_else(|_| {
+                        runtime
+                            .model
+                            .str_to_token(&template_result.prompt, AddBos::Always)
+                    })
+            }
             .context("tokenize local prompt")?;
+        let n_vocab = runtime.model.n_vocab();
+        prompt_tokens.retain(|tok| tok.0 >= 0 && tok.0 < n_vocab);
 
         if prompt_tokens.is_empty() {
             prompt_tokens = runtime
                 .model
                 .str_to_token(" ", AddBos::Always)
                 .context("tokenize fallback prompt")?;
+            prompt_tokens.retain(|tok| tok.0 >= 0 && tok.0 < n_vocab);
         }
 
         let max_output_tokens = Self::max_output_tokens(&request);
@@ -714,29 +1047,62 @@ impl LocalLlamaProvider {
             n_ctx = n_ctx.min(model_ctx).max(512);
         }
 
-        let mut ctx = runtime
-            .model
-            .new_context(
-                &runtime.backend,
-                Self::build_context_params(&runtime, n_ctx),
-            )
-            .context("create local llama context")?;
-
-        let prompt_batch_tokens = n_ctx.min(1024).max(1) as usize;
-        let mut batch = LlamaBatch::new(prompt_batch_tokens, 1);
-        let prompt_len = prompt_tokens.len();
-        for chunk_start in (0..prompt_len).step_by(prompt_batch_tokens) {
-            batch.clear();
-            let chunk_end = (chunk_start + prompt_batch_tokens).min(prompt_len);
-            for (offset, token) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
-                let absolute_idx = chunk_start + offset;
-                let pos = i32::try_from(absolute_idx).unwrap_or(i32::MAX);
-                batch
-                    .add(*token, pos, &[0], absolute_idx + 1 == prompt_len)
-                    .context("fill local prompt batch")?;
+        let preferred_prompt_batch = (prompt_tokens.len().max(1).min(n_ctx as usize)) as u32;
+        let mut batch_candidates = Vec::new();
+        for candidate in [
+            preferred_prompt_batch,
+            n_ctx.clamp(1, 1024),
+            preferred_prompt_batch.min(512),
+            preferred_prompt_batch.min(256),
+            preferred_prompt_batch.min(128),
+            preferred_prompt_batch.min(64),
+            preferred_prompt_batch.min(32),
+            preferred_prompt_batch.min(16),
+            preferred_prompt_batch.min(8),
+            preferred_prompt_batch.min(4),
+            preferred_prompt_batch.min(1),
+        ] {
+            if candidate > 0 && !batch_candidates.contains(&candidate) {
+                batch_candidates.push(candidate);
             }
-            ctx.decode(&mut batch).context("local prompt decode")?;
         }
+        let mut ctx = None;
+        let mut last_decode_error = None;
+        for prompt_batch_tokens in batch_candidates {
+            let mut candidate_ctx = runtime
+                .model
+                .new_context(
+                    &runtime.backend,
+                    Self::build_context_params(&runtime, n_ctx, prompt_batch_tokens),
+                )
+                .with_context(|| {
+                    format!(
+                        "create local llama context n_ctx={} batch_tokens={}",
+                        n_ctx, prompt_batch_tokens
+                    )
+                })?;
+            match Self::decode_prompt_tokens(
+                &mut candidate_ctx,
+                &prompt_tokens,
+                prompt_batch_tokens as usize,
+            ) {
+                Ok(()) => {
+                    ctx = Some(candidate_ctx);
+                    break;
+                }
+                Err(err) => {
+                    last_decode_error = Some(err);
+                }
+            }
+        }
+        let mut ctx = ctx.ok_or_else(|| {
+            anyhow!(
+                "local prompt decode failed after retrying batch sizes: {}",
+                last_decode_error
+                    .map(|err| format!("{err:#}"))
+                    .unwrap_or_else(|| "unknown decode error".to_string())
+            )
+        })?;
 
         let mut preserved_tokens = HashSet::new();
         for token_str in &template_result.preserved_tokens {
@@ -747,16 +1113,49 @@ impl LocalLlamaProvider {
             }
         }
 
-        let first_token_biases = Self::invalid_generation_token_biases(&runtime.model, true);
-        let continuation_biases = Self::invalid_generation_token_biases(&runtime.model, false);
-        // llama.cpp's generated tool grammars currently assert on the bundled
-        // local Gemma template. Keep generation unconstrained and let the
-        // daemon parse/validate tool output.
-        let grammar = None;
+        // Generated tool grammars are not stable for the bundled local Gemma
+        // template, but small caller-provided grammars are useful for compact
+        // planner outputs.
+        let request_grammar = Self::string_option(&request, "grammar");
+        let grammar = request_grammar.as_deref();
+        let ascii_only = Self::bool_option(&request, "ascii_only");
+        let mut first_token_biases = Self::invalid_generation_token_biases(&runtime.model, true);
+        let suppress_eog = Self::bool_option(&request, "suppress_eog");
+        let mut continuation_biases = Self::invalid_generation_token_biases(
+            &runtime.model,
+            grammar.is_some() || suppress_eog,
+        );
+        if suppress_eog {
+            first_token_biases.extend(Self::eog_token_biases(&runtime.model));
+            continuation_biases.extend(Self::eog_token_biases(&runtime.model));
+            first_token_biases.extend(Self::single_token_string_biases(
+                &runtime.model,
+                &template_result.additional_stops,
+            ));
+            continuation_biases.extend(Self::single_token_string_biases(
+                &runtime.model,
+                &template_result.additional_stops,
+            ));
+        }
+        if ascii_only {
+            first_token_biases.extend(runtime.ascii_token_biases.clone());
+            continuation_biases.extend(runtime.ascii_token_biases.clone());
+        }
+        if Self::bool_option(&request, "suppress_newline") {
+            first_token_biases.extend(runtime.newline_token_biases.clone());
+            continuation_biases.extend(runtime.newline_token_biases.clone());
+        }
+        let first_token_prefixes = Self::string_list_option(&request, "first_token_prefixes");
+        if !first_token_prefixes.is_empty() {
+            first_token_biases.extend(Self::first_token_prefix_biases(
+                &runtime.model,
+                &first_token_prefixes,
+            ));
+        }
         let mut first_token_sampler =
-            Self::build_generation_sampler(&runtime.model, grammar, &first_token_biases);
+            Self::build_generation_sampler(&runtime.model, grammar, &first_token_biases, &request);
         let mut continuation_sampler =
-            Self::build_generation_sampler(&runtime.model, grammar, &continuation_biases);
+            Self::build_generation_sampler(&runtime.model, grammar, &continuation_biases, &request);
 
         let mut generated = String::new();
         let mut completion_tokens = 0_u64;
@@ -839,16 +1238,17 @@ impl LocalLlamaProvider {
                 break;
             }
 
-            let next_tokens = [token];
-            let mut next_batch =
-                LlamaBatch::get_one(&next_tokens).context("prepare sampled token batch")?;
-            n_cur += 1;
+            let mut next_batch = LlamaBatch::new(1, 1);
+            next_batch
+                .add(token, n_cur, &[0], true)
+                .context("prepare sampled token batch")?;
             if let Err(e) = ctx.decode(&mut next_batch) {
                 if !generated.trim().is_empty() {
                     break;
                 }
                 bail!("decode sampled token token={} pos={}: {e}", token.0, n_cur);
             }
+            n_cur += 1;
             first_token_sampler.accept(token);
             continuation_sampler.accept(token);
         }

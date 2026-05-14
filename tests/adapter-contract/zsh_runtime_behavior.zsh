@@ -11,6 +11,7 @@ source "${ROOT_DIR}/plugins/zsh/widgets/escape.zsh"
 source "${ROOT_DIR}/plugins/zsh/widgets/safety-floor.zsh"
 source "${ROOT_DIR}/plugins/zsh/lib/capture.zsh"
 source "${ROOT_DIR}/plugins/zsh/lib/ipc.zsh"
+source "${ROOT_DIR}/plugins/zsh/lib/terminal-observer.zsh"
 
 fail() {
   print -r -- "runtime-contract failure: $*" >&2
@@ -73,6 +74,8 @@ reset_state() {
   _TERMLM_SAVED_PS1='$ '
   _TERMLM_WAITING_MODEL=0
   _TERMLM_TASK_ID=""
+  _TERMLM_DEFERRED_PROMPT=""
+  _TERMLM_UPGRADE_COMMAND_PENDING=0
   _TERMLM_CLARIFICATION_TASK_ID=""
   _TERMLM_APPROVAL_TASK_ID=""
   _TERMLM_APPROVAL_CMD=""
@@ -94,6 +97,7 @@ reset_state() {
   _TERMLM_OBS_SAVE_STDERR_FD=-1
   _TERMLM_OUTPUT_STARTED=0
   _TERMLM_OUTPUT_NEEDS_NEWLINE=0
+  _TERMLM_PROMPT_TRANSCRIPT_PRINTED=0
   _TERMLM_STATUS_MESSAGE_ACTIVE=0
 }
 
@@ -120,6 +124,22 @@ termlm-send-decision() {
   return $_TEST_DECISION_FAIL
 }
 
+typeset -g _TEST_HELPER_PAYLOAD=""
+termlm-helper-is-alive() {
+  return 0
+}
+termlm-register-shell() {
+  _TERMLM_SHELL_ID="shell-test"
+  return 0
+}
+termlm-send-shell-context() {
+  return 0
+}
+termlm-helper-send() {
+  _TEST_HELPER_PAYLOAD="$1"
+  return 0
+}
+
 termlm-capture-enabled() {
   return 1
 }
@@ -130,6 +150,45 @@ termlm-self-insert
 assert_eq "$_TERMLM_MODE" "prompt" "self-insert should enter prompt mode"
 assert_eq "$BUFFER" "" "self-insert prompt entry should clear BUFFER"
 assert_eq "$KEYMAP" "termlm-prompt" "prompt mode should switch keymap"
+
+reset_state
+_TERMLM_MODE="prompt"
+KEYMAP="termlm-prompt"
+_TERMLM_SHELL_ID="shell-test"
+one_shot_file="$(mktemp "${TMPDIR:-/tmp}/termlm-one-shot-transcript.XXXXXX")"
+termlm-start-task "What directory am I in?" > "$one_shot_file" 2>&1
+one_shot_out="$(<"$one_shot_file")"
+rm -f -- "$one_shot_file"
+assert_contains "$one_shot_out" "● ? What directory am I in?" "one-shot prompts should stay visible in scrollback"
+assert_eq "$_TERMLM_PROMPT_TRANSCRIPT_PRINTED" "1" "one-shot transcript should suppress the extra blank before model text"
+model_b64="$(encode_b64 "Current directory: /tmp")"
+model_out="$(termlm-handle-run-task-line "{\"event\":\"model_text\",\"task_id\":\"${_TERMLM_TASK_ID}\",\"chunk_b64\":\"${model_b64}\"}" 2>&1)"
+assert_eq "$model_out" "Current directory: /tmp" "model text after one-shot transcript should not start with an empty line"
+first_task_id="$_TERMLM_TASK_ID"
+termlm-handle-run-task-line "{\"event\":\"task_complete\",\"task_id\":\"${first_task_id}\"}"
+_TERMLM_MODE="prompt"
+KEYMAP="termlm-prompt"
+_TERMLM_SHELL_ID="shell-test"
+second_one_shot_file="$(mktemp "${TMPDIR:-/tmp}/termlm-one-shot-transcript-2.XXXXXX")"
+termlm-start-task "What directory am I in?" > "$second_one_shot_file" 2>&1
+second_one_shot_out="$(<"$second_one_shot_file")"
+rm -f -- "$second_one_shot_file"
+assert_contains "$second_one_shot_out" "● ? What directory am I in?" "later one-shot prompts should also stay visible in scrollback"
+second_model_b64="$(encode_b64 "Current directory: /tmp")"
+second_model_out="$(termlm-handle-run-task-line "{\"event\":\"model_text\",\"task_id\":\"${_TERMLM_TASK_ID}\",\"chunk_b64\":\"${second_model_b64}\"}" 2>&1)"
+assert_eq "$second_model_out" "Current directory: /tmp" "later one-shot answers should remain visible"
+
+reset_state
+_TERMLM_MODE="session"
+_TERMLM_SESSION_MODE=1
+KEYMAP="termlm-prompt"
+_TERMLM_SHELL_ID="shell-test"
+session_file="$(mktemp "${TMPDIR:-/tmp}/termlm-session-transcript.XXXXXX")"
+termlm-start-task "What directory am I in?" > "$session_file" 2>&1
+session_out="$(<"$session_file")"
+rm -f -- "$session_file"
+assert_eq "$session_out" "" "interactive session prompts should remain ephemeral"
+assert_eq "$_TERMLM_PROMPT_TRANSCRIPT_PRINTED" "0" "interactive session should not mark one-shot transcript"
 
 reset_state
 KEYS='?'
@@ -297,6 +356,31 @@ assert_eq "$CURSOR" "${#BUFFER}" "cursor should move to end after implicit abort
 assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "typed command should execute immediately after implicit abort"
 
 reset_state
+_TERMLM_MODE="prompt"
+KEYMAP="termlm-prompt"
+_TERMLM_SHELL_ID="shell-test"
+BUFFER="What directory am I in?"
+LBUFFER="$BUFFER"
+RBUFFER=""
+_TEST_HELPER_PAYLOAD=""
+prompt_submit_file="$(mktemp "${TMPDIR:-/tmp}/termlm-prompt-submit.XXXXXX")"
+termlm-accept-line > "$prompt_submit_file" 2>&1
+rm -f -- "$prompt_submit_file"
+assert_eq "$_TEST_HELPER_PAYLOAD" "" "prompt submit should not start blocking task work on the submitted edit line"
+assert_eq "$BUFFER" "" "prompt submit should clear BUFFER before blocking startup work"
+assert_eq "$LBUFFER" "" "prompt submit should clear LBUFFER before blocking startup work"
+assert_eq "$RBUFFER" "" "prompt submit should clear RBUFFER before blocking startup work"
+assert_contains "${(j:|:)_ZLE_CALLS}" "-R" "prompt submit should force a redisplay after clearing the buffer"
+assert_contains "${(j:|:)_ZLE_CALLS}" ".accept-line" "prompt submit should defer startup to the next clean line"
+assert_eq "$_TERMLM_DEFERRED_PROMPT" "What directory am I in?" "prompt submit should defer the prompt text"
+_ZLE_CALLS=()
+line_init_file="$(mktemp "${TMPDIR:-/tmp}/termlm-prompt-line-init.XXXXXX")"
+termlm-line-init > "$line_init_file" 2>&1
+rm -f -- "$line_init_file"
+assert_contains "$_TEST_HELPER_PAYLOAD" '"prompt":"What directory am I in?"' "deferred prompt should start a task from line-init"
+assert_eq "$_TERMLM_DEFERRED_PROMPT" "" "line-init should consume the deferred prompt"
+
+reset_state
 _TERMLM_MODE="session"
 _TERMLM_SESSION_MODE=1
 _TERMLM_WAITING_MODEL=1
@@ -324,6 +408,10 @@ _ZLE_CALLS=()
 _TERMLM_ACKED_PENDING_TASK_ID="task-approved"
 _TERMLM_PENDING_TASK_ID=""
 _TERMLM_TASK_ID="task-approved"
+ack_text_b64="$(encode_b64 "Command approved. Execute in shell and send Ack.")"
+ack_text_out="$(termlm-handle-run-task-line "{\"event\":\"model_text\",\"task_id\":\"task-approved\",\"chunk_b64\":\"${ack_text_b64}\"}" 2>&1)"
+assert_eq "$ack_text_out" "" "model text for an acked approved command should be suppressed"
+assert_eq "$_TERMLM_OUTPUT_STARTED" "0" "suppressed approved-command text should not create a blank async line"
 termlm-handle-run-task-line '{"event":"task_complete","task_id":"task-approved"}'
 assert_not_contains "${(j:|:)_ZLE_CALLS}" "reset-prompt" "task_complete after approved command should not redraw an extra prompt"
 assert_eq "$_TERMLM_ACKED_PENDING_TASK_ID" "" "task_complete should clear acked pending task marker"
@@ -462,5 +550,42 @@ termlm-maybe-warn-no-llm-provider > "$warn_file"
 missing_warn="$(<"$warn_file")"
 assert_contains "$missing_warn" "bundled local model is missing" "missing local bundled model should emit startup warning"
 rm -rf -- "$tmp_cfg_dir"
+
+reset_state
+typeset -g _STOP_HELPER_COUNT=0
+typeset -g _REFRESH_CONTEXT_COUNT=0
+termlm-command-is-upgrade "termlm upgrade" || fail "upgrade detection should match bare termlm upgrade"
+termlm-command-is-upgrade "$HOME/.local/bin/termlm upgrade --repo example/termlm" || fail "upgrade detection should match path-qualified termlm upgrade"
+if termlm-command-is-upgrade "echo termlm upgrade"; then
+  fail "upgrade detection should not match echoed text"
+fi
+termlm-stop-helper() {
+  _STOP_HELPER_COUNT=$(( _STOP_HELPER_COUNT + 1 ))
+  _TERMLM_HELPER_PID=""
+  _TERMLM_HELPER_IN_FD=""
+  _TERMLM_HELPER_OUT_FD=""
+  _TERMLM_HELPER_FIFO_IN=""
+  _TERMLM_HELPER_FIFO_OUT=""
+  _TERMLM_HELPER_FIFO_GUARD_IN_FD=""
+  _TERMLM_HELPER_FIFO_GUARD_OUT_FD=""
+}
+termlm-refresh-filesystem-context() {
+  _REFRESH_CONTEXT_COUNT=$(( _REFRESH_CONTEXT_COUNT + 1 ))
+}
+_TERMLM_SHELL_ID="shell-before-upgrade"
+_TERMLM_HELPER_PID="12345"
+_TERMLM_HELPER_IN_FD="99"
+_TERMLM_HELPER_OUT_FD="98"
+_TERMLM_LAST_CONTEXT_HASH="old-context"
+_TERMLM_NO_LLM_WARNING_SHOWN=1
+termlm-preexec "termlm upgrade"
+assert_eq "$_TERMLM_UPGRADE_COMMAND_PENDING" "1" "preexec should mark termlm upgrade for shell refresh"
+termlm-precmd
+assert_eq "$_TERMLM_UPGRADE_COMMAND_PENDING" "0" "precmd should consume upgrade refresh marker"
+assert_eq "$_TERMLM_SHELL_ID" "" "successful upgrade should clear registered shell state"
+assert_eq "$_TERMLM_LAST_CONTEXT_HASH" "" "successful upgrade should force shell context resend"
+assert_eq "$_TERMLM_NO_LLM_WARNING_SHOWN" "0" "successful upgrade should allow fresh provider health warning"
+assert_eq "$_STOP_HELPER_COUNT" "1" "successful upgrade should stop the old bridge helper"
+assert_eq "$_REFRESH_CONTEXT_COUNT" "1" "successful upgrade should refresh filesystem context"
 
 print -r -- "zsh runtime behavior checks passed."

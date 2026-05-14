@@ -158,6 +158,8 @@ termlm upgrade
 
 Upgrade downloads the platform `no-models` bundle, verifies checksums, installs binaries and the zsh plugin, preserves local model files, and checks that the installed binaries run.
 
+Current zsh sessions refresh stale `termlm` helper state automatically after upgrade. If you are upgrading from an older alpha and the next prompt cannot reach the daemon, run `exec zsh -l` once.
+
 Uninstall:
 
 ```bash
@@ -204,6 +206,21 @@ bash scripts/ci/run_local_ci.sh --quick
 ```
 
 `--quick` skips reliability, security, hardware matrix, Ollama parity, and release-packaging/rehearsal lanes.
+
+Run the response accuracy gate before commits:
+
+```bash
+bash scripts/ci/run_accuracy_gate.sh --level commit
+```
+
+Before release, run the stricter accuracy path on a machine with the bundled GGUF models installed:
+
+```bash
+TERMLM_ACCURACY_REQUIRE_REAL=1 \
+bash scripts/ci/run_accuracy_gate.sh --level release
+```
+
+The release path drives the actual zsh plugin in a PTY, submits prompts with `?`, approves commands, checks retrieval traces, exercises compound command flows, and verifies the local web-search/read path.
 
 GitHub workflow split:
 

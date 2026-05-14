@@ -205,6 +205,33 @@ termlm-observer-stop-capture() {
   _TERMLM_OBS_SAVE_STDERR_FD=-1
 }
 
+termlm-command-is-upgrade() {
+  local cmd="${1:-}"
+  local first_command="${cmd%%[;&|]*}"
+  local -a words
+  words=("${(z)first_command}")
+  local idx=1
+
+  if [[ "${words[$idx]:-}" == "command" ]]; then
+    (( idx += 1 ))
+  fi
+  if [[ "${words[$idx]:-}" == "env" ]]; then
+    (( idx += 1 ))
+    while [[ "${words[$idx]:-}" == -* || "${words[$idx]:-}" == *=* ]]; do
+      (( idx += 1 ))
+    done
+  else
+    while [[ "${words[$idx]:-}" == *=* ]]; do
+      (( idx += 1 ))
+    done
+  fi
+
+  local bin="${words[$idx]:-}"
+  local subcommand="${words[$(( idx + 1 ))]:-}"
+  bin="${bin:t}"
+  [[ "$subcommand" == "upgrade" && ( "$bin" == "termlm" || "$bin" == "termlm-client" ) ]]
+}
+
 termlm-preexec() {
   _TERMLM_LAST_PREEXEC_CMD="${1:-}"
   if [[ -n "${2:-}" ]]; then
@@ -217,6 +244,11 @@ termlm-preexec() {
   _TERMLM_LAST_PREEXEC_TS=$EPOCHREALTIME
   _TERMLM_LAST_PREEXEC_CWD="$PWD"
   _TERMLM_OBS_CURRENT_SEQ=$(( _TERMLM_OBS_SEQ + 1 ))
+  if termlm-command-is-upgrade "$_TERMLM_LAST_PREEXEC_CMD"; then
+    _TERMLM_UPGRADE_COMMAND_PENDING=1
+  else
+    _TERMLM_UPGRADE_COMMAND_PENDING=0
+  fi
 
   # Some PTY/terminal combinations can tear down before zshexit runs; notify early on explicit shell exit commands.
   if [[ -n "$_TERMLM_SHELL_ID" ]] && [[ "$_TERMLM_LAST_PREEXEC_CMD" =~ '^[[:space:]]*(exit|logout)([[:space:]]|$)' ]]; then
@@ -249,6 +281,13 @@ termlm-precmd() {
   local last_status=$?
   termlm-load-capture-settings
   termlm-load-observer-settings
+
+  if [[ "${_TERMLM_UPGRADE_COMMAND_PENDING:-0}" -eq 1 ]]; then
+    _TERMLM_UPGRADE_COMMAND_PENDING=0
+    if [[ "$last_status" -eq 0 ]]; then
+      termlm-refresh-after-upgrade
+    fi
+  fi
 
   local helper_live=0
   if [[ -n "${_TERMLM_SHELL_ID:-}" ]] && termlm-helper-is-alive; then

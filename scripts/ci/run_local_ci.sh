@@ -18,8 +18,12 @@ RUN_SECURITY=1
 RUN_RELIABILITY=1
 RUN_HARDWARE_MATRIX=1
 RUN_OLLAMA_PARITY=1
+RUN_ACCURACY=1
+RUN_ZSH_USABILITY=1
 RUN_RELEASE_PACKAGING=1
 RUN_RELEASE_REHEARSAL=1
+ZSH_USABILITY_LEVEL="${ZSH_USABILITY_LEVEL:-smoke}"
+ACCURACY_LEVEL="${ACCURACY_LEVEL:-commit}"
 
 usage() {
   cat <<'EOF'
@@ -50,6 +54,10 @@ Options:
   --skip-reliability          Skip reliability lane equivalent
   --skip-hardware-matrix      Skip local_stub_all hardware matrix case
   --skip-ollama-parity        Skip ollama parity lane
+  --skip-accuracy             Skip response accuracy gate
+  --accuracy-level <n>        response accuracy level: commit, full, or release
+  --skip-zsh-usability        Skip real zsh plugin usability lane
+  --zsh-usability-level <n>   zsh usability level: smoke, release, or full
   --skip-release-packaging    Skip release packaging lane
   --skip-release-rehearsal    Skip local release upgrade rehearsal lane
   -h, --help                  Show help
@@ -84,6 +92,22 @@ macos_lane() {
   run_step "compat-ssh-env" bash tests/compatibility/ssh_env_smoke.sh
   run_step "compat-plugin-manager" bash tests/compatibility/plugin_manager_matrix.sh
   run_step "release-smoke" bash tests/release/release_smoke.sh
+}
+
+zsh_usability_lane() {
+  run_step "zsh-usability-${ZSH_USABILITY_LEVEL}" env \
+    TERMLM_ZSH_USABILITY_LEVEL="${ZSH_USABILITY_LEVEL}" \
+    TERMLM_ZSH_USABILITY_PROFILE=debug \
+    bash tests/usability/zsh_user_journey.sh
+}
+
+accuracy_lane() {
+  run_step "accuracy-${ACCURACY_LEVEL}" env \
+    TERMLM_ACCURACY_LEVEL="${ACCURACY_LEVEL}" \
+    TERMLM_ACCURACY_ARTIFACTS_DIR="${ARTIFACTS_DIR}/accuracy" \
+    bash scripts/ci/run_accuracy_gate.sh \
+      --level "${ACCURACY_LEVEL}" \
+      --artifacts-dir "${ARTIFACTS_DIR}/accuracy"
 }
 
 hardware_matrix_lane() {
@@ -187,6 +211,13 @@ release_packaging_lane() {
   local dist_dir="${ARTIFACTS_DIR}/release-dist"
   mkdir -p "${dist_dir}"
   run_step "release-build" cargo build -p termlm-client -p termlm-core --release --locked
+  if [[ "${RUN_ZSH_USABILITY}" -eq 1 ]]; then
+    run_step "zsh-usability-release-binary" env \
+      TERMLM_ZSH_USABILITY_LEVEL="${ZSH_USABILITY_LEVEL}" \
+      TERMLM_ZSH_USABILITY_PROFILE=release \
+      TERMLM_ZSH_USABILITY_SKIP_BUILD=1 \
+      bash tests/usability/zsh_user_journey.sh
+  fi
   run_step "package-no-models" \
     scripts/release/package_release.sh \
     --mode no-models \
@@ -256,6 +287,7 @@ while [[ $# -gt 0 ]]; do
       RUN_RELIABILITY=0
       RUN_HARDWARE_MATRIX=0
       RUN_OLLAMA_PARITY=0
+      RUN_ZSH_USABILITY=0
       RUN_RELEASE_PACKAGING=0
       RUN_RELEASE_REHEARSAL=0
       shift
@@ -284,6 +316,22 @@ while [[ $# -gt 0 ]]; do
       RUN_OLLAMA_PARITY=0
       shift
       ;;
+    --skip-accuracy)
+      RUN_ACCURACY=0
+      shift
+      ;;
+    --accuracy-level)
+      ACCURACY_LEVEL="$2"
+      shift 2
+      ;;
+    --skip-zsh-usability)
+      RUN_ZSH_USABILITY=0
+      shift
+      ;;
+    --zsh-usability-level)
+      ZSH_USABILITY_LEVEL="$2"
+      shift 2
+      ;;
     --skip-release-packaging)
       RUN_RELEASE_PACKAGING=0
       shift
@@ -310,7 +358,12 @@ log "perf suite: ${PERF_SUITE}"
 log "perf gates: ${PERF_GATES}"
 log "real runtime gates: ${REAL_RUNTIME_GATES}"
 log "perf reindex timeout secs: ${PERF_REINDEX_TIMEOUT_SECS}"
+log "accuracy level: ${ACCURACY_LEVEL}"
+log "zsh usability level: ${ZSH_USABILITY_LEVEL}"
 
+if [[ "${RUN_ACCURACY}" -eq 1 ]]; then
+  accuracy_lane
+fi
 if [[ "${RUN_MACOS_LANE}" -eq 1 ]]; then
   macos_lane
 fi
@@ -329,6 +382,9 @@ if [[ "${RUN_RELIABILITY}" -eq 1 ]]; then
 fi
 if [[ "${RUN_OLLAMA_PARITY}" -eq 1 ]]; then
   ollama_parity_lane
+fi
+if [[ "${RUN_ZSH_USABILITY}" -eq 1 ]]; then
+  zsh_usability_lane
 fi
 if [[ "${RUN_RELEASE_PACKAGING}" -eq 1 ]]; then
   release_packaging_lane

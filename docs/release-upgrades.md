@@ -138,6 +138,8 @@ Bootstrap installer hardening:
 10. write install receipt to `~/.local/share/termlm/install-receipt.json`
 11. delete temporary artifacts before process exit
 
+When the zsh adapter observes a successful `termlm upgrade`, it clears the old bridge helper and shell registration state before the next prompt. The next `?` prompt then starts the freshly installed client/daemon path without requiring a new terminal. Upgrades from older alpha adapters that do not have this refresh hook may still need one manual `exec zsh -l`.
+
 Environment controls:
 
 - `TERMLM_GITHUB_REPO` (default `thtmnisamnstr/termlm`)

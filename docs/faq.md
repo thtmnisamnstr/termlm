@@ -47,6 +47,8 @@ termlm upgrade
 
 `termlm update` is accepted as a hidden alias.
 
+Current zsh sessions refresh stale helper state automatically after upgrade. If you are upgrading from an older alpha and the next prompt cannot reach the daemon, run `exec zsh -l` once.
+
 ## Why is `termlm upgrade` lightweight?
 
 Upgrade installs the `no-models` artifact, preserves existing inference models, and bootstraps only

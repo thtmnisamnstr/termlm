@@ -54,6 +54,12 @@ jobs:
       - run: bash tests/adapter-contract/zsh_adapter_contract.sh
       - run: bash tests/release/release_smoke.sh
       - run: cargo build -p termlm-client -p termlm-core --release --locked
+      - name: Response accuracy release gate
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/termlm-release-accuracy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TERMLM_RELEASE_ACCURACY_OUT=${OUT_DIR}" >> "${GITHUB_ENV}"
+          TERMLM_ZSH_USABILITY_SKIP_BUILD=1 \
+          bash scripts/ci/run_accuracy_gate.sh --level release --artifacts-dir "${OUT_DIR}"
       - name: Prepare release bundles
         run: |
           mkdir -p dist
@@ -142,6 +148,13 @@ jobs:
         with:
           name: release-dist-${{ env.TAG_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*
+          if-no-files-found: error
+      - name: Upload response accuracy artifacts
+        if: ${{ always() && env.TERMLM_RELEASE_ACCURACY_OUT != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-response-accuracy-${{ env.TAG_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TERMLM_RELEASE_ACCURACY_OUT }}
           if-no-files-found: error
       - name: Publish GitHub release assets
         env:

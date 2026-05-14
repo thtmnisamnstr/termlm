@@ -34,6 +34,11 @@ jobs:
       - run: bash tests/compatibility/ssh_env_smoke.sh
       - run: bash tests/compatibility/plugin_manager_matrix.sh
       - run: bash tests/release/release_smoke.sh
+      - name: Response accuracy gate
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/termlm-accuracy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TERMLM_ACCURACY_OUT=${OUT_DIR}" >> "${GITHUB_ENV}"
+          bash scripts/ci/run_accuracy_gate.sh --level full --artifacts-dir "${OUT_DIR}"
       - name: Run local stub hardware matrix evidence
         run: |
           OUT_DIR="${RUNNER_TEMP}/termlm-hardware-matrix-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -56,6 +61,13 @@ jobs:
         with:
           name: hardware-matrix-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.TERMLM_HW_MATRIX_OUT }}
+          if-no-files-found: error
+      - name: Upload response accuracy artifacts
+        if: ${{ always() && env.TERMLM_ACCURACY_OUT != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: response-accuracy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TERMLM_ACCURACY_OUT }}
           if-no-files-found: error
 
   rust-linux-maintenance:

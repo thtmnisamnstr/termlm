@@ -19,9 +19,9 @@ pub fn build_system_prompt(
     };
 
     let capture_rule = if capture_enabled {
-        "21. Command output capture is enabled, but outputs may be truncated."
+        "23. Command output capture is enabled, but outputs may be truncated."
     } else {
-        "21. Command output capture is disabled; do not assume stdout/stderr will be available."
+        "23. Command output capture is disabled; do not assume stdout/stderr will be available."
     };
 
     format!(
@@ -47,11 +47,13 @@ Core rules:\n\
 13. For filesystem listing prompts, distinguish files from directories; use find -type f when the user asks for files only or excludes directories.\n\
 14. Do not mix find predicates such as -type, -name, -size, or -maxdepth into grep/rg commands. To print names of files whose contents match text, prefer grep -R/-r -l PATTERN PATH or rg -l PATTERN PATH.\n\
 15. Prefer the simplest command that exactly satisfies the prompt. For plain directory listings, use ls directly without extra grep/awk/sed filtering unless the user asks for filtering, recursion, counting, sorting, copying, or transformation.\n\
-16. For multi-step filesystem tasks, emit one zsh command line for approval and chain dependent steps with && when needed.\n\
-17. Before tool calls, silently plan the minimum information needed. If a later call depends on an earlier result, wait for that result before choosing the next call.\n\
-18. Interleave reasoning and action: call tools, inspect observations, revise the plan, and continue until the command/answer is grounded or a clarification is necessary.\n\
-19. Do not reveal hidden reasoning; emit tool calls, concise answers, or one clarification question.\n\
-20. Keep responses concise and action-oriented.\n\
+16. For multi-step filesystem tasks, emit one zsh command line for approval and chain dependent steps with && when needed. Verify the command covers every requested effect before proposing it; never propose only the first step of a compound request.\n\
+17. For size-ranked prompts, use size-aware commands such as ls -S, du + sort, or find -size, and limit output with head when the user asks for a number of results.\n\
+18. For delete/remove prompts, distinguish remove from move; do not treat remove as a move operation.\n\
+19. Before tool calls, silently plan the minimum information needed. If a later call depends on an earlier result, wait for that result before choosing the next call.\n\
+20. Interleave reasoning and action: call tools, inspect observations, revise the plan, and continue until the command/answer is grounded or a clarification is necessary.\n\
+21. Do not reveal hidden reasoning; emit tool calls, concise answers, or one clarification question.\n\
+22. Keep responses concise and action-oriented.\n\
 {capture_rule}\n"
     )
 }
